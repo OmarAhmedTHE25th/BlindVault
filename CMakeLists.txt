@@ -8,9 +8,11 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 option(P2P_BUILD_TESTS "Build the unit tests" ON)
 option(P2P_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer (GCC/Clang only)" OFF)
 option(P2P_BUILD_GUI "Build the Qt6 desktop application" OFF)
+
 if (WIN32)
     add_compile_definitions(_WIN32_WINNT=0x0A00) # Windows 10/11
 endif()
+
 # Sanitizers add checks that turn memory errors into loud crashes
 if(P2P_SANITIZE)
     if(MSVC)
@@ -24,9 +26,7 @@ endif()
 find_package(OpenSSL REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 
-# ---------------- CLI Application ----------------
-add_executable(P2P_Secure_File_Sharing
-        main.cpp
+set(CORE_HEADERS
         protocol.hpp
         validation.hpp
         disk_budget.hpp
@@ -39,9 +39,18 @@ add_executable(P2P_Secure_File_Sharing
         server_session.hpp
         server_node.hpp
         p2p_node.hpp
+        at_rest_crypto.hpp
+        tokenizer.hpp
+        vault_index.hpp
+        vault_gateway.hpp
         gui/log_redirect.hpp
         events.hpp
-        at_rest_crypto.hpp
+)
+
+# ---------------- CLI Application ----------------
+add_executable(P2P_Secure_File_Sharing
+        main.cpp
+        ${CORE_HEADERS}
 )
 
 target_link_libraries(P2P_Secure_File_Sharing PRIVATE
@@ -64,26 +73,7 @@ if(P2P_BUILD_GUI)
             gui/main_window.cpp
             gui/network_bridge.hpp
             gui/network_bridge.cpp
-            protocol.hpp
-            validation.hpp
-            disk_budget.hpp
-            trust_store.hpp
-            identity.hpp
-            cli_identity.hpp
-            tls_trust.hpp
-            file_streaming.hpp
-            client_node.hpp
-            server_session.hpp
-            server_node.hpp
-            gui/network_bridge.hpp
-            gui/main_window.cpp
-            gui/main_window.hpp
-            gui/main_gui.cpp
-            gui/main_gui.cpp
-            gui/network_bridge.cpp
-            gui/log_redirect.hpp
-            events.hpp
-            at_rest_crypto.hpp
+            ${CORE_HEADERS}
     )
 
     target_include_directories(P2P_Secure_File_Sharing_GUI PRIVATE
@@ -107,8 +97,7 @@ if(P2P_BUILD_FUZZERS)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         message(FATAL_ERROR "P2P_BUILD_FUZZERS needs Clang (it uses libFuzzer)")
     endif()
-    add_executable(fuzz_validation fuzz/fuzz_validation.cpp
-            at_rest_crypto.hpp)
+    add_executable(fuzz_validation fuzz/fuzz_validation.cpp)
     target_include_directories(fuzz_validation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_options(fuzz_validation PRIVATE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -O1 -g)
     target_link_options(fuzz_validation PRIVATE -fsanitize=fuzzer,address,undefined)
@@ -136,7 +125,7 @@ if(P2P_BUILD_TESTS)
             tests/test_tls_trust.cpp
             tests/test_hashing.cpp
             tests/test_e2e_trust.cpp
-            at_rest_crypto.hpp
+            tests/test_vault_core.cpp
     )
     target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(unit_tests PRIVATE GTest::gtest_main OpenSSL::Crypto OpenSSL::SSL Boost::system)

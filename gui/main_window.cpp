@@ -1,5 +1,6 @@
 #include "main_window.hpp"
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QGridLayout>
 #include <QFormLayout>
 #include <QTabWidget>
@@ -15,6 +16,7 @@
 #include "identity.hpp"
 #include "trust_store.hpp"
 #include <openssl/err.h>
+
 namespace {
 std::filesystem::path getIdentityDirectory() {
     QString qPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
@@ -32,8 +34,8 @@ std::filesystem::path getIdentityDirectory() {
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent), bridge_(new NetworkBridge(this)) {
-    setMinimumSize(940, 680);
-    resize(980, 720);
+    setMinimumSize(1060, 740);
+    resize(1140, 780);
     setupUi();
     if (!initializeIdentity()) {
         QTimer::singleShot(0, this, &QWidget::close);
@@ -43,7 +45,10 @@ MainWindow::MainWindow(QWidget* parent)
     connect(bridge_, &NetworkBridge::logMessage, this, &MainWindow::onLogMessage);
     connect(bridge_, &NetworkBridge::transferProgress, this, &MainWindow::onTransferProgress);
     connect(bridge_, &NetworkBridge::transferCompleted, this, &MainWindow::onTransferCompleted);
-connect(bridge_, &NetworkBridge::serverStatus, this, &MainWindow::onServerStatus);
+    connect(bridge_, &NetworkBridge::syntheticBatchReady, this, &MainWindow::onSyntheticBatchReady);
+    connect(bridge_, &NetworkBridge::offloadTelemetryReady, this, &MainWindow::onOffloadTelemetryReady);
+    connect(bridge_, &NetworkBridge::auditorQueryCompleted, this, &MainWindow::onAuditorQueryCompleted);
+    connect(bridge_, &NetworkBridge::serverStatus, this, &MainWindow::onServerStatus);
     connect(bridge_, &NetworkBridge::receiveProgress, this, &MainWindow::onReceiveProgress);
     connect(bridge_, &NetworkBridge::receiveFinished, this, &MainWindow::onReceiveFinished);
     refreshPeerList();
@@ -61,8 +66,6 @@ bool MainWindow::initializeIdentity() {
         return identity::private_key_loads(keyPath, passphrase.toStdString());
     };
 
-    // A failed generation can leave only one file behind. Treat that as an
-    // incomplete identity and allow the creation dialog to retry.
     const bool keyExists = std::filesystem::exists(keyPath);
     const bool certExists = std::filesystem::exists(certPath);
     std::error_code tempCleanupError;
@@ -71,25 +74,13 @@ bool MainWindow::initializeIdentity() {
     if (keyExists != certExists) {
         std::error_code ec;
         if (keyExists) std::filesystem::remove(keyPath, ec);
-        if (ec) {
-            QMessageBox::critical(this, "Identity Error",
-                                  QString("Cannot remove incomplete identity: %1")
-                                      .arg(QString::fromStdString(ec.message())));
-            return false;
-        }
         if (certExists) std::filesystem::remove(certPath, ec);
-        if (ec) {
-            QMessageBox::critical(this, "Identity Error",
-                                  QString("Cannot remove incomplete identity: %1")
-                                      .arg(QString::fromStdString(ec.message())));
-            return false;
-        }
     }
 
     QString passphrase;
     if (!std::filesystem::exists(keyPath)) {
         QDialog dialog(this);
-        dialog.setWindowTitle("Create Node Identity");
+        dialog.setWindowTitle("Create BlindVault Node Identity");
         dialog.setModal(true);
 
         auto* form = new QFormLayout(&dialog);
@@ -98,12 +89,12 @@ bool MainWindow::initializeIdentity() {
         auto* confirmInput = new QLineEdit(&dialog);
         passInput->setEchoMode(QLineEdit::Password);
         confirmInput->setEchoMode(QLineEdit::Password);
-        aliasInput->setPlaceholderText("e.g. Alice");
-        form->addRow("Node Alias / Display Name:", aliasInput);
+        aliasInput->setPlaceholderText("e.g. CBE-Gateway-Cairo");
+        form->addRow("Gateway / Node Alias:", aliasInput);
         form->addRow("Passphrase:", passInput);
         form->addRow("Confirm Passphrase:", confirmInput);
 
-        auto* generateButton = new QPushButton("Generate", &dialog);
+        auto* generateButton = new QPushButton("Generate Identity", &dialog);
         form->addRow(generateButton);
         connect(generateButton, &QPushButton::clicked, &dialog, [&]() {
             const QString alias = aliasInput->text().trimmed();
@@ -121,49 +112,35 @@ bool MainWindow::initializeIdentity() {
                 passphrase = first;
                 dialog.accept();
             } catch (const std::exception& error) {
-    char err_buf[256];
-    unsigned long err = ERR_get_error();
-    QString ssl_details;
-    while (err != 0) {
-        ERR_error_string_n(err, err_buf, sizeof(err_buf));
-        ssl_details += QString("\nOpenSSL Error: %1").arg(err_buf);
-        err = ERR_get_error();
-    }
-    QMessageBox::critical(&dialog, "Identity Generation Failed",
-                          QString("Error: %1%2").arg(error.what(), ssl_details));
-}
+                QMessageBox::critical(&dialog, "Identity Generation Failed", error.what());
+            }
         });
 
         if (dialog.exec() != QDialog::Accepted) return false;
-    } else {
-        if (!readPrivateKey(QString())) {
-            QDialog dialog(this);
-            dialog.setWindowTitle("Unlock Identity");
-            dialog.setModal(true);
-            auto* form = new QFormLayout(&dialog);
-            auto* passInput = new QLineEdit(&dialog);
-            passInput->setEchoMode(QLineEdit::Password);
-            form->addRow("Passphrase:", passInput);
-            auto* unlockButton = new QPushButton("Unlock", &dialog);
-            form->addRow(unlockButton);
-            connect(unlockButton, &QPushButton::clicked, &dialog, [&]() {
-                if (!readPrivateKey(passInput->text())) {
-                    QMessageBox::warning(&dialog, "Unlock Failed",
-                                         "The passphrase is incorrect or the private key is invalid.");
-                    return;
-                }
-                passphrase = passInput->text();
-                dialog.accept();
-            });
-            if (dialog.exec() != QDialog::Accepted) return false;
-        }
+    } else if (!readPrivateKey(QString())) {
+        QDialog dialog(this);
+        dialog.setWindowTitle("Unlock BlindVault Identity");
+        dialog.setModal(true);
+        auto* form = new QFormLayout(&dialog);
+        auto* passInput = new QLineEdit(&dialog);
+        passInput->setEchoMode(QLineEdit::Password);
+        form->addRow("Passphrase:", passInput);
+        auto* unlockButton = new QPushButton("Unlock", &dialog);
+        form->addRow(unlockButton);
+        connect(unlockButton, &QPushButton::clicked, &dialog, [&]() {
+            if (!readPrivateKey(passInput->text())) {
+                QMessageBox::warning(&dialog, "Unlock Failed", "Incorrect passphrase.");
+                return;
+            }
+            passphrase = passInput->text();
+            dialog.accept();
+        });
+        if (dialog.exec() != QDialog::Accepted) return false;
     }
 
     try {
-        raw_fingerprint_ = QString::fromStdString(
-            identity::fingerprint_of_file(certPath));
-        fp_label_->setText(QString::fromStdString(
-            trust::display_fingerprint(raw_fingerprint_.toStdString())));
+        raw_fingerprint_ = QString::fromStdString(identity::fingerprint_of_file(certPath));
+        fp_label_->setText(QString::fromStdString(trust::display_fingerprint(raw_fingerprint_.toStdString())));
         bridge_->setIdentityPassphrase(passphrase);
         return true;
     } catch (const std::exception& error) {
@@ -173,82 +150,70 @@ bool MainWindow::initializeIdentity() {
 }
 
 void MainWindow::setupUi() {
-    setWindowTitle("P2P Secure File Sharing");
+    setWindowTitle("BlindVault — Zero-Knowledge RegTech Storage Gateway");
 
     auto* centralWidget = new QWidget(this);
     auto* mainLayout = new QVBoxLayout(centralWidget);
     mainLayout->setContentsMargins(16, 16, 16, 16);
     mainLayout->setSpacing(12);
 
-    // Identity Card Container
+    // Header Identity Card
     auto* idCard = new QFrame(centralWidget);
     idCard->setObjectName("card");
     auto* idLayout = new QVBoxLayout(idCard);
-    idLayout->setContentsMargins(22, 18, 22, 18);
-    idLayout->setSpacing(12);
+    idLayout->setContentsMargins(20, 14, 20, 14);
+    idLayout->setSpacing(10);
 
     auto* idHeaderLayout = new QHBoxLayout();
-    auto* appTitle = new QLabel("P2P Secure File Sharing", centralWidget);
+    auto* appTitle = new QLabel("BlindVault — Zero-Knowledge RegTech Gateway", centralWidget);
     appTitle->setObjectName("appTitle");
-    auto* badge = new QLabel("TLS 1.3 Node", centralWidget);
+    auto* badge = new QLabel("AES-256-GCM + Mutual TLS 1.3", centralWidget);
     badge->setObjectName("badge");
     idHeaderLayout->addWidget(appTitle);
     idHeaderLayout->addStretch();
     idHeaderLayout->addWidget(badge);
     idLayout->addLayout(idHeaderLayout);
 
-    QString my_fp = "No Identity Found";
-    try {
-        const auto certPath = getIdentityDirectory() / identity::CERT_FILE;
-        raw_fingerprint_ = QString::fromStdString(identity::fingerprint_of_file(certPath));
-        my_fp = QString::fromStdString(trust::display_fingerprint(raw_fingerprint_.toStdString()));
-    } catch (...) {}
-
     auto* fpRowLayout = new QHBoxLayout();
-    auto* fpTitle = new QLabel("My Fingerprint:", centralWidget);
+    auto* fpTitle = new QLabel("Node Fingerprint:", centralWidget);
     fpTitle->setObjectName("subheading");
-
-    fp_label_ = new QLabel(my_fp, centralWidget);
+    fp_label_ = new QLabel("Loading...", centralWidget);
     fp_label_->setObjectName("monoBox");
     fp_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     copy_fp_btn_ = new QPushButton("Copy", centralWidget);
     copy_fp_btn_->setObjectName("secondaryBtn");
-    copy_fp_btn_->setToolTip("Copy raw SHA-256 fingerprint to clipboard");
-    copy_fp_btn_->setFixedWidth(70);
+    copy_fp_btn_->setFixedWidth(72);
     connect(copy_fp_btn_, &QPushButton::clicked, this, &MainWindow::onCopyFingerprint);
 
     fpRowLayout->addWidget(fpTitle);
     fpRowLayout->addWidget(fp_label_, 1);
     fpRowLayout->addWidget(copy_fp_btn_);
     idLayout->addLayout(fpRowLayout);
-
     mainLayout->addWidget(idCard);
 
     auto* columnsLayout = new QHBoxLayout();
-    columnsLayout->setContentsMargins(0, 0, 0, 0);
     columnsLayout->setSpacing(12);
 
-    // Left column: tab navigation and functional forms
     auto* tabs = new QTabWidget(centralWidget);
-    tabs->addTab(createSendTab(), "Send File");
-    tabs->addTab(createReceiveTab(), "Receive Files");
-    tabs->addTab(createTrustTab(), "Trusted Peers");
-    columnsLayout->addWidget(tabs, 55);
+    tabs->addTab(createEgressGatewayTab(), "1. Bank Egress Gateway");
+    tabs->addTab(createAuditorTab(), "2. Auditor Query & Cloud Proof");
+    tabs->addTab(createCloudAndTrustTab(), "3. Cloud Vault & Node Trust");
+    columnsLayout->addWidget(tabs, 62);
 
-    // Right column: activity log
+    // Right Column: Live Compliance & Telemetry Log
     auto* logCard = new QFrame(centralWidget);
     logCard->setObjectName("card");
     auto* logLayout = new QVBoxLayout(logCard);
-    logLayout->setContentsMargins(22, 18, 22, 20);
-    logLayout->setSpacing(12);
+    logLayout->setContentsMargins(18, 16, 18, 16);
+    logLayout->setSpacing(10);
 
     auto* logHeaderLayout = new QHBoxLayout();
-    auto* logTitle = new QLabel("Activity & Network Log", centralWidget);
+    auto* logTitle = new QLabel("RegTech Telemetry & Audit Log", centralWidget);
     logTitle->setObjectName("cardTitle");
-    auto* clearLogBtn = new QPushButton("Clear Log", centralWidget);
+    auto* clearLogBtn = new QPushButton("Clear", centralWidget);
     clearLogBtn->setObjectName("secondaryBtn");
-    clearLogBtn->setMinimumHeight(36);
+    clearLogBtn->setFixedHeight(32);
     connect(clearLogBtn, &QPushButton::clicked, this, &MainWindow::onClearLog);
     logHeaderLayout->addWidget(logTitle);
     logHeaderLayout->addStretch();
@@ -257,305 +222,324 @@ void MainWindow::setupUi() {
 
     log_pane_ = new QTextEdit(this);
     log_pane_->setReadOnly(true);
-    log_pane_->setMinimumHeight(120);
     logLayout->addWidget(log_pane_, 1);
 
-    columnsLayout->addWidget(logCard, 45);
+    columnsLayout->addWidget(logCard, 38);
     mainLayout->addLayout(columnsLayout, 1);
 
     setCentralWidget(centralWidget);
 }
 
-QWidget* MainWindow::createSendTab() {
-    auto* sendTab = new QWidget();
-    auto* layout = new QVBoxLayout(sendTab);
+QWidget* MainWindow::createEgressGatewayTab() {
+    auto* tab = new QWidget();
+    auto* layout = new QVBoxLayout(tab);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(8);
+    layout->setSpacing(10);
 
-    // Target Node Card
-    auto* targetCard = new QFrame(sendTab);
+    // Target Cloud Storage Card
+    auto* targetCard = new QFrame(tab);
     targetCard->setObjectName("card");
     auto* targetLayout = new QVBoxLayout(targetCard);
-    targetLayout->setContentsMargins(22, 20, 22, 20);
-    targetLayout->setSpacing(14);
+    targetLayout->setContentsMargins(20, 16, 20, 16);
+    targetLayout->setSpacing(10);
 
-    auto* targetTitle = new QLabel("Target Peer Information", targetCard);
+    auto* targetTitle = new QLabel("Untrusted Cloud Vault Endpoint", targetCard);
     targetTitle->setObjectName("cardTitle");
     targetLayout->addWidget(targetTitle);
 
-    auto* targetFormLayout = new QGridLayout();
-    targetFormLayout->setHorizontalSpacing(12);
-    targetFormLayout->setVerticalSpacing(10);
-    targetFormLayout->setColumnStretch(0, 1);
-
-    auto* hostLabel = new QLabel("Host Address:", targetCard);
-    hostLabel->setObjectName("inputLabel");
+    auto* grid = new QGridLayout();
+    grid->setColumnStretch(0, 1);
+    auto* hostLbl = new QLabel("Cloud Endpoint Host:", targetCard);
+    hostLbl->setObjectName("inputLabel");
     host_input_ = new QLineEdit("127.0.0.1", targetCard);
-    host_input_->setPlaceholderText("IP address or hostname (e.g. 192.168.1.10)");
     host_input_->setFixedHeight(36);
 
-    auto* portLabel = new QLabel("Port:", targetCard);
-    portLabel->setObjectName("inputLabel");
+    auto* portLbl = new QLabel("Port:", targetCard);
+    portLbl->setObjectName("inputLabel");
     port_input_ = new QLineEdit("8080", targetCard);
-    port_input_->setPlaceholderText("8080");
     port_input_->setFixedWidth(96);
     port_input_->setFixedHeight(36);
 
-    targetFormLayout->addWidget(hostLabel, 0, 0);
-    targetFormLayout->addWidget(portLabel, 0, 1);
-    targetFormLayout->addWidget(host_input_, 1, 0);
-    targetFormLayout->addWidget(port_input_, 1, 1);
-    targetLayout->addLayout(targetFormLayout);
-
+    grid->addWidget(hostLbl, 0, 0);
+    grid->addWidget(portLbl, 0, 1);
+    grid->addWidget(host_input_, 1, 0);
+    grid->addWidget(port_input_, 1, 1);
+    targetLayout->addLayout(grid);
     layout->addWidget(targetCard);
 
-    // File Selection Card
-    auto* fileCard = new QFrame(sendTab);
-    fileCard->setObjectName("card");
-    auto* fileLayout = new QVBoxLayout(fileCard);
-    fileLayout->setContentsMargins(22, 20, 22, 20);
-    fileLayout->setSpacing(14);
+    // Transaction Batch Card
+    auto* batchCard = new QFrame(tab);
+    batchCard->setObjectName("card");
+    auto* batchLayout = new QVBoxLayout(batchCard);
+    batchLayout->setContentsMargins(20, 16, 20, 16);
+    batchLayout->setSpacing(12);
 
-    auto* fileTitle = new QLabel("Payload Selection", fileCard);
-    fileTitle->setObjectName("cardTitle");
-    fileLayout->addWidget(fileTitle);
+    auto* batchHeader = new QHBoxLayout();
+    auto* batchTitle = new QLabel("Core Banking Transaction Batch (CSV)", batchCard);
+    batchTitle->setObjectName("cardTitle");
 
-    auto* fileInputLayout = new QHBoxLayout();
-    file_path_input_ = new QLineEdit(fileCard);
-    file_path_input_->setPlaceholderText("Select a file to transfer securely...");
+    gen_synth_btn_ = new QPushButton("Generate 10,000 CBE Records", batchCard);
+    gen_synth_btn_->setObjectName("secondaryBtn");
+    gen_synth_btn_->setFixedHeight(34);
+    connect(gen_synth_btn_, &QPushButton::clicked, this, &MainWindow::onGenerateSynthetic);
+
+    batchHeader->addWidget(batchTitle);
+    batchHeader->addStretch();
+    batchHeader->addWidget(gen_synth_btn_);
+    batchLayout->addLayout(batchHeader);
+
+    auto* fileRow = new QHBoxLayout();
+    file_path_input_ = new QLineEdit(batchCard);
+    file_path_input_->setPlaceholderText("Select raw banking transaction CSV or click Generate...");
     file_path_input_->setFixedHeight(36);
 
-    auto* browseBtn = new QPushButton("Browse...", fileCard);
+    auto* browseBtn = new QPushButton("Browse...", batchCard);
     browseBtn->setObjectName("secondaryBtn");
     browseBtn->setFixedHeight(36);
     connect(browseBtn, &QPushButton::clicked, this, &MainWindow::onBrowseFile);
 
-    fileInputLayout->addWidget(file_path_input_, 1);
-    fileInputLayout->addWidget(browseBtn);
-    fileLayout->addLayout(fileInputLayout);
+    fileRow->addWidget(file_path_input_, 1);
+    fileRow->addWidget(browseBtn);
+    batchLayout->addLayout(fileRow);
+    layout->addWidget(batchCard);
 
-    layout->addWidget(fileCard);
-
-    // Transfer Action Card
-    auto* actionCard = new QFrame(sendTab);
+    // Action & Telemetry Card
+    auto* actionCard = new QFrame(tab);
     actionCard->setObjectName("card");
     auto* actionLayout = new QVBoxLayout(actionCard);
-    actionLayout->setContentsMargins(22, 20, 22, 20);
-    actionLayout->setSpacing(14);
+    actionLayout->setContentsMargins(20, 16, 20, 16);
+    actionLayout->setSpacing(12);
 
-    send_btn_ = new QPushButton("Send File", actionCard);
+    send_btn_ = new QPushButton("Sanitize PII, Encrypt (AES-256-GCM) & Offload", actionCard);
     send_btn_->setObjectName("primaryBtn");
-    send_btn_->setFixedHeight(40);
-    send_btn_->setMaximumWidth(820);
-    connect(send_btn_, &QPushButton::clicked, this, &MainWindow::onSendFile);
-    actionLayout->addWidget(send_btn_, 0, Qt::AlignHCenter);
+    send_btn_->setFixedHeight(42);
+    connect(send_btn_, &QPushButton::clicked, this, &MainWindow::onOffloadCsv);
+    actionLayout->addWidget(send_btn_);
 
     progress_bar_ = new QProgressBar(actionCard);
     progress_bar_->setValue(0);
     progress_bar_->setFixedHeight(20);
-    progress_bar_->setMaximumWidth(820);
-    actionLayout->addWidget(progress_bar_, 0, Qt::AlignHCenter);
+    actionLayout->addWidget(progress_bar_);
 
-    transfer_status_lbl_ = new QLabel("Ready to initiate transfer", actionCard);
+    telemetry_lbl_ = new QLabel("Pipeline Ready | Zero PII & Zero Internal IPs Leave Bank Perimeter", actionCard);
+    telemetry_lbl_->setObjectName("monoBox");
+    telemetry_lbl_->setAlignment(Qt::AlignCenter);
+    actionLayout->addWidget(telemetry_lbl_);
+
+    transfer_status_lbl_ = new QLabel("Awaiting batch offload", actionCard);
     transfer_status_lbl_->setObjectName("subheading");
     transfer_status_lbl_->setAlignment(Qt::AlignCenter);
     actionLayout->addWidget(transfer_status_lbl_);
 
     layout->addWidget(actionCard);
     layout->addStretch();
-
-    return sendTab;
+    return tab;
 }
 
-QWidget* MainWindow::createReceiveTab() {
-    auto* recvTab = new QWidget();
-    auto* layout = new QVBoxLayout(recvTab);
+QWidget* MainWindow::createAuditorTab() {
+    auto* tab = new QWidget();
+    auto* layout = new QVBoxLayout(tab);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(8);
+    layout->setSpacing(10);
 
-    // Listener Configuration Card
-    auto* srvCard = new QFrame(recvTab);
+    // Query Bar Card
+    auto* searchCard = new QFrame(tab);
+    searchCard->setObjectName("card");
+    auto* searchLayout = new QVBoxLayout(searchCard);
+    searchLayout->setContentsMargins(20, 16, 20, 16);
+    searchLayout->setSpacing(10);
+
+    auto* searchTitle = new QLabel("Authorized Bank Auditor Retrieval (Blind Index Lookup)", searchCard);
+    searchTitle->setObjectName("cardTitle");
+    searchLayout->addWidget(searchTitle);
+
+    auto* searchRow = new QHBoxLayout();
+    auditor_query_input_ = new QLineEdit(searchCard);
+    auditor_query_input_->setPlaceholderText("Enter Customer Name (e.g. Ahmed Hassan), National ID, or IBAN...");
+    auditor_query_input_->setFixedHeight(36);
+
+    auditor_search_btn_ = new QPushButton("Fetch & Re-Hydrate", searchCard);
+    auditor_search_btn_->setObjectName("primaryBtn");
+    auditor_search_btn_->setFixedHeight(36);
+    connect(auditor_search_btn_, &QPushButton::clicked, this, &MainWindow::onAuditorSearch);
+
+    searchRow->addWidget(auditor_query_input_, 1);
+    searchRow->addWidget(auditor_search_btn_);
+    searchLayout->addLayout(searchRow);
+
+    auditor_token_lbl_ = new QLabel("Resolved Token: —", searchCard);
+    auditor_token_lbl_->setObjectName("subheading");
+    searchLayout->addWidget(auditor_token_lbl_);
+    layout->addWidget(searchCard);
+
+    // Restored Bank View Table
+    auto* restoredCard = new QFrame(tab);
+    restoredCard->setObjectName("card");
+    auto* restoredLayout = new QVBoxLayout(restoredCard);
+    restoredLayout->setContentsMargins(20, 14, 20, 14);
+    restoredLayout->setSpacing(8);
+
+    auto* restoredTitle = new QLabel("Bank Perimeter View (Decrypted & Re-Hydrated in Memory)", restoredCard);
+    restoredTitle->setObjectName("cardTitle");
+    restoredLayout->addWidget(restoredTitle);
+
+    auditor_table_ = new QTableWidget(0, 6, restoredCard);
+    auditor_table_->setHorizontalHeaderLabels({"Tx ID", "Timestamp", "Customer", "National ID", "Amount (EGP)", "Merchant"});
+    auditor_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    auditor_table_->setAlternatingRowColors(true);
+    auditor_table_->setMinimumHeight(150);
+    restoredLayout->addWidget(auditor_table_);
+    layout->addWidget(restoredCard);
+
+    // Untrusted Cloud Hex Proof Card
+    auto* cloudCard = new QFrame(tab);
+    cloudCard->setObjectName("card");
+    auto* cloudLayout = new QVBoxLayout(cloudCard);
+    cloudLayout->setContentsMargins(20, 14, 20, 14);
+    cloudLayout->setSpacing(8);
+
+    auto* cloudTitle = new QLabel("Untrusted Cloud Storage View (Raw BVLT AES-256-GCM Ciphertext on Disk)", cloudCard);
+    cloudTitle->setObjectName("cardTitle");
+    cloudLayout->addWidget(cloudTitle);
+
+    cloud_hex_view_ = new QTextEdit(cloudCard);
+    cloud_hex_view_->setReadOnly(true);
+    cloud_hex_view_->setMaximumHeight(110);
+    cloud_hex_view_->setPlaceholderText("Run an auditor query to inspect the raw encrypted bytes stored on the cloud node...");
+    cloudLayout->addWidget(cloud_hex_view_);
+    layout->addWidget(cloudCard);
+
+    return tab;
+}
+
+QWidget* MainWindow::createCloudAndTrustTab() {
+    auto* tab = new QWidget();
+    auto* layout = new QVBoxLayout(tab);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(10);
+
+    // Cloud Storage Listener Card
+    auto* srvCard = new QFrame(tab);
     srvCard->setObjectName("card");
     auto* srvLayout = new QVBoxLayout(srvCard);
-    srvLayout->setContentsMargins(22, 20, 22, 20);
-    srvLayout->setSpacing(14);
+    srvLayout->setContentsMargins(20, 16, 20, 16);
+    srvLayout->setSpacing(10);
 
-    auto* srvTitle = new QLabel("Incoming Transfers Listener", srvCard);
+    auto* srvTitle = new QLabel("Local Untrusted Cloud Storage Simulator (Vault Receiver)", srvCard);
     srvTitle->setObjectName("cardTitle");
     srvLayout->addWidget(srvTitle);
 
-    auto* srvFormLayout = new QGridLayout();
-    srvFormLayout->setHorizontalSpacing(16);
-    srvFormLayout->setVerticalSpacing(8);
+    auto* srvGrid = new QGridLayout();
+    srvGrid->setColumnStretch(1, 1);
 
-    auto* portLabel = new QLabel("Listening Port:", srvCard);
-    portLabel->setObjectName("inputLabel");
+    auto* pLbl = new QLabel("Listen Port:", srvCard);
+    pLbl->setObjectName("inputLabel");
     server_port_input_ = new QLineEdit("8080", srvCard);
-    server_port_input_->setPlaceholderText("8080");
+    server_port_input_->setFixedWidth(96);
     server_port_input_->setFixedHeight(36);
 
-    auto* dirLabel = new QLabel("Save Directory:", srvCard);
-    dirLabel->setObjectName("inputLabel");
-
-    auto* dirInputLayout = new QHBoxLayout();
+    auto* dLbl = new QLabel("Cloud Object Bucket Folder:", srvCard);
+    dLbl->setObjectName("inputLabel");
+    auto* dirRow = new QHBoxLayout();
     save_dir_input_ = new QLineEdit(
-    QStandardPaths::writableLocation(QStandardPaths::DownloadLocation) + "/P2P Received", srvCard);
+        QStandardPaths::writableLocation(QStandardPaths::DownloadLocation) + "/BlindVault_CloudBucket", srvCard);
     save_dir_input_->setFixedHeight(36);
     auto* browseDirBtn = new QPushButton("Browse...", srvCard);
     browseDirBtn->setObjectName("secondaryBtn");
     browseDirBtn->setFixedHeight(36);
     connect(browseDirBtn, &QPushButton::clicked, this, &MainWindow::onBrowseSaveDir);
-    dirInputLayout->addWidget(save_dir_input_, 1);
-    dirInputLayout->addWidget(browseDirBtn);
+    dirRow->addWidget(save_dir_input_, 1);
+    dirRow->addWidget(browseDirBtn);
 
-    srvFormLayout->addWidget(portLabel, 0, 0);
-    srvFormLayout->addWidget(dirLabel, 0, 1);
-    srvFormLayout->addWidget(server_port_input_, 1, 0);
-    srvFormLayout->addLayout(dirInputLayout, 1, 1);
-    srvLayout->addLayout(srvFormLayout);
+    srvGrid->addWidget(pLbl, 0, 0);
+    srvGrid->addWidget(dLbl, 0, 1);
+    srvGrid->addWidget(server_port_input_, 1, 0);
+    srvGrid->addLayout(dirRow, 1, 1);
+    srvLayout->addLayout(srvGrid);
 
-    server_toggle_btn_ = new QPushButton("Start Listening", srvCard);
+    server_toggle_btn_ = new QPushButton("Start Cloud Storage Node", srvCard);
     server_toggle_btn_->setObjectName("primaryBtn");
-    server_toggle_btn_->setFixedHeight(40);
+    server_toggle_btn_->setFixedHeight(38);
     connect(server_toggle_btn_, &QPushButton::clicked, this, &MainWindow::onStartServer);
     srvLayout->addWidget(server_toggle_btn_);
 
-    server_status_lbl_ = new QLabel("Listener inactive - start listening to receive files from trusted peers", srvCard);
+    server_status_lbl_ = new QLabel("Cloud listener inactive", srvCard);
     server_status_lbl_->setObjectName("subheading");
     server_status_lbl_->setAlignment(Qt::AlignCenter);
     srvLayout->addWidget(server_status_lbl_);
 
     recv_progress_bar_ = new QProgressBar(srvCard);
     recv_progress_bar_->setValue(0);
-    recv_progress_bar_->setFixedHeight(20);
+    recv_progress_bar_->setFixedHeight(18);
     srvLayout->addWidget(recv_progress_bar_);
-
     layout->addWidget(srvCard);
 
-    // Trust Notice Card
-    auto* noticeCard = new QFrame(recvTab);
-    noticeCard->setObjectName("card");
-    auto* noticeLayout = new QVBoxLayout(noticeCard);
-    noticeLayout->setContentsMargins(22, 18, 22, 18);
-    noticeLayout->setSpacing(10);
+    // Zero-Trust Mutual TLS Allowlist Card
+    auto* trustCard = new QFrame(tab);
+    trustCard->setObjectName("card");
+    auto* trustLayout = new QVBoxLayout(trustCard);
+    trustLayout->setContentsMargins(20, 16, 20, 16);
+    trustLayout->setSpacing(10);
 
-    auto* noticeTitle = new QLabel("Security Notice", noticeCard);
-    noticeTitle->setObjectName("cardTitle");
-    auto* noticeText = new QLabel("Incoming connections are authenticated against your Trusted Peers store using mutual TLS 1.3 verification. Transfers from unknown fingerprints are rejected automatically.", noticeCard);
-    noticeText->setWordWrap(true);
-    noticeText->setObjectName("subheading");
+    auto* tHeader = new QHBoxLayout();
+    auto* tTitle = new QLabel("Zero-Trust Node Allowlist (Mutual TLS 1.3 Fingerprints)", trustCard);
+    tTitle->setObjectName("cardTitle");
+    auto* remBtn = new QPushButton("Revoke Selected", trustCard);
+    remBtn->setObjectName("dangerBtn");
+    remBtn->setFixedHeight(30);
+    connect(remBtn, &QPushButton::clicked, this, &MainWindow::onRemovePeer);
+    tHeader->addWidget(tTitle);
+    tHeader->addStretch();
+    tHeader->addWidget(remBtn);
+    trustLayout->addLayout(tHeader);
 
-    noticeLayout->addWidget(noticeTitle);
-    noticeLayout->addWidget(noticeText);
-    layout->addWidget(noticeCard);
-
-    layout->addStretch();
-    return recvTab;
-}
-
-QWidget* MainWindow::createTrustTab() {
-    auto* trustTab = new QWidget();
-    auto* layout = new QVBoxLayout(trustTab);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(8);
-
-    // Authorized Peers Card
-    auto* listCard = new QFrame(trustTab);
-    listCard->setObjectName("card");
-    auto* listLayout = new QVBoxLayout(listCard);
-    listLayout->setContentsMargins(22, 20, 22, 20);
-    listLayout->setSpacing(14);
-
-    auto* headerLayout = new QHBoxLayout();
-    auto* listTitle = new QLabel("Authorized Peers", listCard);
-    listTitle->setObjectName("cardTitle");
-    auto* removePeerBtn = new QPushButton("Remove Selected", listCard);
-    removePeerBtn->setObjectName("dangerBtn");
-    removePeerBtn->setFixedHeight(32);
-    connect(removePeerBtn, &QPushButton::clicked, this, &MainWindow::onRemovePeer);
-
-    headerLayout->addWidget(listTitle);
-    headerLayout->addStretch();
-    headerLayout->addWidget(removePeerBtn);
-    listLayout->addLayout(headerLayout);
-
-    peer_table_ = new QTableWidget(0, 2, listCard);
-    peer_table_->setHorizontalHeaderLabels({"Peer Name", "Fingerprint (SHA-256)"});
+    peer_table_ = new QTableWidget(0, 2, trustCard);
+    peer_table_->setHorizontalHeaderLabels({"Node Alias", "Pinned SHA-256 Fingerprint"});
     peer_table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     peer_table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     peer_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     peer_table_->setSelectionMode(QAbstractItemView::SingleSelection);
-    peer_table_->setAlternatingRowColors(true);
-    peer_table_->setFixedHeight(160);
-    listLayout->addWidget(peer_table_);
+    peer_table_->setFixedHeight(120);
+    trustLayout->addWidget(peer_table_);
 
-    layout->addWidget(listCard);
+    auto* addRow = new QHBoxLayout();
+    peer_name_input_ = new QLineEdit(trustCard);
+    peer_name_input_->setPlaceholderText("Alias (e.g. CloudVault-EG)");
+    peer_name_input_->setFixedHeight(34);
+    peer_fp_input_ = new QLineEdit(trustCard);
+    peer_fp_input_->setPlaceholderText("64-hex SHA-256 Certificate Fingerprint");
+    peer_fp_input_->setFixedHeight(34);
+    auto* addBtn = new QPushButton("Pin Node", trustCard);
+    addBtn->setObjectName("primaryBtn");
+    addBtn->setFixedHeight(34);
+    connect(addBtn, &QPushButton::clicked, this, &MainWindow::onAddPeer);
+    addRow->addWidget(peer_name_input_, 1);
+    addRow->addWidget(peer_fp_input_, 2);
+    addRow->addWidget(addBtn);
+    trustLayout->addLayout(addRow);
 
-    // Add Peer Card
-    auto* addCard = new QFrame(trustTab);
-    addCard->setObjectName("card");
-    auto* addLayout = new QVBoxLayout(addCard);
-    addLayout->setContentsMargins(22, 20, 22, 20);
-    addLayout->setSpacing(14);
-
-    auto* addTitle = new QLabel("Add Trusted Peer", addCard);
-    addTitle->setObjectName("cardTitle");
-    addLayout->addWidget(addTitle);
-
-    auto* addFormLayout = new QHBoxLayout();
-    peer_name_input_ = new QLineEdit(addCard);
-    peer_name_input_->setPlaceholderText("Peer Alias (e.g. Alice)");
-    peer_name_input_->setFixedHeight(36);
-
-    peer_fp_input_ = new QLineEdit(addCard);
-    peer_fp_input_->setPlaceholderText("64-hex SHA-256 Fingerprint");
-    peer_fp_input_->setFixedHeight(36);
-
-    auto* addPeerBtn = new QPushButton("Add Peer", addCard);
-    addPeerBtn->setObjectName("primaryBtn");
-    addPeerBtn->setFixedHeight(36);
-    connect(addPeerBtn, &QPushButton::clicked, this, &MainWindow::onAddPeer);
-
-    addFormLayout->addWidget(peer_name_input_, 1);
-    addFormLayout->addWidget(peer_fp_input_, 2);
-    addFormLayout->addWidget(addPeerBtn);
-    addLayout->addLayout(addFormLayout);
-
-    layout->addWidget(addCard);
+    layout->addWidget(trustCard);
     layout->addStretch();
-
-    return trustTab;
+    return tab;
 }
 
 void MainWindow::onBrowseFile() {
-    QString file = QFileDialog::getOpenFileName(this, "Select File to Transfer");
-    if (!file.isEmpty()) {
-        file_path_input_->setText(file);
-    }
+    QString file = QFileDialog::getOpenFileName(this, "Select Banking Transaction CSV", "", "CSV Files (*.csv);;All Files (*)");
+    if (!file.isEmpty()) file_path_input_->setText(file);
 }
 
 void MainWindow::onBrowseSaveDir() {
-    QString dir = QFileDialog::getExistingDirectory(this, "Select Directory to Save Incoming Files");
-    if (!dir.isEmpty()) {
-        save_dir_input_->setText(dir);
-    }
+    QString dir = QFileDialog::getExistingDirectory(this, "Select Cloud Object Storage Folder");
+    if (!dir.isEmpty()) save_dir_input_->setText(dir);
 }
 
 void MainWindow::onCopyFingerprint() {
-    if (raw_fingerprint_.isEmpty()) {
-        try {
-            const auto certPath = getIdentityDirectory() / identity::CERT_FILE;
-            raw_fingerprint_ = QString::fromStdString(identity::fingerprint_of_file(certPath));
-        } catch (...) {}
-    }
-
     if (!raw_fingerprint_.isEmpty()) {
         QGuiApplication::clipboard()->setText(raw_fingerprint_);
         copy_fp_btn_->setText("Copied!");
         QTimer::singleShot(2000, this, [this]() {
             if (copy_fp_btn_) copy_fp_btn_->setText("Copy");
         });
-        onLogMessage("[INFO] Fingerprint copied to clipboard.");
     }
 }
 
@@ -563,81 +547,121 @@ void MainWindow::onClearLog() const {
     log_pane_->clear();
 }
 
-void MainWindow::onSendFile() {
-    QString host = host_input_->text().trimmed();
-    uint16_t port = port_input_->text().toUShort();
-    QString path = file_path_input_->text().trimmed();
+void MainWindow::onGenerateSynthetic() {
+    gen_synth_btn_->setEnabled(false);
+    bridge_->generateSyntheticBatch(10000);
+}
+
+void MainWindow::onSyntheticBatchReady(const QString& csvPath) {
+    gen_synth_btn_->setEnabled(true);
+    file_path_input_->setText(csvPath);
+}
+
+void MainWindow::onOffloadCsv() {
+    const QString host = host_input_->text().trimmed();
+    const uint16_t port = port_input_->text().toUShort();
+    const QString path = file_path_input_->text().trimmed();
 
     if (host.isEmpty() || port == 0 || path.isEmpty()) {
-        QMessageBox::warning(this, "Validation", "Please provide a valid Host, Port, and File path.");
+        QMessageBox::warning(this, "Validation", "Please provide a valid Cloud Host, Port, and CSV path.");
         return;
     }
+    send_btn_->setEnabled(false);
     progress_bar_->setValue(0);
-    transfer_status_lbl_->setText(QString("Transferring %1 to %2:%3...").arg(path, host).arg(port));
-    bridge_->sendFile(host, port, path);
+    transfer_status_lbl_->setText("Sanitizing PII, encrypting AES-256-GCM, and streaming...");
+    bridge_->ingestAndOffloadCsv(host, port, path);
+}
+
+void MainWindow::onOffloadTelemetryReady(quint64 records, quint64 piiTokenized, quint64 ipsMasked,
+                                         double elapsedMs, double recordsPerSec, const QString& blobName) {
+    telemetry_lbl_->setText(QString("Blob: %1 | %2 tx | %3 PII tokenized | %4 IPs masked | %5 ms (%6 rec/s)")
+                                .arg(blobName)
+                                .arg(records)
+                                .arg(piiTokenized)
+                                .arg(ipsMasked)
+                                .arg(elapsedMs, 0, 'f', 1)
+                                .arg(recordsPerSec, 0, 'f', 0));
+}
+
+void MainWindow::onAuditorSearch() {
+    const QString query = auditor_query_input_->text().trimmed();
+    if (query.isEmpty()) {
+        QMessageBox::warning(this, "Auditor Query", "Enter a Customer Name, National ID, or IBAN.");
+        return;
+    }
+    bridge_->queryAuditorRecords(query, save_dir_input_->text().trimmed());
+}
+
+void MainWindow::onAuditorQueryCompleted(bool found, const QString& matchedToken,
+                                         const QString& restoredCsv, const QString& rawCloudHex) {
+    auditor_token_lbl_->setText("Resolved Deterministic Token: " + matchedToken);
+    auditor_table_->setRowCount(0);
+    cloud_hex_view_->setPlainText(rawCloudHex);
+
+    if (!found) {
+        QMessageBox::information(this, "No Records", "No archived encrypted blobs matched that identifier.");
+        return;
+    }
+
+    const QStringList lines = restoredCsv.split('\n', Qt::SkipEmptyParts);
+    for (int i = 1; i < lines.size(); ++i) {
+        const QStringList cols = lines[i].split(',');
+        if (cols.size() < 8) continue;
+        const int row = auditor_table_->rowCount();
+        auditor_table_->insertRow(row);
+        auditor_table_->setItem(row, 0, new QTableWidgetItem(cols[0]));
+        auditor_table_->setItem(row, 1, new QTableWidgetItem(cols[1]));
+        auditor_table_->setItem(row, 2, new QTableWidgetItem(cols[2]));
+        auditor_table_->setItem(row, 3, new QTableWidgetItem(cols[3]));
+        auditor_table_->setItem(row, 4, new QTableWidgetItem(cols[6]));
+        auditor_table_->setItem(row, 5, new QTableWidgetItem(cols[7]));
+    }
 }
 
 void MainWindow::onStartServer() {
-    uint16_t port = server_port_input_->text().toUShort();
-    QString saveDir = save_dir_input_->text().trimmed();
+    const uint16_t port = server_port_input_->text().toUShort();
+    const QString saveDir = save_dir_input_->text().trimmed();
     if (port == 0 || saveDir.isEmpty()) {
-        QMessageBox::warning(this, "Validation", "Invalid server port or save directory.");
+        QMessageBox::warning(this, "Validation", "Invalid cloud port or storage directory.");
         return;
     }
     server_toggle_btn_->setEnabled(false);
-    server_toggle_btn_->setText("Starting...");
     bridge_->startServer(port, saveDir);
 }
 
 void MainWindow::onAddPeer() {
-    QString name = peer_name_input_->text().trimmed();
-    QString fp = peer_fp_input_->text().trimmed();
-    if (name.isEmpty() || fp.isEmpty()) {
-        QMessageBox::warning(this, "Validation", "Please provide both a peer name and fingerprint.");
-        return;
-    }
+    const QString name = peer_name_input_->text().trimmed();
+    const QString fp = peer_fp_input_->text().trimmed();
+    if (name.isEmpty() || fp.isEmpty()) return;
 
-    const auto trustPath = getIdentityDirectory() / identity::TRUST_FILE;
-    trust::TrustStore store(trustPath);
-    std::string err = store.add(fp.toStdString(), name.toStdString());
+    trust::TrustStore store(getIdentityDirectory() / identity::TRUST_FILE);
+    const std::string err = store.add(fp.toStdString(), name.toStdString());
     if (!err.empty()) {
-        QMessageBox::critical(this, "Error", QString::fromStdString(err));
+        QMessageBox::critical(this, "Trust Error", QString::fromStdString(err));
         return;
     }
     peer_name_input_->clear();
     peer_fp_input_->clear();
     refreshPeerList();
-    onLogMessage(QString("[TRUST] Added peer '%1' to trust store.").arg(name));
 }
 
 void MainWindow::onRemovePeer() {
-    int row = peer_table_->currentRow();
-    if (row < 0) {
-        QMessageBox::information(this, "Notice", "Please select a peer row to remove.");
-        return;
-    }
-    QString name = peer_table_->item(row, 0)->text();
-
-    const auto trustPath = getIdentityDirectory() / identity::TRUST_FILE;
-    trust::TrustStore store(trustPath);
+    const int row = peer_table_->currentRow();
+    if (row < 0) return;
+    const QString name = peer_table_->item(row, 0)->text();
+    trust::TrustStore store(getIdentityDirectory() / identity::TRUST_FILE);
     store.remove(name.toStdString());
     refreshPeerList();
-    onLogMessage(QString("[TRUST] Removed peer '%1' from trust store.").arg(name));
 }
 
 void MainWindow::refreshPeerList() const {
     peer_table_->setRowCount(0);
-    const auto trustPath = getIdentityDirectory() / identity::TRUST_FILE;
-    trust::TrustStore store(trustPath);
+    trust::TrustStore store(getIdentityDirectory() / identity::TRUST_FILE);
     for (const auto& entry : store.list()) {
-        int row = peer_table_->rowCount();
+        const int row = peer_table_->rowCount();
         peer_table_->insertRow(row);
-        auto* nameItem = new QTableWidgetItem(QString::fromStdString(entry.name));
-        auto* fpItem = new QTableWidgetItem(QString::fromStdString(trust::display_fingerprint(entry.fingerprint)));
-        nameItem->setTextAlignment(Qt::AlignVCenter | Qt::AlignLeft);
-        fpItem->setTextAlignment(Qt::AlignVCenter | Qt::AlignLeft);
-        peer_table_->setItem(row, 0, nameItem);
-        peer_table_->setItem(row, 1, fpItem);
+        peer_table_->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(entry.name)));
+        peer_table_->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(trust::display_fingerprint(entry.fingerprint))));
     }
 }
 
@@ -648,14 +672,12 @@ void MainWindow::onLogMessage(const QString& msg) const {
 void MainWindow::onTransferProgress(int percentage, quint64 transferred, quint64 total) const {
     progress_bar_->setValue(percentage);
     if (total > 0) {
-        double transMb = static_cast<double>(transferred) / (1024.0 * 1024.0);
-        double totalMb = static_cast<double>(total) / (1024.0 * 1024.0);
-        transfer_status_lbl_->setText(QString("Progress: %1% (%2 MB / %3 MB)")
-            .arg(percentage)
-            .arg(transMb, 0, 'f', 2)
-            .arg(totalMb, 0, 'f', 2));
-    } else {
-        transfer_status_lbl_->setText(QString("Progress: %1%").arg(percentage));
+        const double transMb = static_cast<double>(transferred) / (1024.0 * 1024.0);
+        const double totalMb = static_cast<double>(total) / (1024.0 * 1024.0);
+        transfer_status_lbl_->setText(QString("Mutual TLS Stream: %1% (%2 MB / %3 MB)")
+                                          .arg(percentage)
+                                          .arg(transMb, 0, 'f', 2)
+                                          .arg(totalMb, 0, 'f', 2));
     }
 }
 
@@ -663,22 +685,20 @@ void MainWindow::onTransferCompleted(bool success, const QString& status) const 
     send_btn_->setEnabled(true);
     if (success) {
         progress_bar_->setValue(100);
-        transfer_status_lbl_->setText("Transfer completed successfully!");
-        onLogMessage("[CLIENT] Done: " + status);
+        transfer_status_lbl_->setText("Zero-knowledge encrypted blob verified and stored on Cloud Node!");
     } else {
-        transfer_status_lbl_->setText(QString("Transfer failed: %1").arg(status));
-        onLogMessage("[CLIENT] FAILED: " + status);
+        transfer_status_lbl_->setText("Offload failed: " + status);
     }
-
 }
+
 void MainWindow::onServerStatus(bool ok, const QString& message) {
     if (ok) {
-        server_toggle_btn_->setText("Server Running");
+        server_toggle_btn_->setText("Cloud Vault Active");
         server_status_lbl_->setText(message);
     } else {
         server_toggle_btn_->setEnabled(true);
-        server_toggle_btn_->setText("Start Listening");
-        server_status_lbl_->setText("Could not start: " + message);
+        server_toggle_btn_->setText("Start Cloud Storage Node");
+        server_status_lbl_->setText("Error: " + message);
     }
 }
 
@@ -686,18 +706,18 @@ void MainWindow::onReceiveProgress(int percentage, quint64 received, quint64 tot
     recv_progress_bar_->setValue(percentage);
     const double recvMb = static_cast<double>(received) / (1024.0 * 1024.0);
     const double totalMb = static_cast<double>(total) / (1024.0 * 1024.0);
-    server_status_lbl_->setText(QString("Receiving: %1% (%2 MB / %3 MB)")
-        .arg(percentage).arg(recvMb, 0, 'f', 2).arg(totalMb, 0, 'f', 2));
+    server_status_lbl_->setText(QString("Receiving Encrypted Blob: %1% (%2 MB / %3 MB)")
+                                    .arg(percentage)
+                                    .arg(recvMb, 0, 'f', 2)
+                                    .arg(totalMb, 0, 'f', 2));
 }
 
 void MainWindow::onReceiveFinished(bool ok, const QString& message) {
     if (ok) {
         recv_progress_bar_->setValue(100);
-        server_status_lbl_->setText("Received: " + message);
-        onLogMessage("[SERVER] Saved " + message);
+        server_status_lbl_->setText("Stored Encrypted Blob: " + message);
     } else {
         recv_progress_bar_->setValue(0);
-        server_status_lbl_->setText("Receive failed: " + message);
-        onLogMessage("[SERVER] FAILED: " + message);
+        server_status_lbl_->setText("Cloud Write Failed: " + message);
     }
 }
