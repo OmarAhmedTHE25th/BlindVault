@@ -1,0 +1,31 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+out/
+
+# IDE files
+.idea/
+.vscode/
+
+# Your node's identity and trust list. NEVER commit a private key.
+# Create your own identity with:  P2P_Secure_File_Sharing init
+identity.key
+identity.crt
+trusted_peers.txt
+*.pem
+# (the old shared certificate, no longer used)
+server.key
+server.crt
+
+# Files created by running the program
+received/
+*.part
+
+# Fuzzing output
+corpus-work/
+fuzz-artifacts/
+crash-*
+leak-*
+timeout-*
+oom-*
