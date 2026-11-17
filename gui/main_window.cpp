@@ -1,5 +1,4 @@
 #include "main_window.hpp"
-#include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QFormLayout>
@@ -15,7 +14,6 @@
 #include <filesystem>
 #include "identity.hpp"
 #include "trust_store.hpp"
-#include <openssl/err.h>
 
 namespace {
 std::filesystem::path getIdentityDirectory() {
@@ -34,8 +32,8 @@ std::filesystem::path getIdentityDirectory() {
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent), bridge_(new NetworkBridge(this)) {
-    setMinimumSize(1060, 740);
-    resize(1140, 780);
+    setMinimumSize(1120, 780);
+    resize(1200, 820);
     setupUi();
     if (!initializeIdentity()) {
         QTimer::singleShot(0, this, &QWidget::close);
@@ -150,7 +148,7 @@ bool MainWindow::initializeIdentity() {
 }
 
 void MainWindow::setupUi() {
-    setWindowTitle("BlindVault — Zero-Knowledge RegTech Storage Gateway");
+    setWindowTitle("BlindVault — Hardened Zero-Knowledge RegTech Storage Gateway");
 
     auto* centralWidget = new QWidget(this);
     auto* mainLayout = new QVBoxLayout(centralWidget);
@@ -165,9 +163,9 @@ void MainWindow::setupUi() {
     idLayout->setSpacing(10);
 
     auto* idHeaderLayout = new QHBoxLayout();
-    auto* appTitle = new QLabel("BlindVault — Zero-Knowledge RegTech Gateway", centralWidget);
+    auto* appTitle = new QLabel("BlindVault — Hardened Zero-Knowledge RegTech Gateway", centralWidget);
     appTitle->setObjectName("appTitle");
-    auto* badge = new QLabel("AES-256-GCM + Mutual TLS 1.3", centralWidget);
+    auto* badge = new QLabel("RFC 3394 KEK + 2-of-3 Quorum + AES-256-GCM + mTLS 1.3", centralWidget);
     badge->setObjectName("badge");
     idHeaderLayout->addWidget(appTitle);
     idHeaderLayout->addStretch();
@@ -197,9 +195,9 @@ void MainWindow::setupUi() {
 
     auto* tabs = new QTabWidget(centralWidget);
     tabs->addTab(createEgressGatewayTab(), "1. Bank Egress Gateway");
-    tabs->addTab(createAuditorTab(), "2. Auditor Query & Cloud Proof");
+    tabs->addTab(createAuditorTab(), "2. Quorum Auditor & Cloud Proof");
     tabs->addTab(createCloudAndTrustTab(), "3. Cloud Vault & Node Trust");
-    columnsLayout->addWidget(tabs, 62);
+    columnsLayout->addWidget(tabs, 60);
 
     // Right Column: Live Compliance & Telemetry Log
     auto* logCard = new QFrame(centralWidget);
@@ -209,7 +207,7 @@ void MainWindow::setupUi() {
     logLayout->setSpacing(10);
 
     auto* logHeaderLayout = new QHBoxLayout();
-    auto* logTitle = new QLabel("RegTech Telemetry & Audit Log", centralWidget);
+    auto* logTitle = new QLabel("RegTech Telemetry & Security Audit Log", centralWidget);
     logTitle->setObjectName("cardTitle");
     auto* clearLogBtn = new QPushButton("Clear", centralWidget);
     clearLogBtn->setObjectName("secondaryBtn");
@@ -222,9 +220,10 @@ void MainWindow::setupUi() {
 
     log_pane_ = new QTextEdit(this);
     log_pane_->setReadOnly(true);
+    log_pane_->setStyleSheet("font-size: 14px; line-height: 1.45;");
     logLayout->addWidget(log_pane_, 1);
 
-    columnsLayout->addWidget(logCard, 38);
+    columnsLayout->addWidget(logCard, 40);
     mainLayout->addLayout(columnsLayout, 1);
 
     setCentralWidget(centralWidget);
@@ -240,7 +239,7 @@ QWidget* MainWindow::createEgressGatewayTab() {
     auto* targetCard = new QFrame(tab);
     targetCard->setObjectName("card");
     auto* targetLayout = new QVBoxLayout(targetCard);
-    targetLayout->setContentsMargins(20, 16, 20, 16);
+    targetLayout->setContentsMargins(20, 14, 20, 14);
     targetLayout->setSpacing(10);
 
     auto* targetTitle = new QLabel("Untrusted Cloud Vault Endpoint", targetCard);
@@ -271,8 +270,8 @@ QWidget* MainWindow::createEgressGatewayTab() {
     auto* batchCard = new QFrame(tab);
     batchCard->setObjectName("card");
     auto* batchLayout = new QVBoxLayout(batchCard);
-    batchLayout->setContentsMargins(20, 16, 20, 16);
-    batchLayout->setSpacing(12);
+    batchLayout->setContentsMargins(20, 14, 20, 14);
+    batchLayout->setSpacing(10);
 
     auto* batchHeader = new QHBoxLayout();
     auto* batchTitle = new QLabel("Core Banking Transaction Batch (CSV)", batchCard);
@@ -303,14 +302,14 @@ QWidget* MainWindow::createEgressGatewayTab() {
     batchLayout->addLayout(fileRow);
     layout->addWidget(batchCard);
 
-    // Action & Telemetry Card
+    // Action & Hardened Telemetry Card
     auto* actionCard = new QFrame(tab);
     actionCard->setObjectName("card");
     auto* actionLayout = new QVBoxLayout(actionCard);
-    actionLayout->setContentsMargins(20, 16, 20, 16);
-    actionLayout->setSpacing(12);
+    actionLayout->setContentsMargins(20, 14, 20, 14);
+    actionLayout->setSpacing(10);
 
-    send_btn_ = new QPushButton("Sanitize PII, Encrypt (AES-256-GCM) & Offload", actionCard);
+    send_btn_ = new QPushButton("Sanitize PII, Pad 64KiB, Wrap DEK & Offload", actionCard);
     send_btn_->setObjectName("primaryBtn");
     send_btn_->setFixedHeight(42);
     connect(send_btn_, &QPushButton::clicked, this, &MainWindow::onOffloadCsv);
@@ -321,10 +320,15 @@ QWidget* MainWindow::createEgressGatewayTab() {
     progress_bar_->setFixedHeight(20);
     actionLayout->addWidget(progress_bar_);
 
-    telemetry_lbl_ = new QLabel("Pipeline Ready | Zero PII & Zero Internal IPs Leave Bank Perimeter", actionCard);
+    telemetry_lbl_ = new QLabel("Throughput: Ready | Zero PII & Zero Internal IPs Leave Bank Perimeter", actionCard);
     telemetry_lbl_->setObjectName("monoBox");
     telemetry_lbl_->setAlignment(Qt::AlignCenter);
     actionLayout->addWidget(telemetry_lbl_);
+
+    hardening_lbl_ = new QLabel("Hardening: RFC 3394 KEK Wrap | 64 KiB Traffic Padding | 2-of-3 Erasure Shards | RLIMIT_CORE=0", actionCard);
+    hardening_lbl_->setObjectName("monoBox");
+    hardening_lbl_->setAlignment(Qt::AlignCenter);
+    actionLayout->addWidget(hardening_lbl_);
 
     transfer_status_lbl_ = new QLabel("Awaiting batch offload", actionCard);
     transfer_status_lbl_->setObjectName("subheading");
@@ -342,23 +346,40 @@ QWidget* MainWindow::createAuditorTab() {
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(10);
 
-    // Query Bar Card
+    // M-of-N Compliance Quorum & Query Card
     auto* searchCard = new QFrame(tab);
     searchCard->setObjectName("card");
     auto* searchLayout = new QVBoxLayout(searchCard);
-    searchLayout->setContentsMargins(20, 16, 20, 16);
+    searchLayout->setContentsMargins(20, 14, 20, 14);
     searchLayout->setSpacing(10);
 
-    auto* searchTitle = new QLabel("Authorized Bank Auditor Retrieval (Blind Index Lookup)", searchCard);
+    auto* searchTitle = new QLabel("M-of-N Compliance Quorum Gate & Blind Index Retrieval", searchCard);
     searchTitle->setObjectName("cardTitle");
     searchLayout->addWidget(searchTitle);
+
+    auto* quorumRow = new QHBoxLayout();
+    auto* qLbl = new QLabel("Dual-Custody Officer Sign-Off (Requires >= 2 of 3):", searchCard);
+    qLbl->setObjectName("inputLabel");
+    officer1_chk_ = new QCheckBox("CBE-Officer-1", searchCard);
+    officer2_chk_ = new QCheckBox("CBE-Officer-2", searchCard);
+    officer3_chk_ = new QCheckBox("CBE-Officer-3", searchCard);
+    officer1_chk_->setChecked(true);
+    officer2_chk_->setChecked(true);
+    officer3_chk_->setChecked(false);
+
+    quorumRow->addWidget(qLbl);
+    quorumRow->addWidget(officer1_chk_);
+    quorumRow->addWidget(officer2_chk_);
+    quorumRow->addWidget(officer3_chk_);
+    quorumRow->addStretch();
+    searchLayout->addLayout(quorumRow);
 
     auto* searchRow = new QHBoxLayout();
     auditor_query_input_ = new QLineEdit(searchCard);
     auditor_query_input_->setPlaceholderText("Enter Customer Name (e.g. Ahmed Hassan), National ID, or IBAN...");
     auditor_query_input_->setFixedHeight(36);
 
-    auditor_search_btn_ = new QPushButton("Fetch & Re-Hydrate", searchCard);
+    auditor_search_btn_ = new QPushButton("Verify Quorum & Re-Hydrate", searchCard);
     auditor_search_btn_->setObjectName("primaryBtn");
     auditor_search_btn_->setFixedHeight(36);
     connect(auditor_search_btn_, &QPushButton::clicked, this, &MainWindow::onAuditorSearch);
@@ -367,7 +388,7 @@ QWidget* MainWindow::createAuditorTab() {
     searchRow->addWidget(auditor_search_btn_);
     searchLayout->addLayout(searchRow);
 
-    auditor_token_lbl_ = new QLabel("Resolved Token: —", searchCard);
+    auditor_token_lbl_ = new QLabel("Quorum & Token Status: Ready", searchCard);
     auditor_token_lbl_->setObjectName("subheading");
     searchLayout->addWidget(auditor_token_lbl_);
     layout->addWidget(searchCard);
@@ -376,10 +397,10 @@ QWidget* MainWindow::createAuditorTab() {
     auto* restoredCard = new QFrame(tab);
     restoredCard->setObjectName("card");
     auto* restoredLayout = new QVBoxLayout(restoredCard);
-    restoredLayout->setContentsMargins(20, 14, 20, 14);
+    restoredLayout->setContentsMargins(20, 12, 20, 12);
     restoredLayout->setSpacing(8);
 
-    auto* restoredTitle = new QLabel("Bank Perimeter View (Decrypted & Re-Hydrated in Memory)", restoredCard);
+    auto* restoredTitle = new QLabel("Bank Perimeter View (Unwrapped DEK -> Decrypted -> RAM Cleansed After Render)", restoredCard);
     restoredTitle->setObjectName("cardTitle");
     restoredLayout->addWidget(restoredTitle);
 
@@ -387,7 +408,7 @@ QWidget* MainWindow::createAuditorTab() {
     auditor_table_->setHorizontalHeaderLabels({"Tx ID", "Timestamp", "Customer", "National ID", "Amount (EGP)", "Merchant"});
     auditor_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     auditor_table_->setAlternatingRowColors(true);
-    auditor_table_->setMinimumHeight(150);
+    auditor_table_->setMinimumHeight(140);
     restoredLayout->addWidget(auditor_table_);
     layout->addWidget(restoredCard);
 
@@ -395,17 +416,18 @@ QWidget* MainWindow::createAuditorTab() {
     auto* cloudCard = new QFrame(tab);
     cloudCard->setObjectName("card");
     auto* cloudLayout = new QVBoxLayout(cloudCard);
-    cloudLayout->setContentsMargins(20, 14, 20, 14);
+    cloudLayout->setContentsMargins(20, 12, 20, 12);
     cloudLayout->setSpacing(8);
 
-    auto* cloudTitle = new QLabel("Untrusted Cloud Storage View (Raw BVLT AES-256-GCM Ciphertext on Disk)", cloudCard);
+    auto* cloudTitle = new QLabel("Untrusted Cloud Storage View (64 KiB-Padded BVLT v2 AES-256-GCM Ciphertext)", cloudCard);
     cloudTitle->setObjectName("cardTitle");
     cloudLayout->addWidget(cloudTitle);
 
     cloud_hex_view_ = new QTextEdit(cloudCard);
     cloud_hex_view_->setReadOnly(true);
     cloud_hex_view_->setMaximumHeight(110);
-    cloud_hex_view_->setPlaceholderText("Run an auditor query to inspect the raw encrypted bytes stored on the cloud node...");
+    cloud_hex_view_->setStyleSheet("font-size: 13px;");
+    cloud_hex_view_->setPlaceholderText("Run an authorized quorum query to inspect the raw padded ciphertext stored on the cloud node...");
     cloudLayout->addWidget(cloud_hex_view_);
     layout->addWidget(cloudCard);
 
@@ -533,7 +555,7 @@ void MainWindow::onBrowseSaveDir() {
     if (!dir.isEmpty()) save_dir_input_->setText(dir);
 }
 
-void MainWindow::onCopyFingerprint() {
+void MainWindow::onCopyFingerprint() const {
     if (!raw_fingerprint_.isEmpty()) {
         QGuiApplication::clipboard()->setText(raw_fingerprint_);
         copy_fp_btn_->setText("Copied!");
@@ -568,11 +590,12 @@ void MainWindow::onOffloadCsv() {
     }
     send_btn_->setEnabled(false);
     progress_bar_->setValue(0);
-    transfer_status_lbl_->setText("Sanitizing PII, encrypting AES-256-GCM, and streaming...");
+    transfer_status_lbl_->setText("Tokenizing PII, padding to 64KiB, wrapping DEK via RFC 3394, and streaming...");
     bridge_->ingestAndOffloadCsv(host, port, path);
 }
 
 void MainWindow::onOffloadTelemetryReady(quint64 records, quint64 piiTokenized, quint64 ipsMasked,
+                                         quint64 paddedBytes, quint64 shardBytes,
                                          double elapsedMs, double recordsPerSec, const QString& blobName) {
     telemetry_lbl_->setText(QString("Blob: %1 | %2 tx | %3 PII tokenized | %4 IPs masked | %5 ms (%6 rec/s)")
                                 .arg(blobName)
@@ -581,6 +604,9 @@ void MainWindow::onOffloadTelemetryReady(quint64 records, quint64 piiTokenized, 
                                 .arg(ipsMasked)
                                 .arg(elapsedMs, 0, 'f', 1)
                                 .arg(recordsPerSec, 0, 'f', 0));
+    hardening_lbl_->setText(QString("Padded Envelope: %1 B (64KiB aligned) | 3x Erasure Shards: %2 B each | DEK Wrapped & Cleansed")
+                                .arg(paddedBytes)
+                                .arg(shardBytes));
 }
 
 void MainWindow::onAuditorSearch() {
@@ -589,14 +615,26 @@ void MainWindow::onAuditorSearch() {
         QMessageBox::warning(this, "Auditor Query", "Enter a Customer Name, National ID, or IBAN.");
         return;
     }
-    bridge_->queryAuditorRecords(query, save_dir_input_->text().trimmed());
+    bridge_->queryAuditorRecords(
+        query,
+        save_dir_input_->text().trimmed(),
+        officer1_chk_->isChecked(),
+        officer2_chk_->isChecked(),
+        officer3_chk_->isChecked());
 }
 
-void MainWindow::onAuditorQueryCompleted(bool found, const QString& matchedToken,
+void MainWindow::onAuditorQueryCompleted(bool authorized, bool found, const QString& statusOrToken,
                                          const QString& restoredCsv, const QString& rawCloudHex) {
-    auditor_token_lbl_->setText("Resolved Deterministic Token: " + matchedToken);
     auditor_table_->setRowCount(0);
     cloud_hex_view_->setPlainText(rawCloudHex);
+
+    if (!authorized) {
+        auditor_token_lbl_->setText("ACCESS BLOCKED: " + statusOrToken);
+        QMessageBox::warning(this, "Compliance Quorum Denied", statusOrToken);
+        return;
+    }
+
+    auditor_token_lbl_->setText("Quorum Verified (2-of-3) | Resolved Token: " + statusOrToken);
 
     if (!found) {
         QMessageBox::information(this, "No Records", "No archived encrypted blobs matched that identifier.");
@@ -674,7 +712,7 @@ void MainWindow::onTransferProgress(int percentage, quint64 transferred, quint64
     if (total > 0) {
         const double transMb = static_cast<double>(transferred) / (1024.0 * 1024.0);
         const double totalMb = static_cast<double>(total) / (1024.0 * 1024.0);
-        transfer_status_lbl_->setText(QString("Mutual TLS Stream: %1% (%2 MB / %3 MB)")
+        transfer_status_lbl_->setText(QString("Mutual TLS 1.3 Stream: %1% (%2 MB / %3 MB)")
                                           .arg(percentage)
                                           .arg(transMb, 0, 'f', 2)
                                           .arg(totalMb, 0, 'f', 2));
@@ -685,7 +723,7 @@ void MainWindow::onTransferCompleted(bool success, const QString& status) const 
     send_btn_->setEnabled(true);
     if (success) {
         progress_bar_->setValue(100);
-        transfer_status_lbl_->setText("Zero-knowledge encrypted blob verified and stored on Cloud Node!");
+        transfer_status_lbl_->setText("64KiB-padded BVLT v2 encrypted blob verified and stored on Cloud Node!");
     } else {
         transfer_status_lbl_->setText("Offload failed: " + status);
     }
@@ -712,10 +750,10 @@ void MainWindow::onReceiveProgress(int percentage, quint64 received, quint64 tot
                                     .arg(totalMb, 0, 'f', 2));
 }
 
-void MainWindow::onReceiveFinished(bool ok, const QString& message) {
+void MainWindow::onReceiveFinished(bool ok, const QString& message) const {
     if (ok) {
         recv_progress_bar_->setValue(100);
-        server_status_lbl_->setText("Stored Encrypted Blob: " + message);
+        server_status_lbl_->setText("Stored BVLT v2 Ciphertext: " + message);
     } else {
         recv_progress_bar_->setValue(0);
         server_status_lbl_->setText("Cloud Write Failed: " + message);

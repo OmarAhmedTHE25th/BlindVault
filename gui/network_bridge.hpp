@@ -21,10 +21,11 @@ public:
     void startServer(uint16_t port, const QString& saveDir);
     void sendFile(const QString& host, uint16_t port, const QString& filePath);
 
-    // BlindVault RegTech Pipeline Methods
+    // BlindVault Hardened RegTech Pipeline Methods
     void generateSyntheticBatch(quint64 rowCount);
     void ingestAndOffloadCsv(const QString& host, uint16_t port, const QString& csvPath);
-    void queryAuditorRecords(const QString& identifier, const QString& cloudDir);
+    void queryAuditorRecords(const QString& identifier, const QString& cloudDir,
+                             bool officer1Approved, bool officer2Approved, bool officer3Approved);
 
 signals:
     void logMessage(const QString& msg);
@@ -35,11 +36,12 @@ signals:
     void receiveProgress(int percentage, quint64 received, quint64 total);
     void receiveFinished(bool ok, const QString& message);
 
-    // BlindVault RegTech Signals
+    // BlindVault Hardened RegTech Signals
     void syntheticBatchReady(const QString& csvPath);
     void offloadTelemetryReady(quint64 records, quint64 piiTokenized, quint64 ipsMasked,
+                               quint64 paddedBytes, quint64 shardBytes,
                                double elapsedMs, double recordsPerSec, const QString& blobName);
-    void auditorQueryCompleted(bool found, const QString& matchedToken,
+    void auditorQueryCompleted(bool authorized, bool found, const QString& statusOrToken,
                                const QString& restoredCsv, const QString& rawCloudHex);
 
 private:

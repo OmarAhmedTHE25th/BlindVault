@@ -8,6 +8,7 @@
 #include <QTableWidget>
 #include <QLabel>
 #include <QFrame>
+#include <QCheckBox>
 #include "network_bridge.hpp"
 
 class MainWindow : public QMainWindow {
@@ -18,7 +19,7 @@ public:
 private slots:
     void onBrowseFile();
     void onBrowseSaveDir();
-    void onCopyFingerprint();
+    void onCopyFingerprint() const;
     void onClearLog() const;
     void onGenerateSynthetic();
     void onOffloadCsv();
@@ -32,14 +33,15 @@ private slots:
     void onTransferCompleted(bool success, const QString& status) const;
     void onSyntheticBatchReady(const QString& csvPath);
     void onOffloadTelemetryReady(quint64 records, quint64 piiTokenized, quint64 ipsMasked,
+                                 quint64 paddedBytes, quint64 shardBytes,
                                  double elapsedMs, double recordsPerSec, const QString& blobName);
-    void onAuditorQueryCompleted(bool found, const QString& matchedToken,
+    void onAuditorQueryCompleted(bool authorized, bool found, const QString& statusOrToken,
                                  const QString& restoredCsv, const QString& rawCloudHex);
 
     void refreshPeerList() const;
     void onServerStatus(bool ok, const QString& message);
     void onReceiveProgress(int percentage, quint64 received, quint64 total);
-    void onReceiveFinished(bool ok, const QString& message);
+    void onReceiveFinished(bool ok, const QString& message) const;
 
 private:
     void setupUi();
@@ -64,10 +66,14 @@ private:
     QProgressBar* progress_bar_ = nullptr;
     QLabel* transfer_status_lbl_ = nullptr;
     QLabel* telemetry_lbl_ = nullptr;
+    QLabel* hardening_lbl_ = nullptr;
 
     // Tab 2: Auditor Re-Hydration & Cloud Proof widgets
     QLineEdit* auditor_query_input_ = nullptr;
     QPushButton* auditor_search_btn_ = nullptr;
+    QCheckBox* officer1_chk_ = nullptr;
+    QCheckBox* officer2_chk_ = nullptr;
+    QCheckBox* officer3_chk_ = nullptr;
     QLabel* auditor_token_lbl_ = nullptr;
     QTableWidget* auditor_table_ = nullptr;
     QTextEdit* cloud_hex_view_ = nullptr;
