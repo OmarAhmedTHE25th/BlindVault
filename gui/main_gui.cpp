@@ -235,7 +235,7 @@ int main(int argc, char* argv[]) {
         padding: 10px;
         color: #334155;
         font-family: "SF Mono", "Fira Code", "Consolas", "Courier New", monospace;
-        font-size: 12px;
+        font-size: 15px;
         line-height: 1.4;
     }
     QTextEdit:focus {
