@@ -294,14 +294,22 @@ private:
 
         std::ostringstream body_accum;
         std::string file_mac;
+        bool saw_mac = false;
         std::string line;
         while (std::getline(in, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) continue;
 
             if (line.rfind("MAC\t", 0) == 0) {
+                if (saw_mac) {
+                    throw std::runtime_error("MetadataIndex: malformed record in index file");
+                }
                 file_mac = line.substr(4);
-                break;
+                saw_mac = true;
+                continue;
+            }
+            if (saw_mac) {
+                throw std::runtime_error("MetadataIndex: unexpected data after index MAC");
             }
             body_accum << line << '\n';
 

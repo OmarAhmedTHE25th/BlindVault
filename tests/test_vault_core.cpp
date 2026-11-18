@@ -44,7 +44,8 @@ TEST(VaultCrypto, RoundTripEncryptAndDecrypt) {
     EXPECT_EQ(envelope[2], 'L');
     EXPECT_EQ(envelope[3], '2');
 
-    const auto decrypted = vault_crypto::decrypt_envelope(envelope.data(), envelope.size(), key, /*unpad_traffic=*/true);
+    const auto decrypted = vault_crypto::decrypt_envelope(
+        envelope.data(), envelope.size(), key, /*unpad_traffic=*/true);
     EXPECT_EQ(decrypted.as_string(), secret_csv);
 }
 
