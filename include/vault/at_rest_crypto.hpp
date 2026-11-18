@@ -16,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -296,7 +297,8 @@ inline SecretBuffer unpad_from_bucket(const SecretBuffer& padded) {
 }
 
 inline std::vector<uint8_t> encrypt_envelope(const uint8_t* plaintext, std::size_t plaintext_len,
-                                             const SecretKey& dek, bool pad_traffic = true) {
+                                             const SecretKey& dek, bool pad_traffic = true,
+                                             std::string_view aad = {}) {
     SecretBuffer prepared;
     const uint8_t* src_ptr = plaintext;
     std::size_t src_len = plaintext_len;
@@ -319,6 +321,14 @@ inline std::vector<uint8_t> encrypt_envelope(const uint8_t* plaintext, std::size
         EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(IV_LEN), nullptr) != 1 ||
         EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, dek.data(), iv.data()) != 1) {
         throw std::runtime_error("vault_crypto: AES-256-GCM init failed");
+    }
+    if (!aad.empty()) {
+        int aad_len = 0;
+        if (EVP_EncryptUpdate(ctx.get(), nullptr, &aad_len,
+                              reinterpret_cast<const uint8_t*>(aad.data()),
+                              static_cast<int>(aad.size())) != 1) {
+            throw std::runtime_error("vault_crypto: AES-256-GCM AAD update failed");
+        }
     }
 
     std::vector<uint8_t> out(HEADER_LEN + src_len);
@@ -346,12 +356,15 @@ inline std::vector<uint8_t> encrypt_envelope(const uint8_t* plaintext, std::size
     return out;
 }
 
-inline std::vector<uint8_t> encrypt_envelope(const std::string& plaintext, const SecretKey& dek, bool pad_traffic = true) {
-    return encrypt_envelope(reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(), dek, pad_traffic);
+inline std::vector<uint8_t> encrypt_envelope(const std::string& plaintext, const SecretKey& dek,
+                                             bool pad_traffic = true, std::string_view aad = {}) {
+    return encrypt_envelope(reinterpret_cast<const uint8_t*>(plaintext.data()),
+                            plaintext.size(), dek, pad_traffic, aad);
 }
 
 inline SecretBuffer decrypt_envelope(const uint8_t* envelope, std::size_t envelope_len,
-                                     const SecretKey& dek, bool unpad_traffic = true) {
+                                     const SecretKey& dek, bool unpad_traffic = true,
+                                     std::string_view aad = {}) {
     if (envelope_len < HEADER_LEN || std::memcmp(envelope, MAGIC.data(), MAGIC.size()) != 0) {
         throw std::runtime_error("vault_crypto: invalid or truncated BVL2 envelope");
     }
@@ -369,6 +382,14 @@ inline SecretBuffer decrypt_envelope(const uint8_t* envelope, std::size_t envelo
         EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(IV_LEN), nullptr) != 1 ||
         EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, dek.data(), iv_ptr) != 1) {
         throw std::runtime_error("vault_crypto: AES-256-GCM decrypt init failed");
+    }
+    if (!aad.empty()) {
+        int aad_len = 0;
+        if (EVP_DecryptUpdate(ctx.get(), nullptr, &aad_len,
+                              reinterpret_cast<const uint8_t*>(aad.data()),
+                              static_cast<int>(aad.size())) != 1) {
+            throw std::runtime_error("vault_crypto: AES-256-GCM AAD update failed");
+        }
     }
 
     SecretBuffer decrypted(ct_len);

@@ -1,10 +1,12 @@
 #pragma once
-// High-speed PII & IP scrubber / deterministic tokenizer with RFC 4180 CSV support.
+// High-speed PII & IP scrubber / deterministic tokenizer with RFC 4180 CSV support
+// and AES-256-GCM + RFC 3394 KMS-wrapped envelope encryption at rest ("BVTK").
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
-#include <fstream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -13,12 +15,17 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include "at_rest_crypto.hpp"
+#include "kms_provider.hpp"
 
 namespace vault_token {
+
+inline constexpr std::array<uint8_t, 4> TOKEN_FILE_MAGIC = {'B', 'V', 'T', 'K'};
+inline constexpr std::size_t WRAPPED_HEX_LEN = vault_crypto::WRAPPED_KEY_LEN * 2; // 80 chars
 
 struct TransactionRecord {
     std::string tx_id;
@@ -37,7 +44,6 @@ struct SanitizeStats {
     std::size_t ips_masked = 0;
 };
 
-// RFC 4180 CSV row parser: handles quoted fields containing commas and escaped "" quotes
 inline std::vector<std::string> parse_csv_row(std::string_view line) {
     std::vector<std::string> fields;
     std::string cur;
@@ -71,7 +77,6 @@ inline std::vector<std::string> parse_csv_row(std::string_view line) {
     return fields;
 }
 
-// RFC 4180 CSV field escaper & row formatter
 inline std::string escape_csv_field(std::string_view field) {
     const bool needs_quotes = field.find_first_of(",\"\r\n") != std::string_view::npos;
     if (!needs_quotes) return std::string(field);
@@ -98,14 +103,41 @@ inline std::string format_csv_row(const std::vector<std::string>& cols) {
 
 class TokenVault {
 public:
-    explicit TokenVault(std::filesystem::path storage_path, std::array<uint8_t, 32> pepper = {})
-        : storage_path_(std::move(storage_path)), pepper_(pepper) {
+    TokenVault(std::filesystem::path storage_path,
+               std::shared_ptr<vault_kms::KeyManagementProvider> kms,
+               const std::array<uint8_t, 32> &pepper = {})
+        : storage_path_(std::move(storage_path)),
+          kms_(std::move(kms)),
+          pepper_(pepper) {
+        if (!kms_) {
+            throw std::runtime_error("TokenVault: KeyManagementProvider cannot be null");
+        }
         if (pepper_ == std::array<uint8_t, 32>{}) {
-            if (RAND_bytes(pepper_.data(), static_cast<int>(pepper_.size())) != 1) {
-                throw std::runtime_error("TokenVault: failed to generate HMAC pepper");
-            }
+            pepper_ = kms_->derive_tokenizer_pepper();
         }
         load_unlocked();
+    }
+
+    ~TokenVault() {
+        OPENSSL_cleanse(pepper_.data(), pepper_.size());
+    }
+
+    std::unordered_map<std::string, std::string> rotate_kms_pepper() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_map<std::string, std::string> old_to_new;
+        old_to_new.reserve(reverse_map_.size());
+        pepper_ = kms_->derive_tokenizer_pepper();
+        std::unordered_map<std::string, std::string> old_reverse = std::move(reverse_map_);
+        forward_map_.clear();
+        reverse_map_.clear();
+        for (const auto& [old_token, raw] : old_reverse) {
+            const std::string token = compute_token(raw);
+            old_to_new[old_token] = token;
+            forward_map_[raw] = token;
+            reverse_map_[token] = raw;
+        }
+        dirty_ = !old_reverse.empty();
+        return old_to_new;
     }
 
     std::string tokenize(std::string_view raw_value) {
@@ -221,14 +253,33 @@ public:
         return out.str();
     }
 
+    // Encrypts the token mapping under a fresh DEK wrapped by the HSM/KMS and writes atomically (0600)
     void flush() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!dirty_) return;
+
         std::ostringstream buf;
         for (const auto& [token, raw] : reverse_map_) {
             buf << token << '\t' << raw << '\n';
         }
-        vault_crypto::write_secret_file_0600(storage_path_, buf.str());
+        std::string plaintext = buf.str();
+
+        vault_crypto::SecretKey vault_dek = vault_crypto::generate_key();
+        const std::string wrapped_dek_hex = kms_->wrap_dek_hex(vault_dek);
+        const std::vector<uint8_t> ciphertext =
+            vault_crypto::encrypt_envelope(
+                plaintext, vault_dek, /*pad_traffic=*/false, "BVTK:v1");
+        vault_dek.cleanse();
+        OPENSSL_cleanse(plaintext.data(), plaintext.size());
+
+        std::string file_blob;
+        file_blob.reserve(TOKEN_FILE_MAGIC.size() + WRAPPED_HEX_LEN + ciphertext.size());
+        file_blob.append(reinterpret_cast<const char*>(TOKEN_FILE_MAGIC.data()), TOKEN_FILE_MAGIC.size());
+        file_blob.append(wrapped_dek_hex);
+        file_blob.append(reinterpret_cast<const char*>(ciphertext.data()), ciphertext.size());
+
+        vault_crypto::write_secret_file_0600(storage_path_, file_blob);
+        OPENSSL_cleanse(file_blob.data(), file_blob.size());
         dirty_ = false;
     }
 
@@ -258,8 +309,28 @@ private:
     }
 
     void load_unlocked() {
-        std::ifstream in(storage_path_, std::ios::binary);
-        if (!in) return;
+        if (!std::filesystem::exists(storage_path_)) return;
+        const auto bytes = vault_crypto::read_bytes_from_file(storage_path_.string());
+        constexpr std::size_t prefix_len = TOKEN_FILE_MAGIC.size() + WRAPPED_HEX_LEN;
+
+        if (bytes.size() < prefix_len ||
+            std::memcmp(bytes.data(), TOKEN_FILE_MAGIC.data(), TOKEN_FILE_MAGIC.size()) != 0) {
+            throw std::runtime_error("TokenVault: invalid or unencrypted token file header (expected BVTK)");
+        }
+
+        const std::string wrapped_hex(
+            reinterpret_cast<const char*>(bytes.data() + TOKEN_FILE_MAGIC.size()), WRAPPED_HEX_LEN);
+        vault_crypto::SecretKey vault_dek = kms_->unwrap_dek_hex(wrapped_hex);
+
+        vault_crypto::SecretBuffer decrypted = vault_crypto::decrypt_envelope(
+            bytes.data() + prefix_len, bytes.size() - prefix_len, vault_dek,
+            /*unpad_traffic=*/false, "BVTK:v1");
+        vault_dek.cleanse();
+
+        std::string plaintext = decrypted.as_string();
+        decrypted.cleanse();
+
+        std::istringstream in(plaintext);
         std::string line;
         while (std::getline(in, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -270,9 +341,11 @@ private:
             reverse_map_[token] = raw;
             forward_map_[raw]   = token;
         }
+        OPENSSL_cleanse(plaintext.data(), plaintext.size());
     }
 
     std::filesystem::path storage_path_;
+    std::shared_ptr<vault_kms::KeyManagementProvider> kms_;
     std::array<uint8_t, 32> pepper_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::string> forward_map_;

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <mutex>
 #include <ranges>
 #include <sstream>
@@ -17,6 +18,7 @@
 #include <utility>
 #include <vector>
 #include "at_rest_crypto.hpp"
+#include "kms_provider.hpp"
 
 namespace vault_index {
 
@@ -112,15 +114,13 @@ private:
 // HMAC-Authenticated Metadata Index & Cryptographic Hash-Chained Audit Log
 class MetadataIndex {
 public:
-    // In MetadataIndex constructor:
     MetadataIndex(std::filesystem::path index_file,
                   std::filesystem::path audit_log_file,
-                  vault_crypto::SecretKey index_auth_key,
-                  vault_crypto::SecretKey audit_auth_key)
+                  std::shared_ptr<vault_kms::KeyManagementProvider> kms)
         : index_file_(std::move(index_file)),
           audit_log_file_(std::move(audit_log_file)),
-          index_auth_key_(std::move(index_auth_key)),
-          audit_auth_key_(std::move(audit_auth_key)) {
+          kms_(std::move(kms)) {
+        if (!kms_) throw std::runtime_error("MetadataIndex: KMS provider is required");
         load_and_verify_index_unlocked();
         load_and_verify_audit_chain_unlocked();
     }
@@ -156,6 +156,80 @@ public:
         return results;
     }
 
+    std::vector<BlobEntry> blob_entries() const {
+        std::lock_guard lock(mutex_);
+        std::vector<BlobEntry> results;
+        results.reserve(blobs_.size());
+        for (const auto& [_, entry] : blobs_) results.push_back(entry);
+        return results;
+    }
+
+    void update_wrapped_dek(const std::string& blob_name, const std::string& wrapped_dek_hex) {
+        std::lock_guard lock(mutex_);
+        auto it = blobs_.find(blob_name);
+        if (it == blobs_.end()) {
+            throw std::runtime_error("MetadataIndex: unknown blob '" + blob_name + "'");
+        }
+        it->second.wrapped_dek_hex = wrapped_dek_hex;
+        save_authenticated_index_unlocked();
+    }
+
+    void remap_tokens(const std::unordered_map<std::string, std::string>& old_to_new) {
+        std::lock_guard lock(mutex_);
+        for (const auto& [old_token, new_token] : old_to_new) {
+            auto it = token_to_blobs_.find(old_token);
+            if (it == token_to_blobs_.end()) continue;
+            auto& target = token_to_blobs_[new_token];
+            target.insert(it->second.begin(), it->second.end());
+            token_to_blobs_.erase(it);
+        }
+        save_authenticated_index_unlocked();
+    }
+
+    void reauthenticate_after_kms_rotation() {
+        std::lock_guard lock(mutex_);
+
+        save_authenticated_index_unlocked();
+        if (!std::filesystem::exists(audit_log_file_)) {
+            audit_seq_ = 1;
+            last_audit_mac_ = std::string(64, '0');
+            return;
+        }
+
+        std::ifstream in(audit_log_file_, std::ios::binary);
+        if (!in) throw std::runtime_error("MetadataIndex: cannot read audit log for key rotation");
+
+        std::vector<std::array<std::string, 4>> entries;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            std::vector<std::string> cols;
+            std::istringstream ss(line);
+            std::string part;
+            while (std::getline(ss, part, '\t')) cols.push_back(part);
+            if (cols.size() != 6) {
+                throw std::runtime_error("MetadataIndex: malformed audit log during key rotation");
+            }
+            entries.push_back({cols[1], cols[2], cols[3], cols[0]});
+        }
+
+        audit_seq_ = 1;
+        last_audit_mac_ = std::string(64, '0');
+        std::ostringstream rewritten;
+        for (const auto& entry : entries) {
+            const std::string seq = std::to_string(audit_seq_);
+            const std::string body =
+                seq + "|" + entry[0] + "|" + entry[1] + "|" + entry[2] + "|" + last_audit_mac_;
+            const std::string mac = kms_->hmac_audit_hex(body);
+            rewritten << seq << '\t' << entry[0] << '\t' << entry[1] << '\t'
+                      << entry[2] << '\t' << last_audit_mac_ << '\t' << mac << '\n';
+            last_audit_mac_ = mac;
+            audit_seq_ += 1;
+        }
+        vault_crypto::write_secret_file_0600(audit_log_file_, rewritten.str());
+    }
+
     void log_security_event(const std::string& action, const std::string& detail) {
         std::lock_guard lock(mutex_);
         append_chained_audit_unlocked(action, detail);
@@ -168,7 +242,7 @@ public:
             uint64_t expected_seq = 1;
             std::string expected_prev(64, '0');
             return verify_audit_file_internal(
-                audit_log_file_, audit_auth_key_, expected_seq, expected_prev);
+                audit_log_file_, kms_, expected_seq, expected_prev);
         } catch (...) {
             return false;
         }
@@ -193,9 +267,7 @@ private:
         const std::string ts = current_utc_iso();
         const std::string body = std::to_string(audit_seq_) + "|" + ts + "|" +
                                  action + "|" + detail + "|" + last_audit_mac_;
-        const std::string entry_mac =
-            vault_crypto::hmac_sha256_hex(
-                audit_auth_key_.data(), vault_crypto::SecretKey::size(), body);
+        const std::string entry_mac = kms_->hmac_audit_hex(body);
 
         std::ofstream log(audit_log_file_, std::ios::app);
         if (!log) throw std::runtime_error("MetadataIndex: cannot append to audit log");
@@ -208,7 +280,7 @@ private:
     }
 
     static bool verify_audit_file_internal(const std::filesystem::path& path,
-                                           const vault_crypto::SecretKey& key,
+                                           const std::shared_ptr<vault_kms::KeyManagementProvider>& kms,
                                            uint64_t& out_next_seq,
                                            std::string& out_last_mac) {
         out_next_seq = 1;
@@ -233,7 +305,7 @@ private:
             if (!vault_crypto::constant_time_hex_equal(cols[4], out_last_mac)) return false;
 
             const std::string body = cols[0] + "|" + cols[1] + "|" + cols[2] + "|" + cols[3] + "|" + cols[4];
-            const std::string expected_mac = vault_crypto::hmac_sha256_hex(key.data(), vault_crypto::SecretKey::size(), body);
+            const std::string expected_mac = kms->hmac_audit_hex(body);
             if (!vault_crypto::constant_time_hex_equal(cols[5], expected_mac)) return false;
 
             out_last_mac = cols[5];
@@ -244,7 +316,7 @@ private:
 
     void load_and_verify_audit_chain_unlocked() {
         if (!verify_audit_file_internal(
-                audit_log_file_, audit_auth_key_, audit_seq_, last_audit_mac_)) {
+                audit_log_file_, kms_, audit_seq_, last_audit_mac_)) {
             throw std::runtime_error("MetadataIndex: tamper detected in regtech_audit.log hash chain!");
         }
     }
@@ -282,8 +354,7 @@ private:
 
     void save_authenticated_index_unlocked() const {
         const std::string body = serialize_canonical_body_unlocked();
-        const std::string mac = vault_crypto::hmac_sha256_hex(
-            index_auth_key_.data(), vault_crypto::SecretKey::size(), body);
+        const std::string mac = kms_->hmac_index_hex(body);
         vault_crypto::write_secret_file_0600(index_file_, body + "MAC\t" + mac + "\n");
     }
 
@@ -331,9 +402,7 @@ private:
             }
         }
 
-        const std::string expected_mac =
-            vault_crypto::hmac_sha256_hex(
-                index_auth_key_.data(), vault_crypto::SecretKey::size(), body_accum.str());
+        const std::string expected_mac = kms_->hmac_index_hex(body_accum.str());
         if (!vault_crypto::constant_time_hex_equal(file_mac, expected_mac)) {
             throw std::runtime_error("MetadataIndex: HMAC verification failed — vault_index.tsv was tampered with!");
         }
@@ -346,8 +415,7 @@ private:
     std::unordered_map<std::string, std::unordered_set<std::string>> token_to_blobs_;
     uint64_t audit_seq_ = 1;
     std::string last_audit_mac_ = std::string(64, '0');
-    vault_crypto::SecretKey index_auth_key_;
-    vault_crypto::SecretKey audit_auth_key_;
+    std::shared_ptr<vault_kms::KeyManagementProvider> kms_;
 };
 
 } // namespace vault_index

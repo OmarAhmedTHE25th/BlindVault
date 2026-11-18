@@ -44,6 +44,7 @@ add_executable(BlindVault
         include/vault/tokenizer.hpp
         include/vault/vault_index.hpp
         include/vault/vault_gateway.hpp
+        include/vault/kms_provider.hpp
 )
 target_include_directories(BlindVault PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
@@ -89,6 +90,7 @@ if(P2P_BUILD_GUI)
             include/vault/tokenizer.hpp
             include/vault/vault_index.hpp
             include/vault/vault_gateway.hpp
+            include/vault/kms_provider.hpp
     )
 
     target_include_directories(BlindVault_GUI PRIVATE

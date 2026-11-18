@@ -19,10 +19,38 @@
 #include <utility>
 #include <vector>
 #include "at_rest_crypto.hpp"
+#include "kms_provider.hpp"
 #include "tokenizer.hpp"
 #include "vault_index.hpp"
 
 namespace vault_gateway {
+
+class ErasureShardBackend {
+public:
+    virtual ~ErasureShardBackend() = default;
+    virtual void write_shard(const std::filesystem::path& blob_name,
+                             std::size_t shard_index,
+                             const std::vector<uint8_t>& shard) = 0;
+};
+
+class LocalErasureShardBackend final : public ErasureShardBackend {
+public:
+    explicit LocalErasureShardBackend(std::filesystem::path shard_dir)
+        : shard_dir_(std::move(shard_dir)) {
+        std::filesystem::create_directories(shard_dir_);
+    }
+
+    void write_shard(const std::filesystem::path& blob_name,
+                     std::size_t shard_index,
+                     const std::vector<uint8_t>& shard) override {
+        vault_crypto::write_bytes_to_file(
+            (shard_dir_ / (blob_name.string() + ".shard" + std::to_string(shard_index))).string(),
+            shard);
+    }
+
+private:
+    std::filesystem::path shard_dir_;
+};
 
 struct OffloadArtifact {
     std::filesystem::path encrypted_file_path;
@@ -46,22 +74,23 @@ struct AuditorQueryResult {
 
 class GatewayEngine {
 public:
-    explicit GatewayEngine(const std::filesystem::path& state_dir, std::size_t quorum_threshold = 2)
+    explicit GatewayEngine(const std::filesystem::path& state_dir,
+                           std::size_t quorum_threshold = 2,
+                           std::shared_ptr<vault_kms::KeyManagementProvider> kms = nullptr,
+                           std::shared_ptr<ErasureShardBackend> shard_backend = nullptr)
         : state_dir_(state_dir),
           staging_dir_(state_dir / "egress_staging"),
           shards_dir_(state_dir / "erasure_shards"),
-          master_kek_(load_or_create_master_kek(state_dir / "hsm_master.kek")),
-          token_vault_(state_dir / "vault_tokens.tsv"),
-    metadata_index_(
-        state_dir / "vault_index.tsv",
-        state_dir / "regtech_audit.log",
-        vault_crypto::derive_subkey(master_kek_, "blindvault:index-auth:v1"),
-        vault_crypto::derive_subkey(master_kek_, "blindvault:audit-auth:v1")),          quorum_gate_(state_dir / "officers", quorum_threshold) {
+          kms_(kms ? std::move(kms) : vault_kms::create_default_kms(state_dir)),
+          shard_backend_(shard_backend ? std::move(shard_backend)
+                                       : std::make_shared<LocalErasureShardBackend>(state_dir / "erasure_shards")),
+          token_vault_(state_dir / "vault_tokens.enc", kms_),
+          metadata_index_(state_dir / "vault_index.tsv", state_dir / "regtech_audit.log", kms_),
+          quorum_gate_(state_dir / "officers", quorum_threshold) {
         vault_crypto::harden_process_memory();
         std::filesystem::create_directories(staging_dir_);
         std::filesystem::create_directories(shards_dir_);
     }
-
     const vault_index::QuorumGate& quorum_gate() const noexcept { return quorum_gate_; }
     const vault_index::MetadataIndex& metadata_index() const noexcept { return metadata_index_; }
 
@@ -134,21 +163,21 @@ public:
         std::vector<std::string> tokens_in_blob = extract_tokens_from_columns(sanitized_csv);
 
         vault_crypto::SecretKey dek = vault_crypto::generate_key();
+        const std::string blob_name = make_blob_filename();
         const std::vector<uint8_t> ciphertext_envelope =
-            vault_crypto::encrypt_envelope(sanitized_csv, dek, /*pad_traffic=*/true);
+            vault_crypto::encrypt_envelope(
+                sanitized_csv, dek, /*pad_traffic=*/true, blob_name);
         OPENSSL_cleanse(sanitized_csv.data(), sanitized_csv.size());
 
-        const std::string wrapped_dek = vault_crypto::wrap_dek_hex(dek, master_kek_);
+        const std::string wrapped_dek = kms_->wrap_dek_hex(dek);
         dek.cleanse();
 
-        const std::string blob_name = make_blob_filename();
         const std::filesystem::path enc_path = staging_dir_ / blob_name;
         vault_crypto::write_bytes_to_file(enc_path.string(), ciphertext_envelope);
 
         const auto shards = vault_crypto::erasure_split_2of3(ciphertext_envelope);
         for (std::size_t s = 0; s < 3; ++s) {
-            const auto shard_path = shards_dir_ / (blob_name + ".shard" + std::to_string(s));
-            vault_crypto::write_bytes_to_file(shard_path.string(), shards[s]);
+            shard_backend_->write_shard(blob_name, s, shards[s]);
         }
 
         vault_index::BlobEntry entry;
@@ -224,9 +253,11 @@ public:
                 res.raw_cloud_hex_preview = format_hex_dump(encrypted_bytes, 256);
             }
 
-            vault_crypto::SecretKey dek = vault_crypto::unwrap_dek_hex(blob.wrapped_dek_hex, master_kek_);
+            vault_crypto::SecretKey dek = kms_->unwrap_dek_hex(blob.wrapped_dek_hex);
             vault_crypto::SecretBuffer decrypted =
-                vault_crypto::decrypt_envelope(encrypted_bytes.data(), encrypted_bytes.size(), dek, /*unpad_traffic=*/true);
+                vault_crypto::decrypt_envelope(
+                    encrypted_bytes.data(), encrypted_bytes.size(), dek,
+                    /*unpad_traffic=*/true, blob.blob_name);
             dek.cleanse();
 
             std::string sanitized_csv = decrypted.as_string();
@@ -279,6 +310,72 @@ public:
         return res;
     }
 
+    void rotate_master_kek(
+        const vault_crypto::SecretKey& new_master_kek,
+        const std::filesystem::path& cloud_storage_dir = {}) {
+        if (!metadata_index_.verify_audit_chain()) {
+            throw std::runtime_error("GatewayEngine: refusing KEK rotation with tampered audit chain");
+        }
+
+        struct RotationBlob {
+            std::string blob_name;
+            vault_crypto::SecretKey dek;
+            std::string rehydrated_csv;
+        };
+        std::vector<RotationBlob> rotation_blobs;
+        for (const auto& entry : metadata_index_.blob_entries()) {
+            auto blob_path = staging_dir_ / entry.blob_name;
+            if (!cloud_storage_dir.empty()) {
+                const auto cloud_path = cloud_storage_dir / entry.blob_name;
+                if (std::filesystem::exists(cloud_path)) blob_path = cloud_path;
+            }
+            if (!std::filesystem::exists(blob_path)) {
+                throw std::runtime_error("GatewayEngine: cannot rotate missing blob '" +
+                                         entry.blob_name + "'");
+            }
+
+            vault_crypto::SecretKey dek = kms_->unwrap_dek_hex(entry.wrapped_dek_hex);
+            const auto encrypted = vault_crypto::read_bytes_from_file(blob_path.string());
+            vault_crypto::SecretBuffer decrypted =
+                vault_crypto::decrypt_envelope(
+                    encrypted.data(), encrypted.size(), dek,
+                    /*unpad_traffic=*/true, entry.blob_name);
+            std::string sanitized_csv = decrypted.as_string();
+            decrypted.cleanse();
+
+            std::string rehydrated_csv = token_vault_.rehydrate_csv_batch(sanitized_csv);
+            OPENSSL_cleanse(sanitized_csv.data(), sanitized_csv.size());
+            rotation_blobs.push_back(
+                RotationBlob{entry.blob_name, std::move(dek), std::move(rehydrated_csv)});
+        }
+
+        kms_->rotate_master_kek(new_master_kek);
+        metadata_index_.reauthenticate_after_kms_rotation();
+        const auto token_remap = token_vault_.rotate_kms_pepper();
+        metadata_index_.remap_tokens(token_remap);
+        token_vault_.flush();
+
+        for (auto& rotation_blob : rotation_blobs) {
+            std::string sanitized_csv =
+                token_vault_.sanitize_csv_batch(rotation_blob.rehydrated_csv);
+            const auto reencrypted =
+                vault_crypto::encrypt_envelope(
+                    sanitized_csv, rotation_blob.dek,
+                    /*pad_traffic=*/true, rotation_blob.blob_name);
+            OPENSSL_cleanse(sanitized_csv.data(), sanitized_csv.size());
+
+            const auto staging_path = staging_dir_ / rotation_blob.blob_name;
+            vault_crypto::write_bytes_to_file(staging_path.string(), reencrypted);
+            if (!cloud_storage_dir.empty()) {
+                vault_crypto::write_bytes_to_file(
+                    (cloud_storage_dir / rotation_blob.blob_name).string(), reencrypted);
+            }
+
+            const std::string rewrapped = kms_->wrap_dek_hex(rotation_blob.dek);
+            metadata_index_.update_wrapped_dek(rotation_blob.blob_name, rewrapped);
+        }
+    }
+
 private:
     std::string resolve_to_token(const std::string& raw_or_token) {
         if (raw_or_token.rfind("TOK_", 0) == 0) {
@@ -286,26 +383,6 @@ private:
         }
         // Const-safe lookup or deterministic compute via TokenVault
         return const_cast<vault_token::TokenVault&>(token_vault_).tokenize(raw_or_token);
-    }
-
-    static vault_crypto::SecretKey load_or_create_master_kek(const std::filesystem::path& kek_path) {
-        std::filesystem::create_directories(kek_path.parent_path());
-        if (std::filesystem::exists(kek_path)) {
-            std::ifstream in(kek_path, std::ios::binary);
-            std::string hex_str;
-            std::getline(in, hex_str);
-            const auto raw = vault_crypto::hex_to_bytes(hex_str);
-            if (raw.size() != vault_crypto::KEY_LEN) {
-                throw std::runtime_error("GatewayEngine: corrupted HSM master KEK");
-            }
-            vault_crypto::SecretKey kek;
-            std::memcpy(kek.data(), raw.data(), vault_crypto::KEY_LEN);
-            return kek;
-        }
-        vault_crypto::SecretKey kek = vault_crypto::generate_key();
-        vault_crypto::write_secret_file_0600(
-            kek_path, vault_crypto::bytes_to_hex(kek.data(), vault_crypto::SecretKey::size()) + "\n");
-        return kek;
     }
 
     static std::string make_blob_filename() {
@@ -353,7 +430,8 @@ private:
     std::filesystem::path state_dir_;
     std::filesystem::path staging_dir_;
     std::filesystem::path shards_dir_;
-    vault_crypto::SecretKey master_kek_;
+    std::shared_ptr<vault_kms::KeyManagementProvider> kms_;
+    std::shared_ptr<ErasureShardBackend> shard_backend_;
     vault_token::TokenVault token_vault_;
     vault_index::MetadataIndex metadata_index_;
     vault_index::QuorumGate quorum_gate_;

@@ -49,6 +49,24 @@ TEST(VaultCrypto, RoundTripEncryptAndDecrypt) {
     EXPECT_EQ(decrypted.as_string(), secret_csv);
 }
 
+TEST(VaultCrypto, RejectsBlobNameSwapViaAad) {
+    const auto key = vault_crypto::generate_key();
+    const std::string plaintext = "blob-a-record";
+    const auto blob_a = vault_crypto::encrypt_envelope(
+        plaintext, key, /*pad_traffic=*/true, "vault_batch_a.enc");
+    const auto blob_b = vault_crypto::encrypt_envelope(
+        plaintext, key, /*pad_traffic=*/true, "vault_batch_b.enc");
+
+    EXPECT_NO_THROW(vault_crypto::decrypt_envelope(
+        blob_a.data(), blob_a.size(), key, true, "vault_batch_a.enc"));
+    EXPECT_THROW(vault_crypto::decrypt_envelope(
+        blob_a.data(), blob_a.size(), key, true, "vault_batch_b.enc"),
+        std::runtime_error);
+    EXPECT_THROW(vault_crypto::decrypt_envelope(
+        blob_b.data(), blob_b.size(), key, true, "vault_batch_a.enc"),
+        std::runtime_error);
+}
+
 TEST(VaultCrypto, KeyHexRoundTrip) {
     const auto key = vault_crypto::generate_key();
     const std::string hex = vault_crypto::bytes_to_hex(key.data(), vault_crypto::SecretKey::size());
@@ -76,10 +94,11 @@ TEST(VaultCrypto, DetectsTamperedCiphertextOrWrongKey) {
 
 TEST(Tokenizer, DeterministicTokensAndIpMasking) {
     TempDir dir;
+    auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("test.kek"));
     std::array<uint8_t, 32> fixed_pepper{};
     fixed_pepper.fill(0x42);
 
-    vault_token::TokenVault vault(dir.file("tokens.tsv"), fixed_pepper);
+    vault_token::TokenVault vault(dir.file("tokens.tsv"), kms, fixed_pepper);
 
     const std::string t1 = vault.tokenize("30108110101000");
     const std::string t2 = vault.tokenize("30108110101000");
@@ -115,17 +134,18 @@ TEST(Tokenizer, DeterministicTokensAndIpMasking) {
 
 TEST(Tokenizer, PersistsAcrossReloads) {
     TempDir dir;
+    auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("test.kek"));
     std::array<uint8_t, 32> fixed_pepper{};
     fixed_pepper.fill(0x11);
 
     std::string tok;
     {
-        vault_token::TokenVault v1(dir.file("tokens.tsv"), fixed_pepper);
+        vault_token::TokenVault v1(dir.file("tokens.tsv"), kms, fixed_pepper);
         tok = v1.tokenize("Mona El-Sayed");
         v1.flush();
     }
     {
-        vault_token::TokenVault v2(dir.file("tokens.tsv"), fixed_pepper);
+        vault_token::TokenVault v2(dir.file("tokens.tsv"), kms, fixed_pepper);
         EXPECT_EQ(v2.detokenize(tok), "Mona El-Sayed");
     }
 }
@@ -222,4 +242,89 @@ TEST(VaultHardening, EndToEndTokenSearchExactColumnMatchTamperIndexAndChainedAud
         tamper << "MAP\tTOK_deadbeefcafebabe\t" << artifact.blob_name << "\n";
     }
     EXPECT_THROW(vault_gateway::GatewayEngine(state_dir, 2), std::runtime_error);
+}
+
+TEST(Tokenizer, PersistsAcrossReloadsEncryptedAtRest) {
+    TempDir dir;
+    auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("test.kek"));
+    std::array<uint8_t, 32> fixed_pepper{};
+    fixed_pepper.fill(0x11);
+
+    const auto token_file = dir.file("tokens.enc");
+    std::string tok;
+    {
+        vault_token::TokenVault v1(token_file, kms, fixed_pepper);
+        tok = v1.tokenize("Mona El-Sayed");
+        v1.flush();
+    }
+
+    // Verify the file on disk is BVTK-encrypted and contains zero plaintext PII
+    const auto raw_disk = vault_crypto::read_bytes_from_file(token_file.string());
+    ASSERT_GT(raw_disk.size(), 84u);
+    EXPECT_EQ(raw_disk[0], 'B');
+    EXPECT_EQ(raw_disk[1], 'V');
+    EXPECT_EQ(raw_disk[2], 'T');
+    EXPECT_EQ(raw_disk[3], 'K');
+    const std::string disk_str(reinterpret_cast<const char*>(raw_disk.data()), raw_disk.size());
+    EXPECT_EQ(disk_str.find("Mona El-Sayed"), std::string::npos);
+
+    {
+        vault_token::TokenVault v2(token_file, kms, fixed_pepper);
+        EXPECT_EQ(v2.detokenize(tok), "Mona El-Sayed");
+    }
+}
+
+TEST(Tokenizer, DerivedPepperPersistsAcrossKmsInstances) {
+    TempDir dir;
+    const auto kek_path = dir.file("test.kek");
+    const auto token_file = dir.file("tokens.tsv");
+    std::string tok;
+
+    {
+        auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(kek_path);
+        vault_token::TokenVault v1(token_file, kms);
+        tok = v1.tokenize("Cross-Process Customer");
+        v1.flush();
+    }
+
+    {
+        auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(kek_path);
+        vault_token::TokenVault v2(token_file, kms);
+        EXPECT_EQ(v2.detokenize(tok), "Cross-Process Customer");
+    }
+}
+
+TEST(VaultHardening, MasterKekRotationRewrapsAndReauthenticates) {
+    TempDir dir;
+    const auto state_dir = dir.file("bank_state");
+    const auto cloud_bucket = dir.file("cloud_bucket");
+    std::filesystem::create_directories(cloud_bucket);
+
+    vault_gateway::GatewayEngine gateway(state_dir, 2);
+    const auto custom_csv = dir.file("rotation_tx.csv");
+    {
+        std::ofstream out(custom_csv);
+        out << "tx_id,timestamp,customer_name,national_id,iban,source_ip,amount_egp,merchant\n";
+        out << "TXNROT,2026-11-18T12:00:00Z,Rotation Customer,30108110101000,EG380019000500000000263181000,41.10.20.30,500.00,Safe-Merchant\n";
+    }
+
+    const auto artifact = gateway.prepare_encrypted_offload(custom_csv);
+    std::filesystem::copy_file(artifact.encrypted_file_path, cloud_bucket / artifact.blob_name);
+    EXPECT_TRUE(gateway.metadata_index().verify_audit_chain());
+
+    gateway.rotate_master_kek(vault_crypto::generate_key(), cloud_bucket);
+
+    EXPECT_TRUE(gateway.metadata_index().verify_audit_chain());
+    const auto blob_entries = gateway.metadata_index().blob_entries();
+    ASSERT_EQ(blob_entries.size(), 1u);
+    EXPECT_FALSE(blob_entries[0].wrapped_dek_hex.empty());
+
+    const auto approvals = gateway.collect_officer_approvals("CBE-Officer-1", "Rotation Customer");
+    auto second = gateway.collect_officer_approvals("CBE-Officer-2", "Rotation Customer");
+    std::vector<std::pair<std::string, std::string>> dual = approvals;
+    dual.insert(dual.end(), second.begin(), second.end());
+    const auto result = gateway.auditor_query("Rotation Customer", cloud_bucket, dual);
+    EXPECT_TRUE(result.authorized);
+    EXPECT_TRUE(result.found);
+    EXPECT_NE(result.restored_csv.find("Rotation Customer"), std::string::npos);
 }
