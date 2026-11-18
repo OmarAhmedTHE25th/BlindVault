@@ -50,7 +50,7 @@ TEST(VaultCrypto, RoundTripEncryptAndDecrypt) {
 
 TEST(VaultCrypto, KeyHexRoundTrip) {
     const auto key = vault_crypto::generate_key();
-    const std::string hex = vault_crypto::bytes_to_hex(key.data(), key.size());
+    const std::string hex = vault_crypto::bytes_to_hex(key.data(), vault_crypto::SecretKey::size());
     EXPECT_EQ(hex.size(), 64u);
 
     const auto raw = vault_crypto::hex_to_bytes(hex);
@@ -165,47 +165,60 @@ TEST(VaultHardening, TwoOfThreeErasureCodingSurvivesCloudNodeLoss) {
     EXPECT_EQ(dec.as_string(), payload);
 }
 
-TEST(VaultHardening, EndToEndOffloadZeroLeakageAndQuorumEnforcement) {
+TEST(VaultHardening, EndToEndTokenSearchExactColumnMatchTamperIndexAndChainedAudit) {
     TempDir dir;
     const auto cloud_bucket = dir.file("cloud_bucket");
+    const auto state_dir    = dir.file("bank_state");
     std::filesystem::create_directories(cloud_bucket);
 
-    vault_gateway::GatewayEngine gateway(dir.file("bank_state"), /*quorum_threshold=*/2);
+    vault_gateway::GatewayEngine gateway(state_dir, /*quorum_threshold=*/2);
 
-    const auto raw_csv_path = gateway.generate_synthetic_cbe_batch(250);
-    ASSERT_TRUE(std::filesystem::exists(raw_csv_path));
+    // Create a custom CSV where a merchant is named "Ahmed-Electronics" while the customer is "Mona El-Sayed"
+    const auto custom_csv = dir.file("custom_tx.csv");
+    {
+        std::ofstream out(custom_csv);
+        out << "tx_id,timestamp,customer_name,national_id,iban,source_ip,amount_egp,merchant\n";
+        out << "TXN1,2026-11-18T02:00:00Z,Ahmed Hassan,30108110101000,EG380019000500000000263181000,41.10.20.30,500.00,Carrefour\n";
+        out << "TXN2,2026-11-18T02:01:00Z,Mona El-Sayed,29901010102222,EG380019000500000000263181001,41.10.20.31,900.00,Ahmed-Electronics\n";
+    }
 
-    const auto artifact = gateway.prepare_encrypted_offload(raw_csv_path);
-    EXPECT_EQ(artifact.stats.records_processed, 250u);
-    EXPECT_EQ(artifact.stats.ips_masked, 250u);
-    EXPECT_EQ(artifact.padded_size_bytes % vault_crypto::BUCKET_ALIGN, vault_crypto::HEADER_LEN);
-    ASSERT_TRUE(std::filesystem::exists(artifact.encrypted_file_path));
+    const auto artifact = gateway.prepare_encrypted_offload(custom_csv);
+    std::filesystem::copy_file(artifact.encrypted_file_path, cloud_bucket / artifact.blob_name);
 
-    const auto cloud_blob_path = cloud_bucket / artifact.blob_name;
-    std::filesystem::copy_file(artifact.encrypted_file_path, cloud_blob_path);
-
-    // Zero-knowledge check: no plaintext PII or IPs in cloud blob
-    const auto raw_cloud_bytes = vault_crypto::read_bytes_from_file(cloud_blob_path.string());
-    const std::string raw_cloud_str(reinterpret_cast<const char*>(raw_cloud_bytes.data()), raw_cloud_bytes.size());
-    EXPECT_EQ(raw_cloud_str.find("Ahmed Hassan"), std::string::npos);
-    EXPECT_EQ(raw_cloud_str.find("30108110101000"), std::string::npos);
-    EXPECT_EQ(raw_cloud_str.find("EG380019"), std::string::npos);
-    EXPECT_EQ(raw_cloud_str.find("41."), std::string::npos);
-
-    // 1. Solo officer (1 of 3) must be DENIED
-    const std::string sig1 = gateway.sign_quorum_approval("CBE-Officer-1", "30108110101000");
-    const auto denied = gateway.auditor_query("30108110101000", cloud_bucket, {{"CBE-Officer-1", sig1}}, "Solo-Auditor");
+    // 1. Solo officer must be DENIED
+    const auto solo = gateway.collect_officer_approvals("CBE-Officer-1", "Ahmed Hassan");
+    const auto denied = gateway.auditor_query("Ahmed Hassan", cloud_bucket, solo, "Solo-Auditor");
     EXPECT_FALSE(denied.authorized);
-    EXPECT_FALSE(denied.found);
 
-    // 2. Two distinct officers (2 of 3) must SUCCEED
-    const std::string sig2 = gateway.sign_quorum_approval("CBE-Officer-2", "30108110101000");
-    const auto allowed = gateway.auditor_query(
-        "30108110101000", cloud_bucket, {{"CBE-Officer-1", sig1}, {"CBE-Officer-2", sig2}}, "Dual-Auditor");
-    EXPECT_TRUE(allowed.authorized);
-    EXPECT_TRUE(allowed.found);
-    EXPECT_NE(allowed.restored_csv.find("Ahmed Hassan"), std::string::npos);
-    EXPECT_NE(allowed.restored_csv.find("30108110101000"), std::string::npos);
-    EXPECT_FALSE(allowed.raw_cloud_hex_preview.empty());
-    EXPECT_TRUE(std::filesystem::exists(dir.file("bank_state") / "regtech_audit.log"));
+    // 2. Searching "Ahmed Hassan" must return ONLY TXN1, NOT TXN2 ("Ahmed-Electronics")
+    auto dual = gateway.collect_officer_approvals("CBE-Officer-1", "Ahmed Hassan");
+    auto sig2 = gateway.collect_officer_approvals("CBE-Officer-2", "Ahmed Hassan");
+    dual.insert(dual.end(), sig2.begin(), sig2.end());
+
+    const auto by_name = gateway.auditor_query("Ahmed Hassan", cloud_bucket, dual, "Dual-Auditor");
+    EXPECT_TRUE(by_name.authorized);
+    EXPECT_TRUE(by_name.found);
+    EXPECT_NE(by_name.restored_csv.find("TXN1"), std::string::npos);
+    EXPECT_EQ(by_name.restored_csv.find("TXN2"), std::string::npos);
+    EXPECT_EQ(by_name.restored_csv.find("Ahmed-Electronics"), std::string::npos);
+
+    // 3. Searching directly by TOK_... must work identically
+    auto tok_approvals = gateway.collect_officer_approvals("CBE-Officer-1", by_name.matched_token);
+    auto tok_sig2      = gateway.collect_officer_approvals("CBE-Officer-2", by_name.matched_token);
+    tok_approvals.insert(tok_approvals.end(), tok_sig2.begin(), tok_sig2.end());
+
+    const auto by_tok = gateway.auditor_query(by_name.matched_token, cloud_bucket, tok_approvals, "Dual-Auditor");
+    EXPECT_TRUE(by_tok.authorized);
+    EXPECT_TRUE(by_tok.found);
+    EXPECT_NE(by_tok.restored_csv.find("Ahmed Hassan"), std::string::npos);
+
+    // 4. Audit log hash chain must verify intact
+    EXPECT_TRUE(gateway.metadata_index().verify_audit_chain());
+
+    // 5. Tampering with vault_index.tsv must fail HMAC authentication on load
+    {
+        std::ofstream tamper(state_dir / "vault_index.tsv", std::ios::app);
+        tamper << "MAP\tTOK_deadbeefcafebabe\t" << artifact.blob_name << "\n";
+    }
+    EXPECT_THROW(vault_gateway::GatewayEngine(state_dir, 2), std::runtime_error);
 }

@@ -1,14 +1,17 @@
 #pragma once
-// Hardened Zero-Knowledge At-Rest Cryptography:
-//   1. RAII Memory Zeroization (OPENSSL_cleanse) & Core-Dump Hardening
-//   2. Fixed-Bucket Traffic-Analysis Padding (64 KiB block alignment)
-//   3. Authenticated AES-256-GCM ("BVLT" v2 envelope)
-//   4. RFC 3394 AES-256 Key Wrapping (DEK wrapped under Master KEK)
-//   5. 2-of-3 XOR Erasure Coding Shards (Multi-Cloud Zero-Trust Availability)
+// Hardened Zero-Knowledge At-Rest Cryptography (v2.1):
+//   1. Move-only RAII SecretKey & SecretBuffer (OPENSSL_cleanse on move/destroy)
+//   2. Owner-only (0600) secret file writer & RLIMIT_CORE=0 process memory lock
+//   3. Fixed-Bucket Traffic-Analysis Padding (64 KiB block alignment)
+//   4. Authenticated AES-256-GCM ("BVL2" envelope)
+//   5. RFC 3394 AES-256 Key Wrapping (DEK wrapped under Master KEK)
+//   6. 2-of-3 XOR Erasure Coding Shards
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
@@ -16,6 +19,7 @@
 #include <vector>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #ifndef _WIN32
@@ -32,7 +36,6 @@ inline constexpr std::size_t TAG_LEN         = 16;     // 128-bit GCM auth tag
 inline constexpr std::size_t HEADER_LEN      = MAGIC.size() + IV_LEN + TAG_LEN; // 32 bytes
 inline constexpr std::size_t BUCKET_ALIGN    = 65536;  // 64 KiB traffic-analysis padding
 
-// Disables OS core dumps so sensitive keys/plaintext in RAM are never written to disk on crash
 inline void harden_process_memory() {
 #ifndef _WIN32
     rlimit rl{0, 0};
@@ -40,16 +43,19 @@ inline void harden_process_memory() {
 #endif
 }
 
-// RAII 256-bit key that wipes itself with OPENSSL_cleanse on destruction
+// Move-only RAII 256-bit key: cannot be accidentally copied in RAM; wipes itself via OPENSSL_cleanse
 struct SecretKey {
     std::array<uint8_t, KEY_LEN> bytes{};
 
     SecretKey() = default;
     ~SecretKey() { cleanse(); }
 
-    SecretKey(const SecretKey&) = default;
-    SecretKey& operator=(const SecretKey&) = default;
-    SecretKey(SecretKey&& other) noexcept : bytes(other.bytes) { other.cleanse(); }
+    SecretKey(const SecretKey&) = delete;
+    SecretKey& operator=(const SecretKey&) = delete;
+
+    SecretKey(SecretKey&& other) noexcept : bytes(other.bytes) {
+        other.cleanse();
+    }
     SecretKey& operator=(SecretKey&& other) noexcept {
         if (this != &other) {
             cleanse();
@@ -64,14 +70,15 @@ struct SecretKey {
     }
 
     uint8_t* data() noexcept { return bytes.data(); }
-    const uint8_t* data() const noexcept { return bytes.data(); }
-    constexpr std::size_t size() const noexcept { return KEY_LEN; }
+    [[nodiscard]] const uint8_t* data() const noexcept { return bytes.data(); }
+    static constexpr std::size_t size() noexcept { return KEY_LEN; }
+
     bool operator==(const SecretKey& o) const noexcept {
         return CRYPTO_memcmp(bytes.data(), o.bytes.data(), KEY_LEN) == 0;
     }
 };
 
-// RAII buffer that wipes decrypted plaintext from RAM when destroyed
+// Move-only RAII buffer that wipes decrypted plaintext from RAM when destroyed
 class SecretBuffer {
 public:
     SecretBuffer() = default;
@@ -80,6 +87,7 @@ public:
 
     SecretBuffer(const SecretBuffer&) = delete;
     SecretBuffer& operator=(const SecretBuffer&) = delete;
+
     SecretBuffer(SecretBuffer&& other) noexcept : data_(std::move(other.data_)) {}
     SecretBuffer& operator=(SecretBuffer&& other) noexcept {
         if (this != &other) {
@@ -96,8 +104,8 @@ public:
     }
 
     std::vector<uint8_t>& vec() noexcept { return data_; }
-    const std::vector<uint8_t>& vec() const noexcept { return data_; }
-    std::string as_string() const {
+    [[nodiscard]] const std::vector<uint8_t>& vec() const noexcept { return data_; }
+    [[nodiscard]] std::string as_string() const {
         return std::string(reinterpret_cast<const char*>(data_.data()), data_.size());
     }
 
@@ -107,7 +115,7 @@ private:
 
 inline SecretKey generate_key() {
     SecretKey key;
-    if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
+    if (RAND_bytes(key.data(), SecretKey::size()) != 1) {
         throw std::runtime_error("vault_crypto: RAND_bytes failed");
     }
     return key;
@@ -139,6 +147,52 @@ inline std::vector<uint8_t> hex_to_bytes(const std::string& hex_str) {
     return out;
 }
 
+// Writes sensitive material (KEK, officer keys, token maps) with owner-only (0600) permissions
+inline void write_secret_file_0600(const std::filesystem::path& path, const std::string& content) {
+    std::filesystem::path tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("vault_crypto: cannot open " + tmp.string());
+        out.write(content.data(), static_cast<std::streamsize>(content.size()));
+        out.flush();
+        if (!out) throw std::runtime_error("vault_crypto: failed writing " + tmp.string());
+    }
+    std::error_code ec;
+    std::filesystem::permissions(
+        tmp,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace,
+        ec);
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) throw std::runtime_error("vault_crypto: atomic rename failed: " + ec.message());
+}
+
+inline std::string hmac_sha256_hex(const uint8_t* key, std::size_t key_len, std::string_view message) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (!HMAC(EVP_sha256(),
+              key, static_cast<int>(key_len),
+              reinterpret_cast<const unsigned char*>(message.data()), message.size(),
+              digest, &len) || len != 32) {
+        throw std::runtime_error("vault_crypto: HMAC-SHA256 failed");
+    }
+    return bytes_to_hex(digest, len);
+}
+
+// Constant-time hex signature comparison via CRYPTO_memcmp
+inline bool constant_time_hex_equal(const std::string& hex_a, const std::string& hex_b) {
+    if (hex_a.size() != hex_b.size() || hex_a.empty()) return false;
+    try {
+        const auto bytes_a = hex_to_bytes(hex_a);
+        const auto bytes_b = hex_to_bytes(hex_b);
+        return bytes_a.size() == bytes_b.size() &&
+               CRYPTO_memcmp(bytes_a.data(), bytes_b.data(), bytes_a.size()) == 0;
+    } catch (...) {
+        return false;
+    }
+}
+
 // RFC 3394 AES-256 Key Wrap: wraps a 32-byte DEK with a 32-byte Master KEK -> 40 bytes
 inline std::string wrap_dek_hex(const SecretKey& dek, const SecretKey& master_kek) {
     using CipherCtx = std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)>;
@@ -162,7 +216,6 @@ inline std::string wrap_dek_hex(const SecretKey& dek, const SecretKey& master_ke
     return bytes_to_hex(wrapped.data(), wrapped.size());
 }
 
-// RFC 3394 AES-256 Key Unwrap: unwraps a 40-byte wrapped DEK using Master KEK -> 32-byte SecretKey
 inline SecretKey unwrap_dek_hex(const std::string& wrapped_hex, const SecretKey& master_kek) {
     const auto wrapped = hex_to_bytes(wrapped_hex);
     if (wrapped.size() != WRAPPED_KEY_LEN) {
@@ -190,8 +243,6 @@ inline SecretKey unwrap_dek_hex(const std::string& wrapped_hex, const SecretKey&
     return dek;
 }
 
-// Pads plaintext to an exact multiple of BUCKET_ALIGN (64 KiB) to defeat traffic analysis:
-//   [8-byte big-endian real_len] [real_len bytes plaintext] [CSPRNG padding up to 64 KiB boundary]
 inline SecretBuffer pad_to_bucket(const uint8_t* plaintext, std::size_t len, std::size_t align = BUCKET_ALIGN) {
     const std::size_t raw_total = 8 + len;
     const std::size_t rem = raw_total % align;
@@ -199,7 +250,7 @@ inline SecretBuffer pad_to_bucket(const uint8_t* plaintext, std::size_t len, std
 
     SecretBuffer buf(padded_total);
     auto& v = buf.vec();
-    const uint64_t len64 = static_cast<uint64_t>(len);
+    const auto len64 = static_cast<uint64_t>(len);
     for (int i = 0; i < 8; ++i) {
         v[i] = static_cast<uint8_t>((len64 >> (56 - i * 8)) & 0xFF);
     }
@@ -230,14 +281,12 @@ inline SecretBuffer unpad_from_bucket(const SecretBuffer& padded) {
     return out;
 }
 
-// Encrypts plaintext with 64 KiB traffic-analysis padding + AES-256-GCM
 inline std::vector<uint8_t> encrypt_envelope(const uint8_t* plaintext, std::size_t plaintext_len,
                                              const SecretKey& dek, bool pad_traffic = true) {
-    SecretBuffer prepared;
     const uint8_t* src_ptr = plaintext;
     std::size_t src_len = plaintext_len;
     if (pad_traffic) {
-        prepared = pad_to_bucket(plaintext, plaintext_len);
+        SecretBuffer prepared = pad_to_bucket(plaintext, plaintext_len);
         src_ptr = prepared.vec().data();
         src_len = prepared.vec().size();
     }
@@ -286,11 +335,10 @@ inline std::vector<uint8_t> encrypt_envelope(const std::string& plaintext, const
     return encrypt_envelope(reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size(), dek, pad_traffic);
 }
 
-// Verifies GCM tag, decrypts into RAII-cleansed SecretBuffer, and strips traffic padding
 inline SecretBuffer decrypt_envelope(const uint8_t* envelope, std::size_t envelope_len,
                                      const SecretKey& dek, bool unpad_traffic = true) {
     if (envelope_len < HEADER_LEN || std::memcmp(envelope, MAGIC.data(), MAGIC.size()) != 0) {
-        throw std::runtime_error("vault_crypto: invalid or truncated BVLT v2 envelope");
+        throw std::runtime_error("vault_crypto: invalid or truncated BVL2 envelope");
     }
 
     const uint8_t* iv_ptr  = envelope + MAGIC.size();
@@ -334,8 +382,6 @@ inline SecretBuffer decrypt_envelope(const uint8_t* envelope, std::size_t envelo
     return decrypted;
 }
 
-// 2-of-3 Erasure Coding: splits `blob` into 3 equal shards where shard_2 = shard_0 ^ shard_1.
-// Any 2 shards reconstruct the original ciphertext; 1 shard alone reveals zero information.
 inline std::array<std::vector<uint8_t>, 3> erasure_split_2of3(const std::vector<uint8_t>& blob) {
     const std::size_t half = (blob.size() + 1) / 2;
     std::array<std::vector<uint8_t>, 3> shards;
@@ -354,7 +400,6 @@ inline std::array<std::vector<uint8_t>, 3> erasure_split_2of3(const std::vector<
     return shards;
 }
 
-// Reconstructs the original blob from any 2 surviving shards (pass empty vector for the missing shard)
 inline std::vector<uint8_t> erasure_reconstruct_2of3(const std::vector<uint8_t>& s0,
                                                      const std::vector<uint8_t>& s1,
                                                      const std::vector<uint8_t>& s2,

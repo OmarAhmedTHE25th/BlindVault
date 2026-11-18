@@ -1,8 +1,5 @@
 #pragma once
-// High-speed PII & IP scrubber / deterministic tokenizer.
-// Replaces sensitive fields (National ID, IBAN, Customer Name) with deterministic
-// HMAC-SHA256 tokens ("TOK_<16-hex>") and masks internal/source IP addresses to
-// prevent IP-based data leakage before offloading to untrusted storage.
+// High-speed PII & IP scrubber / deterministic tokenizer with RFC 4180 CSV support.
 
 #include <array>
 #include <cstdint>
@@ -19,6 +16,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#include "at_rest_crypto.hpp"
 
 namespace vault_token {
 
@@ -39,6 +37,65 @@ struct SanitizeStats {
     std::size_t ips_masked = 0;
 };
 
+// RFC 4180 CSV row parser: handles quoted fields containing commas and escaped "" quotes
+inline std::vector<std::string> parse_csv_row(std::string_view line) {
+    std::vector<std::string> fields;
+    std::string cur;
+    bool in_quotes = false;
+
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (in_quotes) {
+            if (c == '"') {
+                if (i + 1 < line.size() && line[i + 1] == '"') {
+                    cur.push_back('"');
+                    ++i;
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                cur.push_back(c);
+            }
+        } else {
+            if (c == '"') {
+                in_quotes = true;
+            } else if (c == ',') {
+                fields.push_back(std::move(cur));
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        }
+    }
+    fields.push_back(std::move(cur));
+    return fields;
+}
+
+// RFC 4180 CSV field escaper & row formatter
+inline std::string escape_csv_field(std::string_view field) {
+    const bool needs_quotes = field.find_first_of(",\"\r\n") != std::string_view::npos;
+    if (!needs_quotes) return std::string(field);
+
+    std::string out;
+    out.reserve(field.size() + 2);
+    out.push_back('"');
+    for (char c : field) {
+        if (c == '"') out.push_back('"');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+inline std::string format_csv_row(const std::vector<std::string>& cols) {
+    std::ostringstream out;
+    for (std::size_t i = 0; i < cols.size(); ++i) {
+        if (i > 0) out << ',';
+        out << escape_csv_field(cols[i]);
+    }
+    return out.str();
+}
+
 class TokenVault {
 public:
     explicit TokenVault(std::filesystem::path storage_path, std::array<uint8_t, 32> pepper = {})
@@ -51,7 +108,6 @@ public:
         load_unlocked();
     }
 
-    // Deterministically maps a sensitive value to "TOK_<16-hex>" in O(1) memory lookup
     std::string tokenize(std::string_view raw_value) {
         if (raw_value.empty()) return "";
         if (raw_value.rfind("TOK_", 0) == 0) return std::string(raw_value);
@@ -77,7 +133,6 @@ public:
         return it->second;
     }
 
-    // Strips PII + masks source IP into "0.0.0.0/MASKED"
     TransactionRecord sanitize_record(const TransactionRecord& raw, SanitizeStats* stats = nullptr) {
         TransactionRecord clean;
         clean.tx_id         = raw.tx_id;
@@ -97,7 +152,6 @@ public:
         return clean;
     }
 
-    // Re-hydrates a sanitized record back to original identities for authorized bank auditors
     TransactionRecord rehydrate_record(const TransactionRecord& clean) const {
         TransactionRecord restored = clean;
         if (auto v = detokenize(clean.customer_name)) restored.customer_name = *v;
@@ -106,7 +160,6 @@ public:
         return restored;
     }
 
-    // Batch CSV ingestion: parses raw CSV lines, scrubs PII/IPs, flushes token map once
     std::string sanitize_csv_batch(std::string_view csv_text, SanitizeStats* out_stats = nullptr) {
         std::istringstream in{std::string(csv_text)};
         std::ostringstream out;
@@ -123,25 +176,21 @@ public:
             }
             first_line = false;
 
-            const auto cols = split_csv_line(line);
+            const auto cols = parse_csv_row(line);
             if (cols.size() < 8) continue;
 
             TransactionRecord raw{cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7]};
             const TransactionRecord clean = sanitize_record(raw, out_stats);
-            out << clean.tx_id << ','
-                << clean.timestamp << ','
-                << clean.customer_name << ','
-                << clean.national_id << ','
-                << clean.iban << ','
-                << clean.source_ip << ','
-                << clean.amount_egp << ','
-                << clean.merchant << '\n';
+            out << format_csv_row({
+                clean.tx_id, clean.timestamp, clean.customer_name,
+                clean.national_id, clean.iban, clean.source_ip,
+                clean.amount_egp, clean.merchant
+            }) << '\n';
         }
         flush();
         return out.str();
     }
 
-    // Restores an entire decrypted CSV payload back to plain customer data
     std::string rehydrate_csv_batch(std::string_view sanitized_csv) const {
         std::istringstream in{std::string(sanitized_csv)};
         std::ostringstream out;
@@ -158,19 +207,16 @@ public:
             }
             first_line = false;
 
-            const auto cols = split_csv_line(line);
+            const auto cols = parse_csv_row(line);
             if (cols.size() < 8) continue;
 
             TransactionRecord clean{cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7]};
             const TransactionRecord restored = rehydrate_record(clean);
-            out << restored.tx_id << ','
-                << restored.timestamp << ','
-                << restored.customer_name << ','
-                << restored.national_id << ','
-                << restored.iban << ','
-                << restored.source_ip << ','
-                << restored.amount_egp << ','
-                << restored.merchant << '\n';
+            out << format_csv_row({
+                restored.tx_id, restored.timestamp, restored.customer_name,
+                restored.national_id, restored.iban, restored.source_ip,
+                restored.amount_egp, restored.merchant
+            }) << '\n';
         }
         return out.str();
     }
@@ -178,20 +224,11 @@ public:
     void flush() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!dirty_) return;
-        std::filesystem::path tmp = storage_path_;
-        tmp += ".tmp";
-        {
-            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            if (!out) throw std::runtime_error("TokenVault: cannot write " + tmp.string());
-            for (const auto& [token, raw] : reverse_map_) {
-                out << token << '\t' << raw << '\n';
-            }
-            out.flush();
-            if (!out) throw std::runtime_error("TokenVault: flush failed for " + tmp.string());
+        std::ostringstream buf;
+        for (const auto& [token, raw] : reverse_map_) {
+            buf << token << '\t' << raw << '\n';
         }
-        std::error_code ec;
-        std::filesystem::rename(tmp, storage_path_, ec);
-        if (ec) throw std::runtime_error("TokenVault: atomic rename failed: " + ec.message());
+        vault_crypto::write_secret_file_0600(storage_path_, buf.str());
         dirty_ = false;
     }
 
@@ -233,21 +270,6 @@ private:
             reverse_map_[token] = raw;
             forward_map_[raw]   = token;
         }
-    }
-
-    static std::vector<std::string> split_csv_line(const std::string& line) {
-        std::vector<std::string> fields;
-        std::string cur;
-        for (char c : line) {
-            if (c == ',') {
-                fields.push_back(cur);
-                cur.clear();
-            } else {
-                cur.push_back(c);
-            }
-        }
-        fields.push_back(cur);
-        return fields;
     }
 
     std::filesystem::path storage_path_;

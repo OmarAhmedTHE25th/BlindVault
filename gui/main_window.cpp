@@ -14,6 +14,7 @@
 #include <filesystem>
 #include "identity.hpp"
 #include "trust_store.hpp"
+#include "../tokenizer.hpp"
 
 namespace {
 std::filesystem::path getIdentityDirectory() {
@@ -643,16 +644,16 @@ void MainWindow::onAuditorQueryCompleted(bool authorized, bool found, const QStr
 
     const QStringList lines = restoredCsv.split('\n', Qt::SkipEmptyParts);
     for (int i = 1; i < lines.size(); ++i) {
-        const QStringList cols = lines[i].split(',');
+        const auto cols = vault_token::parse_csv_row(lines[i].toStdString());
         if (cols.size() < 8) continue;
         const int row = auditor_table_->rowCount();
         auditor_table_->insertRow(row);
-        auditor_table_->setItem(row, 0, new QTableWidgetItem(cols[0]));
-        auditor_table_->setItem(row, 1, new QTableWidgetItem(cols[1]));
-        auditor_table_->setItem(row, 2, new QTableWidgetItem(cols[2]));
-        auditor_table_->setItem(row, 3, new QTableWidgetItem(cols[3]));
-        auditor_table_->setItem(row, 4, new QTableWidgetItem(cols[6]));
-        auditor_table_->setItem(row, 5, new QTableWidgetItem(cols[7]));
+        auditor_table_->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(cols[0])));
+        auditor_table_->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(cols[1])));
+        auditor_table_->setItem(row, 2, new QTableWidgetItem(QString::fromStdString(cols[2])));
+        auditor_table_->setItem(row, 3, new QTableWidgetItem(QString::fromStdString(cols[3])));
+        auditor_table_->setItem(row, 4, new QTableWidgetItem(QString::fromStdString(cols[6])));
+        auditor_table_->setItem(row, 5, new QTableWidgetItem(QString::fromStdString(cols[7])));
     }
 }
 

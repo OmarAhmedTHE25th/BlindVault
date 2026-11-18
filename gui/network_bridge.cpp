@@ -165,18 +165,14 @@ void NetworkBridge::queryAuditorRecords(const QString& identifier, const QString
         try {
             const std::string id_str = identifier.toStdString();
             std::vector<std::pair<std::string, std::string>> approvals;
-            if (officer1Approved) {
-                approvals.emplace_back("CBE-Officer-1", gateway_engine_->sign_quorum_approval("CBE-Officer-1", id_str));
-            }
-            if (officer2Approved) {
-                approvals.emplace_back("CBE-Officer-2", gateway_engine_->sign_quorum_approval("CBE-Officer-2", id_str));
-            }
-            if (officer3Approved) {
-                approvals.emplace_back("CBE-Officer-3", gateway_engine_->sign_quorum_approval("CBE-Officer-3", id_str));
-            }
-
-            emit logMessage(QString("[QUORUM] Verifying %1/3 Compliance Officer cryptographic signatures for '%2'...")
-                                .arg(approvals.size()).arg(identifier));
+            auto append_officer = [&](bool checked, const std::string& officer_id) {
+                if (!checked) return;
+                auto sigs = gateway_engine_->collect_officer_approvals(officer_id, id_str);
+                approvals.insert(approvals.end(), sigs.begin(), sigs.end());
+            };
+            append_officer(officer1Approved, "CBE-Officer-1");
+            append_officer(officer2Approved, "CBE-Officer-2");
+            append_officer(officer3Approved, "CBE-Officer-3");
 
             const auto res = gateway_engine_->auditor_query(id_str, cloudDir.toStdString(), approvals);
             if (!res.authorized) {
@@ -186,10 +182,10 @@ void NetworkBridge::queryAuditorRecords(const QString& identifier, const QString
             }
 
             if (res.found) {
-                emit logMessage(QString("[AUDITOR] Quorum Approved! Unwrapped DEK via RFC 3394, decrypted BVLT v2 & cleansed RAM for %1.")
+                emit logMessage(QString("[AUDITOR] Data-Bound Quorum Approved! Unwrapped DEK via RFC 3394 & re-hydrated %1.")
                                     .arg(QString::fromStdString(res.matched_token)));
             } else {
-                emit logMessage(QString("[AUDITOR] Quorum Approved, but no archived blobs matched '%1' (token: %2).")
+                emit logMessage(QString("[AUDITOR] Quorum Approved, no archived blobs matched '%1' (token: %2).")
                                     .arg(identifier, QString::fromStdString(res.matched_token)));
             }
 

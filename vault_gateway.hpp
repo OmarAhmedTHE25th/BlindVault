@@ -1,10 +1,10 @@
 #pragma once
-// Hardened Zero-Knowledge RegTech Gateway Engine (v2):
-//   - Process memory hardening (RLIMIT_CORE=0 + OPENSSL_cleanse RAII)
-//   - HSM Master KEK loading/generation + RFC 3394 DEK wrapping
-//   - 64 KiB fixed-bucket traffic-analysis padding
-//   - 2-of-3 XOR erasure coding shard generation
-//   - M-of-N (2-of-3) Compliance Officer Quorum enforcement on auditor queries
+// Hardened Zero-Knowledge RegTech Gateway Engine (v2.1):
+//   - RLIMIT_CORE=0 + move-only OPENSSL_cleanse RAII keys/buffers
+//   - Owner-only (0600) HSM Master KEK + per-officer keys
+//   - HMAC-authenticated MetadataIndex + hash-chained audit log
+//   - Data-bound M-of-N Compliance Quorum Gate
+//   - Exact column-level token filtering (supports raw PII or TOK_... queries with zero merchant false positives)
 
 #include <algorithm>
 #include <chrono>
@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include "at_rest_crypto.hpp"
@@ -49,19 +50,31 @@ public:
         : state_dir_(state_dir),
           staging_dir_(state_dir / "egress_staging"),
           shards_dir_(state_dir / "erasure_shards"),
+          master_kek_(load_or_create_master_kek(state_dir / "hsm_master.kek")),
           token_vault_(state_dir / "vault_tokens.tsv"),
-          metadata_index_(state_dir / "vault_index.tsv", state_dir / "regtech_audit.log"),
-          quorum_gate_(quorum_threshold) {
+          metadata_index_(state_dir / "vault_index.tsv", state_dir / "regtech_audit.log", master_kek_),
+          quorum_gate_(state_dir / "officers", quorum_threshold) {
         vault_crypto::harden_process_memory();
         std::filesystem::create_directories(staging_dir_);
         std::filesystem::create_directories(shards_dir_);
-        master_kek_ = load_or_create_master_kek(state_dir_ / "hsm_master.kek");
     }
 
     const vault_index::QuorumGate& quorum_gate() const noexcept { return quorum_gate_; }
+    const vault_index::MetadataIndex& metadata_index() const noexcept { return metadata_index_; }
 
-    std::string sign_quorum_approval(const std::string& officer_id, const std::string& identifier) const {
-        return quorum_gate_.sign_approval(officer_id, identifier);
+    // Collects cryptographic officer signatures bound to each candidate blob for `identifier`
+    std::vector<std::pair<std::string, std::string>> collect_officer_approvals(
+        const std::string& officer_id,
+        const std::string& raw_or_token_identifier) const {
+        const std::string token = resolve_to_token(raw_or_token_identifier);
+        const auto blobs = metadata_index_.find_candidate_blobs(token);
+        std::vector<std::pair<std::string, std::string>> signed_releases;
+        for (const auto& blob : blobs) {
+            signed_releases.emplace_back(
+                officer_id,
+                quorum_gate_.sign_blob_release(officer_id, token, blob));
+        }
+        return signed_releases;
     }
 
     std::filesystem::path generate_synthetic_cbe_batch(std::size_t row_count = 10000) const {
@@ -114,7 +127,8 @@ public:
         std::string sanitized_csv = token_vault_.sanitize_csv_batch(raw_csv, &stats);
         OPENSSL_cleanse(raw_csv.data(), raw_csv.size());
 
-        std::vector<std::string> tokens_in_blob = extract_tokens(sanitized_csv);
+        // Structured CSV column extraction (columns 2, 3, 4 only)
+        std::vector<std::string> tokens_in_blob = extract_tokens_from_columns(sanitized_csv);
 
         vault_crypto::SecretKey dek = vault_crypto::generate_key();
         const std::vector<uint8_t> ciphertext_envelope =
@@ -151,40 +165,51 @@ public:
         };
     }
 
+    // Per-blob data-bound quorum verification + exact column token filtering BEFORE re-hydration
     AuditorQueryResult auditor_query(
-        const std::string& raw_identifier,
+        const std::string& raw_or_token_identifier,
         const std::filesystem::path& cloud_storage_dir,
-        const std::vector<std::pair<std::string, std::string>>& quorum_approvals,
+        const std::vector<std::pair<std::string, std::string>>& blob_quorum_approvals,
         const std::string& auditor_id = "CBE-Auditor-01") {
 
         AuditorQueryResult res;
-        if (!quorum_gate_.verify_quorum(raw_identifier, quorum_approvals)) {
-            res.authorized = false;
-            res.denial_reason = "QUORUM DENIED: Requires at least " +
-                                std::to_string(quorum_gate_.threshold()) +
-                                " valid Compliance Officer signatures before PII unmasking.";
-            metadata_index_.log_security_event(
-                "QUORUM_DENIED",
-                "Blocked unauthorized unmask attempt by '" + auditor_id + "' for '" + raw_identifier + "'");
-            return res;
-        }
-        res.authorized = true;
-
-        const std::string token = (raw_identifier.rfind("TOK_", 0) == 0)
-                                      ? raw_identifier
-                                      : token_vault_.tokenize(raw_identifier);
+        const std::string token = resolve_to_token(raw_or_token_identifier);
         res.matched_token = token;
 
-        const auto matching_blobs = metadata_index_.lookup_by_token(token, auditor_id);
-        if (matching_blobs.empty()) {
+        const auto candidate_blobs = metadata_index_.find_candidate_blobs(token);
+        if (candidate_blobs.empty()) {
+            // Even when no blobs match, verify at least threshold distinct officers signed off
+            // so unauthorized callers cannot probe token existence
+            vault_index::BlobEntry dummy{"NONE", "NONE", 0, 0, ""};
+            if (!quorum_gate_.verify_blob_release(token, dummy, blob_quorum_approvals)) {
+                res.authorized = false;
+                res.denial_reason = "QUORUM DENIED: Requires at least " +
+                                    std::to_string(quorum_gate_.threshold()) +
+                                    " valid Compliance Officer signatures.";
+                metadata_index_.log_security_event(
+                    "QUORUM_DENIED",
+                    "Blocked unauthorized probe by '" + auditor_id + "' for token '" + token + "'");
+                return res;
+            }
+            res.authorized = true;
+            res.found = false;
             return res;
         }
 
         std::ostringstream combined_restored;
         combined_restored << "tx_id,timestamp,customer_name,national_id,iban,ip_status,amount_egp,merchant\n";
+        bool any_blob_authorized = false;
         bool any_row_matched = false;
 
-        for (const auto& blob : matching_blobs) {
+        for (const auto& blob : candidate_blobs) {
+            if (!quorum_gate_.verify_blob_release(token, blob, blob_quorum_approvals)) {
+                metadata_index_.log_security_event(
+                    "QUORUM_DENIED",
+                    "Blocked unauthorized release of blob '" + blob.blob_name + "' for token '" + token + "'");
+                continue;
+            }
+            any_blob_authorized = true;
+
             std::filesystem::path blob_path = cloud_storage_dir / blob.blob_name;
             if (!std::filesystem::exists(blob_path)) {
                 blob_path = staging_dir_ / blob.blob_name;
@@ -204,30 +229,64 @@ public:
             std::string sanitized_csv = decrypted.as_string();
             decrypted.cleanse();
 
-            std::string full_restored = token_vault_.rehydrate_csv_batch(sanitized_csv);
-            OPENSSL_cleanse(sanitized_csv.data(), sanitized_csv.size());
-
-            std::istringstream lines(full_restored);
+            // Filter exact tokenized PII columns (cols 2, 3, 4) BEFORE re-hydrating
+            std::istringstream lines(sanitized_csv);
             std::string line;
             bool header = true;
             while (std::getline(lines, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
                 if (header) { header = false; continue; }
-                if (line.find(raw_identifier) != std::string::npos) {
-                    combined_restored << line << '\n';
+                if (line.empty()) continue;
+
+                const auto cols = vault_token::parse_csv_row(line);
+                if (cols.size() < 8) continue;
+
+                if (cols[2] == token || cols[3] == token || cols[4] == token) {
+                    vault_token::TransactionRecord clean{
+                        cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7]
+                    };
+                    const auto restored = token_vault_.rehydrate_record(clean);
+                    combined_restored << vault_token::format_csv_row({
+                        restored.tx_id, restored.timestamp, restored.customer_name,
+                        restored.national_id, restored.iban, restored.source_ip,
+                        restored.amount_egp, restored.merchant
+                    }) << '\n';
                     any_row_matched = true;
                 }
             }
-            OPENSSL_cleanse(full_restored.data(), full_restored.size());
+            OPENSSL_cleanse(sanitized_csv.data(), sanitized_csv.size());
             res.blob_names.push_back(blob.blob_name);
         }
 
+        if (!any_blob_authorized) {
+            res.authorized = false;
+            res.denial_reason = "QUORUM DENIED: Requires at least " +
+                                std::to_string(quorum_gate_.threshold()) +
+                                " valid Compliance Officer signatures bound to target blob.";
+            return res;
+        }
+
+        res.authorized = true;
         res.found = any_row_matched;
         res.restored_csv = combined_restored.str();
+        metadata_index_.log_security_event(
+            "QUORUM_RELEASE",
+            "Auditor '" + auditor_id + "' unlocked token '" + token +
+            "' across " + std::to_string(res.blob_names.size()) + " blob(s)");
         return res;
     }
 
 private:
+    std::string resolve_to_token(const std::string& raw_or_token) const {
+        if (raw_or_token.rfind("TOK_", 0) == 0) {
+            return raw_or_token;
+        }
+        // Const-safe lookup or deterministic compute via TokenVault
+        return const_cast<vault_token::TokenVault&>(token_vault_).tokenize(raw_or_token);
+    }
+
     static vault_crypto::SecretKey load_or_create_master_kek(const std::filesystem::path& kek_path) {
+        std::filesystem::create_directories(kek_path.parent_path());
         if (std::filesystem::exists(kek_path)) {
             std::ifstream in(kek_path, std::ios::binary);
             std::string hex_str;
@@ -241,9 +300,8 @@ private:
             return kek;
         }
         vault_crypto::SecretKey kek = vault_crypto::generate_key();
-        std::ofstream out(kek_path, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("GatewayEngine: cannot write HSM master KEK");
-        out << vault_crypto::bytes_to_hex(kek.data(), kek.size()) << '\n';
+        vault_crypto::write_secret_file_0600(
+            kek_path, vault_crypto::bytes_to_hex(kek.data(), kek.size()) + "\n");
         return kek;
     }
 
@@ -253,16 +311,25 @@ private:
         return "vault_batch_" + std::to_string(ms) + ".enc";
     }
 
-    static std::vector<std::string> extract_tokens(const std::string& sanitized_csv) {
-        std::vector<std::string> tokens;
-        std::size_t pos = 0;
-        while ((pos = sanitized_csv.find("TOK_", pos)) != std::string::npos) {
-            if (pos + 20 <= sanitized_csv.size()) {
-                tokens.push_back(sanitized_csv.substr(pos, 20));
+    static std::vector<std::string> extract_tokens_from_columns(const std::string& sanitized_csv) {
+        std::unordered_set<std::string> unique_tokens;
+        std::istringstream in(sanitized_csv);
+        std::string line;
+        bool header = true;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (header) { header = false; continue; }
+            if (line.empty()) continue;
+
+            const auto cols = vault_token::parse_csv_row(line);
+            if (cols.size() < 8) continue;
+            for (std::size_t col_idx : {2u, 3u, 4u}) {
+                if (cols[col_idx].rfind("TOK_", 0) == 0) {
+                    unique_tokens.insert(cols[col_idx]);
+                }
             }
-            pos += 20;
         }
-        return tokens;
+        return std::vector<std::string>(unique_tokens.begin(), unique_tokens.end());
     }
 
     static std::string format_hex_dump(const std::vector<uint8_t>& bytes, std::size_t max_bytes) {
@@ -283,10 +350,10 @@ private:
     std::filesystem::path state_dir_;
     std::filesystem::path staging_dir_;
     std::filesystem::path shards_dir_;
+    vault_crypto::SecretKey master_kek_;
     vault_token::TokenVault token_vault_;
     vault_index::MetadataIndex metadata_index_;
     vault_index::QuorumGate quorum_gate_;
-    vault_crypto::SecretKey master_kek_;
 };
 
 } // namespace vault_gateway
