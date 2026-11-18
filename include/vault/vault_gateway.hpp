@@ -313,6 +313,10 @@ public:
     void rotate_master_kek(
         const vault_crypto::SecretKey& new_master_kek,
         const std::filesystem::path& cloud_storage_dir = {}) {
+        if (!kms_->can_rotate_master_kek_in_app()) {
+            throw std::runtime_error(
+                "GatewayEngine: master KEK rotation is administratively managed by the KMS/HSM backend");
+        }
         if (!metadata_index_.verify_audit_chain()) {
             throw std::runtime_error("GatewayEngine: refusing KEK rotation with tampered audit chain");
         }

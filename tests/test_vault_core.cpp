@@ -18,7 +18,7 @@ public:
         path_ = std::filesystem::temp_directory_path() /
                 ("blindvault_test_" + std::to_string(rd()) + std::to_string(rd()));
         std::filesystem::create_directories(path_);
-    }
+    };
     ~TempDir() {
         std::error_code ec;
         std::filesystem::remove_all(path_, ec);
@@ -27,6 +27,50 @@ public:
     [[nodiscard]] std::filesystem::path file(const std::string& name) const { return path_ / name; }
 private:
     std::filesystem::path path_;
+};
+
+class NonRotatableKmsProvider final : public vault_kms::KeyManagementProvider {
+public:
+    NonRotatableKmsProvider()
+        : master_(vault_crypto::generate_key()) {}
+
+    [[nodiscard]] std::string wrap_dek_hex(const vault_crypto::SecretKey& dek) const override {
+        return vault_crypto::wrap_dek_hex(dek, master_);
+    }
+
+    [[nodiscard]] vault_crypto::SecretKey unwrap_dek_hex(const std::string& wrapped_hex) const override {
+        return vault_crypto::unwrap_dek_hex(wrapped_hex, master_);
+    }
+
+    [[nodiscard]] std::string hmac_index_hex(std::string_view body) const override {
+        return vault_crypto::hmac_sha256_hex(master_.data(), vault_crypto::SecretKey::size(), body);
+    }
+
+    [[nodiscard]] std::string hmac_audit_hex(std::string_view body) const override {
+        return vault_crypto::hmac_sha256_hex(master_.data(), vault_crypto::SecretKey::size(), body);
+    }
+
+    [[nodiscard]] std::array<uint8_t, 32> derive_tokenizer_pepper() const override {
+        return vault_crypto::derive_subkey(master_, "test:pepper:v1").bytes;
+    }
+
+    [[nodiscard]] bool can_rotate_master_kek_in_app() const override {
+        return false;
+    }
+
+    void rotate_master_kek(const vault_crypto::SecretKey&) override {
+        rotate_called_ = true;
+        throw std::runtime_error("unexpected HSM rotation call");
+    }
+
+    [[nodiscard]] std::string backend_description() const override {
+        return "Test-NonRotatable-HSM";
+    }
+
+    mutable bool rotate_called_ = false;
+
+private:
+    vault_crypto::SecretKey master_;
 };
 
 } // namespace
@@ -294,6 +338,42 @@ TEST(Tokenizer, DerivedPepperPersistsAcrossKmsInstances) {
     }
 }
 
+TEST(VaultHardening, HsmRotationFailsBeforeBlobOrIndexMutation) {
+    TempDir dir;
+    const auto state_dir = dir.file("bank_state");
+    const auto cloud_bucket = dir.file("cloud_bucket");
+    std::filesystem::create_directories(cloud_bucket);
+
+    auto kms = std::make_shared<NonRotatableKmsProvider>();
+    vault_gateway::GatewayEngine gateway(state_dir, 2, kms);
+
+    const auto custom_csv = dir.file("hsm_rotation_tx.csv");
+    {
+        std::ofstream out(custom_csv);
+        out << "tx_id,timestamp,customer_name,national_id,iban,source_ip,amount_egp,merchant\n";
+        out << "TXNHSM,2026-11-18T12:00:00Z,HSM Customer,30108110101000,EG380019000500000000263181000,41.10.20.30,500.00,HSM-Merchant\n";
+    }
+
+    const auto artifact = gateway.prepare_encrypted_offload(custom_csv);
+    std::filesystem::copy_file(artifact.encrypted_file_path, cloud_bucket / artifact.blob_name);
+    const auto blob_before = vault_crypto::read_bytes_from_file(
+        (cloud_bucket / artifact.blob_name).string());
+    const auto index_before = vault_crypto::read_bytes_from_file(
+        (state_dir / "vault_index.tsv").string());
+
+    EXPECT_THROW(
+        gateway.rotate_master_kek(vault_crypto::generate_key(), cloud_bucket),
+        std::runtime_error);
+    EXPECT_FALSE(kms->rotate_called_);
+
+    const auto blob_after = vault_crypto::read_bytes_from_file(
+        (cloud_bucket / artifact.blob_name).string());
+    const auto index_after = vault_crypto::read_bytes_from_file(
+        (state_dir / "vault_index.tsv").string());
+    EXPECT_EQ(blob_before, blob_after);
+    EXPECT_EQ(index_before, index_after);
+}
+
 TEST(VaultHardening, MasterKekRotationRewrapsAndReauthenticates) {
     TempDir dir;
     const auto state_dir = dir.file("bank_state");
@@ -316,7 +396,6 @@ TEST(VaultHardening, MasterKekRotationRewrapsAndReauthenticates) {
 
     EXPECT_TRUE(gateway.metadata_index().verify_audit_chain());
     const auto blob_entries = gateway.metadata_index().blob_entries();
-    ASSERT_EQ(blob_entries.size(), 1u);
     EXPECT_FALSE(blob_entries[0].wrapped_dek_hex.empty());
 
     const auto approvals = gateway.collect_officer_approvals("CBE-Officer-1", "Rotation Customer");

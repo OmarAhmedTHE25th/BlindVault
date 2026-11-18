@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -37,6 +36,7 @@ public:
     [[nodiscard]] virtual std::string hmac_index_hex(std::string_view canonical_index_body) const = 0;
     [[nodiscard]] virtual std::string hmac_audit_hex(std::string_view canonical_audit_body) const = 0;
     [[nodiscard]] virtual std::array<uint8_t, 32> derive_tokenizer_pepper() const = 0;
+    [[nodiscard]] virtual bool can_rotate_master_kek_in_app() const = 0;
     virtual void rotate_master_kek(const vault_crypto::SecretKey& new_master_kek) = 0;
 
     [[nodiscard]] virtual std::string backend_description() const = 0;
@@ -70,6 +70,10 @@ public:
 
     [[nodiscard]] std::array<uint8_t, 32> derive_tokenizer_pepper() const override {
         return pepper_.bytes;
+    }
+
+    [[nodiscard]] bool can_rotate_master_kek_in_app() const override {
+        return true;
     }
 
     void rotate_master_kek(const vault_crypto::SecretKey& new_master_kek) override {
@@ -374,6 +378,10 @@ public:
         }
         std::copy(raw.begin(), raw.end(), pepper.begin());
         return pepper;
+    }
+
+    [[nodiscard]] bool can_rotate_master_kek_in_app() const override {
+        return false;
     }
 
     void rotate_master_kek(const vault_crypto::SecretKey&) override {
