@@ -179,7 +179,21 @@ inline std::string hmac_sha256_hex(const uint8_t* key, std::size_t key_len, std:
     }
     return bytes_to_hex(digest, len);
 }
-
+    // Domain-separated 256-bit subkey derivation via HMAC-SHA256(master_key, context_label)
+    inline SecretKey derive_subkey(const SecretKey& master_key, std::string_view context_label) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (!HMAC(EVP_sha256(),
+              master_key.data(), static_cast<int>(master_key.size()),
+              reinterpret_cast<const unsigned char*>(context_label.data()), context_label.size(),
+              digest, &len) || len != KEY_LEN) {
+        throw std::runtime_error("vault_crypto: derive_subkey HMAC-SHA256 failed");
+              }
+    SecretKey subkey;
+    std::memcpy(subkey.data(), digest, KEY_LEN);
+    OPENSSL_cleanse(digest, sizeof(digest));
+    return subkey;
+}
 // Constant-time hex signature comparison via CRYPTO_memcmp
 inline bool constant_time_hex_equal(const std::string& hex_a, const std::string& hex_b) {
     if (hex_a.size() != hex_b.size() || hex_a.empty()) return false;

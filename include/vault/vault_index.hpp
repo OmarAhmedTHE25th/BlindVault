@@ -8,12 +8,13 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
-#include <optional>
+#include <ranges>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "at_rest_crypto.hpp"
 
@@ -33,8 +34,8 @@ struct BlobEntry {
 //   - Verifies signatures in constant time (CRYPTO_memcmp)
 class QuorumGate {
 public:
-    QuorumGate(const std::filesystem::path& officer_key_dir, std::size_t threshold = 2)
-        : officer_key_dir_(officer_key_dir), threshold_(threshold) {
+    explicit QuorumGate(std::filesystem::path  officer_key_dir, std::size_t threshold = 2)
+        : officer_key_dir_(std::move(officer_key_dir)), threshold_(threshold) {
         std::filesystem::create_directories(officer_key_dir_);
         const std::vector<std::string> default_officers = {
             "CBE-Officer-1", "CBE-Officer-2", "CBE-Officer-3"
@@ -55,7 +56,7 @@ public:
             throw std::runtime_error("QuorumGate: unknown compliance officer '" + officer_id + "'");
         }
         const std::string payload = build_release_payload(officer_id, target_token, blob);
-        return vault_crypto::hmac_sha256_hex(it->second.data(), it->second.size(), payload);
+        return vault_crypto::hmac_sha256_hex(it->second.data(), vault_crypto::SecretKey::size(), payload);
     }
 
     // Constant-time verification that >= threshold distinct officers signed this exact blob release
@@ -68,7 +69,7 @@ public:
             if (it == officer_keys_.end()) continue;
             const std::string payload = build_release_payload(officer_id, target_token, blob);
             const std::string expected_hex =
-                vault_crypto::hmac_sha256_hex(it->second.data(), it->second.size(), payload);
+                vault_crypto::hmac_sha256_hex(it->second.data(), vault_crypto::SecretKey::size(), payload);
             if (vault_crypto::constant_time_hex_equal(sig_hex, expected_hex)) {
                 valid_officers.insert(officer_id);
             }
@@ -99,7 +100,7 @@ private:
         }
         vault_crypto::SecretKey k = vault_crypto::generate_key();
         vault_crypto::write_secret_file_0600(
-            key_path, vault_crypto::bytes_to_hex(k.data(), k.size()) + "\n");
+            key_path, vault_crypto::bytes_to_hex(k.data(), vault_crypto::SecretKey::size()) + "\n");
         return k;
     }
 
@@ -111,17 +112,21 @@ private:
 // HMAC-Authenticated Metadata Index & Cryptographic Hash-Chained Audit Log
 class MetadataIndex {
 public:
+    // In MetadataIndex constructor:
     MetadataIndex(std::filesystem::path index_file,
                   std::filesystem::path audit_log_file,
-                  const vault_crypto::SecretKey& auth_key)
-        : index_file_(std::move(index_file)), audit_log_file_(std::move(audit_log_file)) {
-        std::memcpy(auth_key_.data(), auth_key.data(), vault_crypto::KEY_LEN);
+                  vault_crypto::SecretKey index_auth_key,
+                  vault_crypto::SecretKey audit_auth_key)
+        : index_file_(std::move(index_file)),
+          audit_log_file_(std::move(audit_log_file)),
+          index_auth_key_(std::move(index_auth_key)),
+          audit_auth_key_(std::move(audit_auth_key)) {
         load_and_verify_index_unlocked();
         load_and_verify_audit_chain_unlocked();
     }
 
     void register_blob(const BlobEntry& entry, const std::vector<std::string>& tokens_in_blob) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard lock(mutex_);
         BlobEntry stored = entry;
         if (stored.created_utc.empty()) stored.created_utc = current_utc_iso();
         blobs_[stored.blob_name] = stored;
@@ -139,13 +144,11 @@ public:
     }
 
     std::vector<BlobEntry> find_candidate_blobs(const std::string& token) const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard lock(mutex_);
         std::vector<BlobEntry> results;
-        auto it = token_to_blobs_.find(token);
-        if (it != token_to_blobs_.end()) {
+        if (const auto it = token_to_blobs_.find(token); it != token_to_blobs_.end()) {
             for (const auto& blob_name : it->second) {
-                auto b_it = blobs_.find(blob_name);
-                if (b_it != blobs_.end()) {
+                if (auto b_it = blobs_.find(blob_name); b_it != blobs_.end()) {
                     results.push_back(b_it->second);
                 }
             }
@@ -154,17 +157,18 @@ public:
     }
 
     void log_security_event(const std::string& action, const std::string& detail) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard lock(mutex_);
         append_chained_audit_unlocked(action, detail);
     }
 
     // Re-verifies every HMAC link in regtech_audit.log from genesis to latest entry
     bool verify_audit_chain() const {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard lock(mutex_);
         try {
             uint64_t expected_seq = 1;
             std::string expected_prev(64, '0');
-            return verify_audit_file_internal(audit_log_file_, auth_key_, expected_seq, expected_prev);
+            return verify_audit_file_internal(
+                audit_log_file_, audit_auth_key_, expected_seq, expected_prev);
         } catch (...) {
             return false;
         }
@@ -190,7 +194,8 @@ private:
         const std::string body = std::to_string(audit_seq_) + "|" + ts + "|" +
                                  action + "|" + detail + "|" + last_audit_mac_;
         const std::string entry_mac =
-            vault_crypto::hmac_sha256_hex(auth_key_.data(), auth_key_.size(), body);
+            vault_crypto::hmac_sha256_hex(
+                audit_auth_key_.data(), vault_crypto::SecretKey::size(), body);
 
         std::ofstream log(audit_log_file_, std::ios::app);
         if (!log) throw std::runtime_error("MetadataIndex: cannot append to audit log");
@@ -228,7 +233,7 @@ private:
             if (!vault_crypto::constant_time_hex_equal(cols[4], out_last_mac)) return false;
 
             const std::string body = cols[0] + "|" + cols[1] + "|" + cols[2] + "|" + cols[3] + "|" + cols[4];
-            const std::string expected_mac = vault_crypto::hmac_sha256_hex(key.data(), key.size(), body);
+            const std::string expected_mac = vault_crypto::hmac_sha256_hex(key.data(), vault_crypto::SecretKey::size(), body);
             if (!vault_crypto::constant_time_hex_equal(cols[5], expected_mac)) return false;
 
             out_last_mac = cols[5];
@@ -238,7 +243,8 @@ private:
     }
 
     void load_and_verify_audit_chain_unlocked() {
-        if (!verify_audit_file_internal(audit_log_file_, auth_key_, audit_seq_, last_audit_mac_)) {
+        if (!verify_audit_file_internal(
+                audit_log_file_, audit_auth_key_, audit_seq_, last_audit_mac_)) {
             throw std::runtime_error("MetadataIndex: tamper detected in regtech_audit.log hash chain!");
         }
     }
@@ -247,8 +253,8 @@ private:
         // Deterministic sorted serialization so MAC verification is invariant
         std::vector<std::string> blob_names;
         blob_names.reserve(blobs_.size());
-        for (const auto& [name, _] : blobs_) blob_names.push_back(name);
-        std::sort(blob_names.begin(), blob_names.end());
+        for (const auto &name: blobs_ | std::views::keys) blob_names.push_back(name);
+        std::ranges::sort(blob_names);
 
         std::ostringstream body;
         for (const auto& name : blob_names) {
@@ -260,13 +266,13 @@ private:
 
         std::vector<std::string> tokens;
         tokens.reserve(token_to_blobs_.size());
-        for (const auto& [tok, _] : token_to_blobs_) tokens.push_back(tok);
-        std::sort(tokens.begin(), tokens.end());
+        for (const auto &tok: token_to_blobs_ | std::views::keys) tokens.push_back(tok);
+        std::ranges::sort(tokens);
 
         for (const auto& tok : tokens) {
             const auto& bset = token_to_blobs_.at(tok);
             std::vector<std::string> sorted_b(bset.begin(), bset.end());
-            std::sort(sorted_b.begin(), sorted_b.end());
+            std::ranges::sort(sorted_b);
             for (const auto& bname : sorted_b) {
                 body << "MAP\t" << tok << '\t' << bname << '\n';
             }
@@ -276,7 +282,8 @@ private:
 
     void save_authenticated_index_unlocked() const {
         const std::string body = serialize_canonical_body_unlocked();
-        const std::string mac = vault_crypto::hmac_sha256_hex(auth_key_.data(), auth_key_.size(), body);
+        const std::string mac = vault_crypto::hmac_sha256_hex(
+            index_auth_key_.data(), vault_crypto::SecretKey::size(), body);
         vault_crypto::write_secret_file_0600(index_file_, body + "MAC\t" + mac + "\n");
     }
 
@@ -317,7 +324,8 @@ private:
         }
 
         const std::string expected_mac =
-            vault_crypto::hmac_sha256_hex(auth_key_.data(), auth_key_.size(), body_accum.str());
+            vault_crypto::hmac_sha256_hex(
+                index_auth_key_.data(), vault_crypto::SecretKey::size(), body_accum.str());
         if (!vault_crypto::constant_time_hex_equal(file_mac, expected_mac)) {
             throw std::runtime_error("MetadataIndex: HMAC verification failed — vault_index.tsv was tampered with!");
         }
@@ -325,12 +333,13 @@ private:
 
     std::filesystem::path index_file_;
     std::filesystem::path audit_log_file_;
-    vault_crypto::SecretKey auth_key_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, BlobEntry> blobs_;
     std::unordered_map<std::string, std::unordered_set<std::string>> token_to_blobs_;
     uint64_t audit_seq_ = 1;
     std::string last_audit_mac_ = std::string(64, '0');
+    vault_crypto::SecretKey index_auth_key_;
+    vault_crypto::SecretKey audit_auth_key_;
 };
 
 } // namespace vault_index

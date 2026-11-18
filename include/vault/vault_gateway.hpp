@@ -52,8 +52,11 @@ public:
           shards_dir_(state_dir / "erasure_shards"),
           master_kek_(load_or_create_master_kek(state_dir / "hsm_master.kek")),
           token_vault_(state_dir / "vault_tokens.tsv"),
-          metadata_index_(state_dir / "vault_index.tsv", state_dir / "regtech_audit.log", master_kek_),
-          quorum_gate_(state_dir / "officers", quorum_threshold) {
+    metadata_index_(
+        state_dir / "vault_index.tsv",
+        state_dir / "regtech_audit.log",
+        vault_crypto::derive_subkey(master_kek_, "blindvault:index-auth:v1"),
+        vault_crypto::derive_subkey(master_kek_, "blindvault:audit-auth:v1")),          quorum_gate_(state_dir / "officers", quorum_threshold) {
         vault_crypto::harden_process_memory();
         std::filesystem::create_directories(staging_dir_);
         std::filesystem::create_directories(shards_dir_);
