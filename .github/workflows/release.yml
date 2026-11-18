@@ -38,19 +38,19 @@ jobs:
             wget \
             file
 
-      - name: Prepare Desktop Entry & Placeholder Icon
+      - name: Prepare Desktop Entry & Icon
         run: |
-          cat << 'EOF' > p2p_share.desktop
+          cat << 'EOF' > blindvault.desktop
           [Desktop Entry]
           Type=Application
-          Name=BlindVault RegTech Gateway
-          Exec=P2P_Secure_File_Sharing_GUI
-          Icon=p2p_icon
+          Name=BlindVault
+          Exec=BlindVault_GUI
+          Icon=blindvault_icon
           Categories=Utility;Network;
           Terminal=false
           EOF
 
-          if [ ! -f p2p_icon.png ]; then
+          if [ ! -f blindvault_icon.png ]; then
             python3 -c "
           import struct, zlib
           def make_png(w, h, r, g, b):
@@ -58,7 +58,7 @@ jobs:
               def chunk(tag, data):
                   return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
               return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
-          with open('p2p_icon.png', 'wb') as f:
+          with open('blindvault_icon.png', 'wb') as f:
               f.write(make_png(256, 256, 37, 99, 235))
           "
           fi
@@ -69,7 +69,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DP2P_BUILD_GUI=ON \
             -DP2P_BUILD_TESTS=OFF
-          cmake --build build --target P2P_Secure_File_Sharing_GUI
+          cmake --build build --target BlindVault_GUI
 
       - name: Download AppImage Packaging Tools
         run: |
@@ -82,13 +82,13 @@ jobs:
           export QMAKE=/usr/lib/qt6/bin/qmake
           ./linuxdeploy-x86_64.AppImage --appimage-extract-and-run \
             --appdir AppDir \
-            -e build/P2P_Secure_File_Sharing_GUI \
-            -d p2p_share.desktop \
-            -i p2p_icon.png \
+            -e build/BlindVault_GUI \
+            -d blindvault.desktop \
+            -i blindvault_icon.png \
             --plugin qt \
             --output appimage
 
-          mv BlindVault_RegTech_Gateway-x86_64.AppImage BlindVault-Linux-x86_64.AppImage
+          mv BlindVault-x86_64.AppImage BlindVault-Linux-x86_64.AppImage
 
       - name: Upload Linux Asset
         uses: actions/upload-artifact@v4
@@ -146,14 +146,14 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build Binary
-        run: cmake --build build --target P2P_Secure_File_Sharing_GUI --config Release
+        run: cmake --build build --target BlindVault_GUI --config Release
 
       - name: Bundle DLLs with windeployqt
         run: |
           mkdir dist
-          copy build\P2P_Secure_File_Sharing_GUI.exe dist\
+          copy build\BlindVault_GUI.exe dist\
 
-          windeployqt --release --compiler-runtime dist\P2P_Secure_File_Sharing_GUI.exe
+          windeployqt --release --compiler-runtime dist\BlindVault_GUI.exe
 
           copy "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\libssl-3-x64.dll" dist\
           copy "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\libcrypto-3-x64.dll" dist\
@@ -190,7 +190,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "Release ${{ github.ref_name }}"
+          name: "BlindVault ${{ github.ref_name }}"
           draft: false
           prerelease: false
           files: |

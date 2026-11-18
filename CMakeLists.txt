@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(P2P_Secure_File_Sharing)
+project(BlindVault LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,9 +23,8 @@ endif()
 # Find core backend dependencies
 find_package(OpenSSL REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
-
 # ---------------- CLI Application ----------------
-add_executable(P2P_Secure_File_Sharing
+add_executable(BlindVault
         src/main.cpp
         include/transport/common/protocol.hpp
         include/security/validation.hpp
@@ -46,14 +45,14 @@ add_executable(P2P_Secure_File_Sharing
         include/vault/vault_index.hpp
         include/vault/vault_gateway.hpp
 )
-target_include_directories(P2P_Secure_File_Sharing PRIVATE
+target_include_directories(BlindVault PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
         ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
         ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
         ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
         ${CMAKE_CURRENT_SOURCE_DIR}/include/security
 )
-target_link_libraries(P2P_Secure_File_Sharing PRIVATE
+target_link_libraries(BlindVault PRIVATE
         OpenSSL::SSL
         OpenSSL::Crypto
         Boost::system
@@ -67,12 +66,13 @@ if(P2P_BUILD_GUI)
 
     find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
 
-    add_executable(P2P_Secure_File_Sharing_GUI
+    add_executable(BlindVault_GUI
             gui/main_gui.cpp
             gui/main_window.hpp
             gui/main_window.cpp
             gui/network_bridge.hpp
             gui/network_bridge.cpp
+            gui/log_redirect.hpp
             include/transport/common/protocol.hpp
             include/security/validation.hpp
             include/security/disk_budget.hpp
@@ -84,13 +84,6 @@ if(P2P_BUILD_GUI)
             include/transport/client/client_node.hpp
             include/transport/server/server_session.hpp
             include/transport/server/server_node.hpp
-            gui/network_bridge.hpp
-            gui/main_window.cpp
-            gui/main_window.hpp
-            gui/main_gui.cpp
-            gui/main_gui.cpp
-            gui/network_bridge.cpp
-            gui/log_redirect.hpp
             include/transport/common/events.hpp
             include/vault/at_rest_crypto.hpp
             include/vault/tokenizer.hpp
@@ -98,7 +91,7 @@ if(P2P_BUILD_GUI)
             include/vault/vault_gateway.hpp
     )
 
-    target_include_directories(P2P_Secure_File_Sharing_GUI PRIVATE
+    target_include_directories(BlindVault_GUI PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
             ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
@@ -108,7 +101,7 @@ if(P2P_BUILD_GUI)
             ${CMAKE_CURRENT_SOURCE_DIR}/gui
     )
 
-    target_link_libraries(P2P_Secure_File_Sharing_GUI PRIVATE
+    target_link_libraries(BlindVault_GUI PRIVATE
             Qt6::Core
             Qt6::Gui
             Qt6::Widgets
@@ -117,6 +110,9 @@ if(P2P_BUILD_GUI)
             Boost::system
     )
 endif()
+
+
+
 
 # ---------------- Fuzzing (Clang only) ----------------
 option(P2P_BUILD_FUZZERS "Build the libFuzzer fuzz targets (Clang only)" OFF)
@@ -175,6 +171,6 @@ if(P2P_BUILD_TESTS)
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME end_to_end
-                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/e2e_test.sh $<TARGET_FILE:P2P_Secure_File_Sharing>)
+                COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/e2e_test.sh $<TARGET_FILE:BlindVault>)
     endif()
 endif()
