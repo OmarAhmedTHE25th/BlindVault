@@ -184,7 +184,7 @@ inline std::string hmac_sha256_hex(const uint8_t* key, std::size_t key_len, std:
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
     if (!HMAC(EVP_sha256(),
-              master_key.data(), static_cast<int>(master_key.size()),
+              master_key.data(), SecretKey::size(),
               reinterpret_cast<const unsigned char*>(context_label.data()), context_label.size(),
               digest, &len) || len != KEY_LEN) {
         throw std::runtime_error("vault_crypto: derive_subkey HMAC-SHA256 failed");
@@ -297,10 +297,11 @@ inline SecretBuffer unpad_from_bucket(const SecretBuffer& padded) {
 
 inline std::vector<uint8_t> encrypt_envelope(const uint8_t* plaintext, std::size_t plaintext_len,
                                              const SecretKey& dek, bool pad_traffic = true) {
+    SecretBuffer prepared;
     const uint8_t* src_ptr = plaintext;
     std::size_t src_len = plaintext_len;
     if (pad_traffic) {
-        SecretBuffer prepared = pad_to_bucket(plaintext, plaintext_len);
+        prepared = pad_to_bucket(plaintext, plaintext_len);
         src_ptr = prepared.vec().data();
         src_len = prepared.vec().size();
     }

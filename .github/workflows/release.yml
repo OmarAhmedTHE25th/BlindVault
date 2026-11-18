@@ -25,13 +25,14 @@ jobs:
 
       - name: Install System Dependencies
         run: |
-          sudo apt update
-          sudo apt install -y \
+          sudo apt-get update
+          sudo apt-get install -y \
             build-essential \
             cmake \
             ninja-build \
             libssl-dev \
-            libboost-all-dev \
+            libboost-dev \
+            libboost-system-dev \
             qt6-base-dev \
             libgl1-mesa-dev \
             wget \
@@ -42,7 +43,7 @@ jobs:
           cat << 'EOF' > p2p_share.desktop
           [Desktop Entry]
           Type=Application
-          Name=P2P Secure File Transfer
+          Name=BlindVault RegTech Gateway
           Exec=P2P_Secure_File_Sharing_GUI
           Icon=p2p_icon
           Categories=Utility;Network;
@@ -50,7 +51,6 @@ jobs:
           EOF
 
           if [ ! -f p2p_icon.png ]; then
-            # Generate a 256x256 fallback blue PNG if none exists
             python3 -c "
           import struct, zlib
           def make_png(w, h, r, g, b):
@@ -67,7 +67,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DP2P_BUILD_GUI=ON
+            -DP2P_BUILD_GUI=ON \
+            -DP2P_BUILD_TESTS=OFF
           cmake --build build --target P2P_Secure_File_Sharing_GUI
 
       - name: Download AppImage Packaging Tools
@@ -79,7 +80,6 @@ jobs:
       - name: Generate AppImage
         run: |
           export QMAKE=/usr/lib/qt6/bin/qmake
-          # Use extract-and-run flags to operate inside GitHub Actions Docker/VM containers
           ./linuxdeploy-x86_64.AppImage --appimage-extract-and-run \
             --appdir AppDir \
             -e build/P2P_Secure_File_Sharing_GUI \
@@ -88,13 +88,13 @@ jobs:
             --plugin qt \
             --output appimage
 
-          mv P2P_Secure_File_Transfer-x86_64.AppImage P2P-Secure-File-Transfer-Linux-x86_64.AppImage
+          mv BlindVault_RegTech_Gateway-x86_64.AppImage BlindVault-Linux-x86_64.AppImage
 
       - name: Upload Linux Asset
         uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
-          path: P2P-Secure-File-Transfer-Linux-x86_64.AppImage
+          path: BlindVault-Linux-x86_64.AppImage
 
   # ==========================================
   # JOB 2: Build Native Windows Executable
@@ -123,7 +123,6 @@ jobs:
           target: 'desktop'
           arch: 'win64_msvc2019_64'
 
-
       - name: Setup vcpkg caching
         uses: actions/cache@v4
         with:
@@ -136,14 +135,14 @@ jobs:
 
       - name: Install OpenSSL and Boost
         run: |
-          choco install openssl.light -y
-          vcpkg install boost-asio:x64-windows boost-endian:x64-windows
+          vcpkg install openssl:x64-windows boost-system:x64-windows boost-asio:x64-windows boost-endian:x64-windows
 
       - name: Configure CMake
         run: |
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DP2P_BUILD_GUI=ON `
+            -DP2P_BUILD_TESTS=OFF `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build Binary
@@ -153,22 +152,19 @@ jobs:
         run: |
           mkdir dist
           copy build\P2P_Secure_File_Sharing_GUI.exe dist\
-          
-          # Deploy Qt dependencies and plugins
+
           windeployqt --release --compiler-runtime dist\P2P_Secure_File_Sharing_GUI.exe
-          
-          # Copy OpenSSL runtime DLLs
-          copy "C:\Program Files\OpenSSL\bin\libssl-3-x64.dll" dist\
-          copy "C:\Program Files\OpenSSL\bin\libcrypto-3-x64.dll" dist\
-          
-          # Compress to zip distribution package
-          Compress-Archive -Path dist\* -DestinationPath P2P-Secure-File-Transfer-Windows-x64.zip
+
+          copy "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\libssl-3-x64.dll" dist\
+          copy "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\libcrypto-3-x64.dll" dist\
+
+          Compress-Archive -Path dist\* -DestinationPath BlindVault-Windows-x64.zip
 
       - name: Upload Windows Asset
         uses: actions/upload-artifact@v4
         with:
           name: windows-zip
-          path: P2P-Secure-File-Transfer-Windows-x64.zip
+          path: BlindVault-Windows-x64.zip
 
   # ==========================================
   # JOB 3: Publish GitHub Release
@@ -176,6 +172,7 @@ jobs:
   release:
     name: Create GitHub Release
     needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
     steps:
@@ -197,7 +194,7 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            P2P-Secure-File-Transfer-Linux-x86_64.AppImage
-            P2P-Secure-File-Transfer-Windows-x64.zip
+            BlindVault-Linux-x86_64.AppImage
+            BlindVault-Windows-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -124,16 +124,9 @@ if(P2P_BUILD_FUZZERS)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         message(FATAL_ERROR "P2P_BUILD_FUZZERS needs Clang (it uses libFuzzer)")
     endif()
-    add_executable(fuzz_validation fuzz/fuzz_validation.cpp
-            include/vault/at_rest_crypto.hpp
-            include/vault/tokenizer.hpp
-            include/vault/vault_index.hpp
-            include/vault/vault_gateway.hpp)
+    add_executable(fuzz_validation fuzz/fuzz_validation.cpp)
     target_include_directories(fuzz_validation PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
             ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
             ${CMAKE_CURRENT_SOURCE_DIR}/include/security)
     target_compile_options(fuzz_validation PRIVATE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -O1 -g)
