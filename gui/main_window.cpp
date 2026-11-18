@@ -33,8 +33,8 @@ std::filesystem::path getIdentityDirectory() {
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent), bridge_(new NetworkBridge(this)) {
-    setMinimumSize(1120, 780);
-    resize(1200, 820);
+    setMinimumSize(1160, 820);
+    resize(1240, 860);
     setupUi();
     if (!initializeIdentity()) {
         QTimer::singleShot(0, this, &QWidget::close);
@@ -46,6 +46,8 @@ MainWindow::MainWindow(QWidget* parent)
     connect(bridge_, &NetworkBridge::transferCompleted, this, &MainWindow::onTransferCompleted);
     connect(bridge_, &NetworkBridge::syntheticBatchReady, this, &MainWindow::onSyntheticBatchReady);
     connect(bridge_, &NetworkBridge::offloadTelemetryReady, this, &MainWindow::onOffloadTelemetryReady);
+    connect(bridge_, &NetworkBridge::releaseChallengeReady, this, &MainWindow::onReleaseChallengeReady);
+    connect(bridge_, &NetworkBridge::officerPublicKeyImported, this, &MainWindow::onOfficerPublicKeyImported);
     connect(bridge_, &NetworkBridge::auditorQueryCompleted, this, &MainWindow::onAuditorQueryCompleted);
     connect(bridge_, &NetworkBridge::serverStatus, this, &MainWindow::onServerStatus);
     connect(bridge_, &NetworkBridge::receiveProgress, this, &MainWindow::onReceiveProgress);
@@ -166,7 +168,7 @@ void MainWindow::setupUi() {
     auto* idHeaderLayout = new QHBoxLayout();
     auto* appTitle = new QLabel("BlindVault — Hardened Zero-Knowledge RegTech Gateway", centralWidget);
     appTitle->setObjectName("appTitle");
-    auto* badge = new QLabel("RFC 3394 KEK + 2-of-3 Quorum + AES-256-GCM + mTLS 1.3", centralWidget);
+    auto* badge = new QLabel("RFC 3394 KEK + Ed25519 2-of-3 Quorum + AES-256-GCM + mTLS 1.3", centralWidget);
     badge->setObjectName("badge");
     idHeaderLayout->addWidget(appTitle);
     idHeaderLayout->addStretch();
@@ -198,7 +200,7 @@ void MainWindow::setupUi() {
     tabs->addTab(createEgressGatewayTab(), "1. Bank Egress Gateway");
     tabs->addTab(createAuditorTab(), "2. Quorum Auditor & Cloud Proof");
     tabs->addTab(createCloudAndTrustTab(), "3. Cloud Vault & Node Trust");
-    columnsLayout->addWidget(tabs, 60);
+    columnsLayout->addWidget(tabs, 62);
 
     // Right Column: Live Compliance & Telemetry Log
     auto* logCard = new QFrame(centralWidget);
@@ -224,7 +226,7 @@ void MainWindow::setupUi() {
     log_pane_->setStyleSheet("font-size: 14px; line-height: 1.45;");
     logLayout->addWidget(log_pane_, 1);
 
-    columnsLayout->addWidget(logCard, 40);
+    columnsLayout->addWidget(logCard, 38);
     mainLayout->addLayout(columnsLayout, 1);
 
     setCentralWidget(centralWidget);
@@ -345,51 +347,78 @@ QWidget* MainWindow::createAuditorTab() {
     auto* tab = new QWidget();
     auto* layout = new QVBoxLayout(tab);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(10);
+    layout->setSpacing(8);
 
-    // M-of-N Compliance Quorum & Query Card
+    // Asymmetric Ed25519 M-of-N Compliance Quorum & Challenge Card
     auto* searchCard = new QFrame(tab);
     searchCard->setObjectName("card");
     auto* searchLayout = new QVBoxLayout(searchCard);
-    searchLayout->setContentsMargins(20, 14, 20, 14);
-    searchLayout->setSpacing(10);
+    searchLayout->setContentsMargins(18, 12, 18, 12);
+    searchLayout->setSpacing(8);
 
-    auto* searchTitle = new QLabel("M-of-N Compliance Quorum Gate & Blind Index Retrieval", searchCard);
+    auto* headerRow = new QHBoxLayout();
+    auto* searchTitle = new QLabel("Asymmetric Ed25519 Quorum Gate (Public-Key-Only Gateway)", searchCard);
     searchTitle->setObjectName("cardTitle");
-    searchLayout->addWidget(searchTitle);
+    import_officer_pub_btn_ = new QPushButton("Import Officer .pub Key...", searchCard);
+    import_officer_pub_btn_->setObjectName("secondaryBtn");
+    import_officer_pub_btn_->setFixedHeight(32);
+    connect(import_officer_pub_btn_, &QPushButton::clicked, this, &MainWindow::onImportOfficerPubKey);
+    headerRow->addWidget(searchTitle);
+    headerRow->addStretch();
+    headerRow->addWidget(import_officer_pub_btn_);
+    searchLayout->addLayout(headerRow);
 
-    auto* quorumRow = new QHBoxLayout();
-    auto* qLbl = new QLabel("Dual-Custody Officer Sign-Off (Requires >= 2 of 3):", searchCard);
-    qLbl->setObjectName("inputLabel");
-    officer1_chk_ = new QCheckBox("CBE-Officer-1", searchCard);
-    officer2_chk_ = new QCheckBox("CBE-Officer-2", searchCard);
-    officer3_chk_ = new QCheckBox("CBE-Officer-3", searchCard);
-    officer1_chk_->setChecked(true);
-    officer2_chk_->setChecked(true);
-    officer3_chk_->setChecked(false);
-
-    quorumRow->addWidget(qLbl);
-    quorumRow->addWidget(officer1_chk_);
-    quorumRow->addWidget(officer2_chk_);
-    quorumRow->addWidget(officer3_chk_);
-    quorumRow->addStretch();
-    searchLayout->addLayout(quorumRow);
-
-    auto* searchRow = new QHBoxLayout();
+    auto* queryRow = new QHBoxLayout();
     auditor_query_input_ = new QLineEdit(searchCard);
-    auditor_query_input_->setPlaceholderText("Enter Customer Name (e.g. Ahmed Hassan), National ID, or IBAN...");
-    auditor_query_input_->setFixedHeight(36);
+    auditor_query_input_->setPlaceholderText("Customer Name (e.g. Ahmed Hassan), National ID, IBAN, or TOK_...");
+    auditor_query_input_->setFixedHeight(34);
 
-    auditor_search_btn_ = new QPushButton("Verify Quorum & Re-Hydrate", searchCard);
+    prep_challenge_btn_ = new QPushButton("1. Prepare Signing Challenge", searchCard);
+    prep_challenge_btn_->setObjectName("secondaryBtn");
+    prep_challenge_btn_->setFixedHeight(34);
+    connect(prep_challenge_btn_, &QPushButton::clicked, this, &MainWindow::onPrepareChallenge);
+
+    queryRow->addWidget(auditor_query_input_, 1);
+    queryRow->addWidget(prep_challenge_btn_);
+    searchLayout->addLayout(queryRow);
+
+    challenge_view_ = new QTextEdit(searchCard);
+    challenge_view_->setReadOnly(true);
+    challenge_view_->setMaximumHeight(74);
+    challenge_view_->setStyleSheet("font-size: 12px;");
+    challenge_view_->setPlaceholderText("Click '1. Prepare Signing Challenge' to get the blob challenge tuple for offline Ed25519 officer signing...");
+    searchLayout->addWidget(challenge_view_);
+
+    auto* sig1Row = new QHBoxLayout();
+    officer1_id_input_ = new QLineEdit("CBE-Officer-1", searchCard);
+    officer1_id_input_->setFixedWidth(135);
+    officer1_id_input_->setFixedHeight(32);
+    officer1_sig_input_ = new QLineEdit(searchCard);
+    officer1_sig_input_->setPlaceholderText("Officer 1 detached 128-hex Ed25519 signature...");
+    officer1_sig_input_->setFixedHeight(32);
+    sig1Row->addWidget(officer1_id_input_);
+    sig1Row->addWidget(officer1_sig_input_, 1);
+    searchLayout->addLayout(sig1Row);
+
+    auto* sig2Row = new QHBoxLayout();
+    officer2_id_input_ = new QLineEdit("CBE-Officer-2", searchCard);
+    officer2_id_input_->setFixedWidth(135);
+    officer2_id_input_->setFixedHeight(32);
+    officer2_sig_input_ = new QLineEdit(searchCard);
+    officer2_sig_input_->setPlaceholderText("Officer 2 detached 128-hex Ed25519 signature...");
+    officer2_sig_input_->setFixedHeight(32);
+
+    auditor_search_btn_ = new QPushButton("2. Verify & Re-Hydrate", searchCard);
     auditor_search_btn_->setObjectName("primaryBtn");
-    auditor_search_btn_->setFixedHeight(36);
+    auditor_search_btn_->setFixedHeight(32);
     connect(auditor_search_btn_, &QPushButton::clicked, this, &MainWindow::onAuditorSearch);
 
-    searchRow->addWidget(auditor_query_input_, 1);
-    searchRow->addWidget(auditor_search_btn_);
-    searchLayout->addLayout(searchRow);
+    sig2Row->addWidget(officer2_id_input_);
+    sig2Row->addWidget(officer2_sig_input_, 1);
+    sig2Row->addWidget(auditor_search_btn_);
+    searchLayout->addLayout(sig2Row);
 
-    auditor_token_lbl_ = new QLabel("Quorum & Token Status: Ready", searchCard);
+    auditor_token_lbl_ = new QLabel("Quorum Status: Gateway holds ONLY officer public keys (*.pub)", searchCard);
     auditor_token_lbl_->setObjectName("subheading");
     searchLayout->addWidget(auditor_token_lbl_);
     layout->addWidget(searchCard);
@@ -398,8 +427,8 @@ QWidget* MainWindow::createAuditorTab() {
     auto* restoredCard = new QFrame(tab);
     restoredCard->setObjectName("card");
     auto* restoredLayout = new QVBoxLayout(restoredCard);
-    restoredLayout->setContentsMargins(20, 12, 20, 12);
-    restoredLayout->setSpacing(8);
+    restoredLayout->setContentsMargins(18, 10, 18, 10);
+    restoredLayout->setSpacing(6);
 
     auto* restoredTitle = new QLabel("Bank Perimeter View (Unwrapped DEK -> Decrypted -> RAM Cleansed After Render)", restoredCard);
     restoredTitle->setObjectName("cardTitle");
@@ -409,7 +438,7 @@ QWidget* MainWindow::createAuditorTab() {
     auditor_table_->setHorizontalHeaderLabels({"Tx ID", "Timestamp", "Customer", "National ID", "Amount (EGP)", "Merchant"});
     auditor_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     auditor_table_->setAlternatingRowColors(true);
-    auditor_table_->setMinimumHeight(140);
+    auditor_table_->setMinimumHeight(110);
     restoredLayout->addWidget(auditor_table_);
     layout->addWidget(restoredCard);
 
@@ -417,18 +446,18 @@ QWidget* MainWindow::createAuditorTab() {
     auto* cloudCard = new QFrame(tab);
     cloudCard->setObjectName("card");
     auto* cloudLayout = new QVBoxLayout(cloudCard);
-    cloudLayout->setContentsMargins(20, 12, 20, 12);
-    cloudLayout->setSpacing(8);
+    cloudLayout->setContentsMargins(18, 10, 18, 10);
+    cloudLayout->setSpacing(6);
 
-    auto* cloudTitle = new QLabel("Untrusted Cloud Storage View (64 KiB-Padded BVLT v2 AES-256-GCM Ciphertext)", cloudCard);
+    auto* cloudTitle = new QLabel("Untrusted Cloud Storage View (64 KiB-Padded BVL2 AES-256-GCM Ciphertext)", cloudCard);
     cloudTitle->setObjectName("cardTitle");
     cloudLayout->addWidget(cloudTitle);
 
     cloud_hex_view_ = new QTextEdit(cloudCard);
     cloud_hex_view_->setReadOnly(true);
-    cloud_hex_view_->setMaximumHeight(110);
-    cloud_hex_view_->setStyleSheet("font-size: 13px;");
-    cloud_hex_view_->setPlaceholderText("Run an authorized quorum query to inspect the raw padded ciphertext stored on the cloud node...");
+    cloud_hex_view_->setMaximumHeight(90);
+    cloud_hex_view_->setStyleSheet("font-size: 12px;");
+    cloud_hex_view_->setPlaceholderText("Run an authorized Ed25519 quorum query to inspect the raw padded ciphertext stored on the cloud node...");
     cloudLayout->addWidget(cloud_hex_view_);
     layout->addWidget(cloudCard);
 
@@ -610,18 +639,46 @@ void MainWindow::onOffloadTelemetryReady(quint64 records, quint64 piiTokenized, 
                                 .arg(shardBytes));
 }
 
+void MainWindow::onImportOfficerPubKey() {
+    const QString file = QFileDialog::getOpenFileName(
+        this, "Select Officer Ed25519 Public Key (*.pub)", "", "Ed25519 Public Keys (*.pub);;All Files (*)");
+    if (!file.isEmpty()) {
+        bridge_->importOfficerPublicKey(file);
+    }
+}
+
+void MainWindow::onOfficerPublicKeyImported(const QString& statusMessage) {
+    auditor_token_lbl_->setText(statusMessage);
+}
+
+void MainWindow::onPrepareChallenge() {
+    const QString query = auditor_query_input_->text().trimmed();
+    if (query.isEmpty()) {
+        QMessageBox::warning(this, "Signing Challenge", "Enter a Customer Name, National ID, IBAN, or TOK_... first.");
+        return;
+    }
+    bridge_->prepareReleaseChallenge(query);
+}
+
+void MainWindow::onReleaseChallengeReady(const QString& targetToken,
+                                         const QString& challengeSummary,
+                                         const QString& registeredOfficersSummary) {
+    challenge_view_->setPlainText(challengeSummary);
+    auditor_token_lbl_->setText("Token: " + targetToken + " | Registered Officers: " + registeredOfficersSummary);
+}
+
 void MainWindow::onAuditorSearch() {
     const QString query = auditor_query_input_->text().trimmed();
     if (query.isEmpty()) {
-        QMessageBox::warning(this, "Auditor Query", "Enter a Customer Name, National ID, or IBAN.");
+        QMessageBox::warning(this, "Auditor Query", "Enter a Customer Name, National ID, IBAN, or TOK_...");
         return;
     }
-    bridge_->queryAuditorRecords(
-        query,
-        save_dir_input_->text().trimmed(),
-        officer1_chk_->isChecked(),
-        officer2_chk_->isChecked(),
-        officer3_chk_->isChecked());
+
+    QList<QPair<QString, QString>> approvals;
+    approvals.append({officer1_id_input_->text().trimmed(), officer1_sig_input_->text().trimmed()});
+    approvals.append({officer2_id_input_->text().trimmed(), officer2_sig_input_->text().trimmed()});
+
+    bridge_->queryAuditorRecords(query, save_dir_input_->text().trimmed(), approvals);
 }
 
 void MainWindow::onAuditorQueryCompleted(bool authorized, bool found, const QString& statusOrToken,
@@ -635,7 +692,7 @@ void MainWindow::onAuditorQueryCompleted(bool authorized, bool found, const QStr
         return;
     }
 
-    auditor_token_lbl_->setText("Quorum Verified (2-of-3) | Resolved Token: " + statusOrToken);
+    auditor_token_lbl_->setText("Ed25519 Quorum Verified (2-of-3) | Resolved Token: " + statusOrToken);
 
     if (!found) {
         QMessageBox::information(this, "No Records", "No archived encrypted blobs matched that identifier.");

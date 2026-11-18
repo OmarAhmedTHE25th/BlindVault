@@ -3,8 +3,10 @@
 #include "identity.hpp"
 #include <QStandardPaths>
 #include <QDir>
+#include <QStringList>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include "client_node.hpp"
 #include "events.hpp"
 
@@ -159,22 +161,92 @@ void NetworkBridge::ingestAndOffloadCsv(const QString& host, uint16_t port, cons
     });
 }
 
-void NetworkBridge::queryAuditorRecords(const QString& identifier, const QString& cloudDir,
-                                        bool officer1Approved, bool officer2Approved, bool officer3Approved) {
-    boost::asio::post(io_ctx_, [this, identifier, cloudDir, officer1Approved, officer2Approved, officer3Approved]() {
+void NetworkBridge::importOfficerPublicKey(const QString& pubKeyPath) {
+    boost::asio::post(io_ctx_, [this, pubKeyPath]() {
         try {
-            const std::string id_str = identifier.toStdString();
-            std::vector<std::pair<std::string, std::string>> approvals;
-            auto append_officer = [&](bool checked, const std::string& officer_id) {
-                if (!checked) return;
-                auto sigs = gateway_engine_->collect_officer_approvals(officer_id, id_str);
-                approvals.insert(approvals.end(), sigs.begin(), sigs.end());
-            };
-            append_officer(officer1Approved, "CBE-Officer-1");
-            append_officer(officer2Approved, "CBE-Officer-2");
-            append_officer(officer3Approved, "CBE-Officer-3");
+            const std::filesystem::path src(pubKeyPath.toStdString());
+            if (!std::filesystem::exists(src) || src.extension() != ".pub") {
+                throw std::runtime_error("Select a valid officer Ed25519 public key file (*.pub)");
+            }
+            const auto dest = gateway_engine_->officer_pubkey_directory() / src.filename();
+            std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing);
+            gateway_engine_->quorum_gate().reload_public_keys();
 
-            const auto res = gateway_engine_->auditor_query(id_str, cloudDir.toStdString(), approvals);
+            const auto officers = gateway_engine_->quorum_gate().registered_officers();
+            QStringList names;
+            for (const auto& o : officers) names << QString::fromStdString(o);
+            const QString summary = QString("Installed '%1' | Registered Officers (%2): %3")
+                                        .arg(QString::fromStdString(src.stem().string()))
+                                        .arg(officers.size())
+                                        .arg(names.join(", "));
+            emit logMessage("[QUORUM] " + summary);
+            emit officerPublicKeyImported(summary);
+        } catch (const std::exception& e) {
+            emit logMessage(QString("[QUORUM ERROR] %1").arg(e.what()));
+            emit officerPublicKeyImported(QString("Error: %1").arg(e.what()));
+        }
+    });
+}
+
+void NetworkBridge::prepareReleaseChallenge(const QString& identifier) {
+    boost::asio::post(io_ctx_, [this, identifier]() {
+        try {
+            const auto challenge = gateway_engine_->prepare_release_challenge(identifier.toStdString());
+            QStringList officerNames;
+            for (const auto& id : challenge.registered_officers) {
+                officerNames << QString::fromStdString(id);
+            }
+            const QString officersStr = officerNames.isEmpty()
+                ? QString("None registered yet (import *.pub keys in %1)")
+                      .arg(QString::fromStdString(gateway_engine_->officer_pubkey_directory().string()))
+                : officerNames.join(", ");
+
+            std::ostringstream ss;
+            ss << "Target Token: " << challenge.target_token << "\n";
+            if (challenge.candidate_blobs.empty()) {
+                ss << "Candidate Blobs: None matched (sign against blob_name=NONE, wrapped_dek_hex=NONE)\n"
+                   << "CLI: BlindVault officer-sign <officer.priv> <officer_id> "
+                   << challenge.target_token << " NONE NONE";
+            } else {
+                for (const auto& blob : challenge.candidate_blobs) {
+                    ss << "Blob: " << blob.blob_name << "\n"
+                       << "Wrapped DEK: " << blob.wrapped_dek_hex << "\n"
+                       << "Offline Sign Command:\n"
+                       << "  BlindVault officer-sign <officer.priv> <officer_id> "
+                       << challenge.target_token << " " << blob.blob_name << " " << blob.wrapped_dek_hex << "\n";
+                }
+            }
+
+            emit logMessage(QString("[QUORUM] Prepared signing challenge for token %1 (%2 candidate blob(s))")
+                                .arg(QString::fromStdString(challenge.target_token))
+                                .arg(challenge.candidate_blobs.size()));
+            emit releaseChallengeReady(
+                QString::fromStdString(challenge.target_token),
+                QString::fromStdString(ss.str()),
+                officersStr);
+        } catch (const std::exception& e) {
+            emit logMessage(QString("[QUORUM ERROR] %1").arg(e.what()));
+        }
+    });
+}
+
+void NetworkBridge::queryAuditorRecords(const QString& identifier,
+                                        const QString& cloudDir,
+                                        const QList<QPair<QString, QString>>& detachedApprovals) {
+    boost::asio::post(io_ctx_, [this, identifier, cloudDir, detachedApprovals]() {
+        try {
+            std::vector<vault_index::OfficerApproval> approvals;
+            approvals.reserve(static_cast<std::size_t>(detachedApprovals.size()));
+            for (const auto& pair : detachedApprovals) {
+                const std::string id = pair.first.trimmed().toStdString();
+                const std::string sig = pair.second.trimmed().toStdString();
+                if (!id.empty() && !sig.empty()) {
+                    approvals.push_back(vault_index::OfficerApproval{id, sig});
+                }
+            }
+
+            const auto res = gateway_engine_->auditor_query(
+                identifier.toStdString(), cloudDir.toStdString(), approvals);
             if (!res.authorized) {
                 emit logMessage(QString("[SECURITY BLOCK] %1").arg(QString::fromStdString(res.denial_reason)));
                 emit auditorQueryCompleted(false, false, QString::fromStdString(res.denial_reason), "", "");
@@ -182,10 +254,10 @@ void NetworkBridge::queryAuditorRecords(const QString& identifier, const QString
             }
 
             if (res.found) {
-                emit logMessage(QString("[AUDITOR] Data-Bound Quorum Approved! Unwrapped DEK via RFC 3394 & re-hydrated %1.")
+                emit logMessage(QString("[AUDITOR] Ed25519 Quorum Verified! Unwrapped DEK via RFC 3394 & re-hydrated %1.")
                                     .arg(QString::fromStdString(res.matched_token)));
             } else {
-                emit logMessage(QString("[AUDITOR] Quorum Approved, no archived blobs matched '%1' (token: %2).")
+                emit logMessage(QString("[AUDITOR] Ed25519 Quorum Verified, no archived blobs matched '%1' (token: %2).")
                                     .arg(identifier, QString::fromStdString(res.matched_token)));
             }
 

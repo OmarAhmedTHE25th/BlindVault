@@ -4,12 +4,16 @@
 #include <iostream>
 #include <iomanip>
 #include <string>
+#include <thread>
+#include <vector>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include "client_node.hpp"
 #include "server_node.hpp"
+#include "p2p_node.hpp"
 #include "cli_identity.hpp"
 #include "tls_trust.hpp"
+#include "vault_index.hpp"
 
 namespace {
 
@@ -17,11 +21,11 @@ namespace {
 void check_ready(const trust::TrustStore& store) {
     if (!fs::exists(identity::CERT_FILE) || !fs::exists(identity::KEY_FILE)) {
         throw std::runtime_error(std::string("No identity found in this folder. Create one with:  ") +
-                                 "P2P_Secure_File_Sharing init");
+                                 "BlindVault init");
     }
     if (store.list().empty()) {
         std::cerr << "[WARNING] Your trust list (" << identity::TRUST_FILE << ") is empty, so you will not "
-                  << "accept anyone yet. Add a peer with:  P2P_Secure_File_Sharing trust add <fingerprint> <name>\n";
+                  << "accept anyone yet. Add a peer with:  BlindVault trust add <fingerprint> <name>\n";
     }
 }
 
@@ -44,14 +48,14 @@ void print_usage(const char* program) {
     std::cerr << "Usage:\n"
               << "  " << program << " receive <port> [save_folder]\n"
               << "  " << program << " send <host> <port> <file>\n"
-              << "  " << program << " p2p <port> [save_folder]\n";
+              << "  " << program << " p2p <port> [save_folder]\n\n"
+              << "Compliance Officer Offline Quorum Commands (run on officer workstation):\n"
+              << "  " << program << " officer-keygen <officer_id> [out_dir]\n"
+              << "  " << program << " officer-sign <priv_key.pem> <officer_id> <token> <blob_name> <wrapped_dek_hex>\n\n";
     cli::print_identity_usage(program);
 }
 
 } // namespace
-
-#include "p2p_node.hpp"
-#include <thread>
 
 int main(int argc, char* argv[]) {
 #ifndef _WIN32
@@ -62,10 +66,35 @@ int main(int argc, char* argv[]) {
         if (argc < 2) { print_usage(argv[0]); return 1; }
         const std::string mode = argv[1];
 
+        // Offline Compliance Officer Ed25519 key generation and detached challenge signing
+        if (mode == "officer-keygen" && (argc == 3 || argc == 4)) {
+            const std::string officer_id = argv[2];
+            if (!trust::valid_name(officer_id)) {
+                throw std::runtime_error("Invalid officer_id (use letters, digits, '.', '_' or '-')");
+            }
+            const fs::path out_dir = (argc == 4) ? fs::path(argv[3]) : fs::current_path();
+            fs::create_directories(out_dir);
+            const auto priv_path = out_dir / (officer_id + ".priv");
+            const auto pub_path  = out_dir / (officer_id + ".pub");
+            vault_index::generate_officer_ed25519_keypair(priv_path, pub_path);
+            std::cout << "Generated Ed25519 keypair for '" << officer_id << "':\n"
+                      << "  Private key (keep on officer device): " << priv_path.string() << "\n"
+                      << "  Public key  (install on gateway):     " << pub_path.string() << "\n";
+            return 0;
+        }
+
+        if (mode == "officer-sign" && argc == 7) {
+            const std::string sig_hex = vault_index::sign_blob_release_offline(
+                argv[2], argv[3], argv[4], argv[5], argv[6]);
+            std::cout << sig_hex << '\n';
+            return 0;
+        }
+
         // init, fingerprint and trust: manage your identity and who you trust
         const int identity_result = cli::handle_identity_command(
-            std::vector<std::string>(argv + 1, argv + argc), "P2P_Secure_File_Sharing");
+            std::vector<std::string>(argv + 1, argv + argc), "BlindVault");
         if (identity_result >= 0) return identity_result;
+
         net::io_context io_ctx;
 
         if (mode == "p2p" && argc >= 3) {
@@ -84,7 +113,6 @@ int main(int argc, char* argv[]) {
             auto node = std::make_shared<P2PNode>(io_ctx, server_ctx, client_ctx, port, save_dir, trust_store);
             node->start();
 
-            // Simple command loop for P2P interaction
             std::thread input_thread([&io_ctx, node]() {
                 std::string cmd;
                 while (true) {
@@ -92,7 +120,7 @@ int main(int argc, char* argv[]) {
                     if (!(std::cin >> cmd)) break;
                     if (cmd == "send") {
                         std::string host, port, file;
-                        std::cin >> host >> port >> std::quoted(file);;
+                        std::cin >> host >> port >> std::quoted(file);
                         node->send_file_to_addr(host, port, file);
                     } else if (cmd == "add") {
                         std::string name, host, port;
@@ -128,7 +156,7 @@ int main(int argc, char* argv[]) {
 
         } else if (mode == "send" && argc == 5) {
             const std::string host = argv[2];
-            const std::string port = std::to_string(parse_port(argv[3]));   // validates it
+            const std::string port = std::to_string(parse_port(argv[3]));
             const std::string file = argv[4];
 
             auto trust_store = std::make_shared<trust::TrustStore>(identity::TRUST_FILE);
@@ -137,11 +165,10 @@ int main(int argc, char* argv[]) {
             net::ssl::context ssl_ctx(net::ssl::context::tlsv13_client);
             tls_trust::configure_client(ssl_ctx, trust_store);
 
-            // heads up: send_file takes (port, host, file), in that order
             auto node = std::make_shared<ClientNode>(io_ctx, ssl_ctx);
             node->send_file(port, host, file);
             io_ctx.run();
-            return node->succeeded() ? 0 : 1;   // so scripts can tell whether the file really arrived
+            return node->succeeded() ? 0 : 1;
 
         } else {
             print_usage(argv[0]);

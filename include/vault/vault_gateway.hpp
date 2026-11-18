@@ -1,9 +1,9 @@
 #pragma once
-// Hardened Zero-Knowledge RegTech Gateway Engine (v2.1):
+// Hardened Zero-Knowledge RegTech Gateway Engine (v2.2):
 //   - RLIMIT_CORE=0 + move-only OPENSSL_cleanse RAII keys/buffers
-//   - Owner-only (0600) HSM Master KEK + per-officer keys
+//   - PKCS#11 Hardware HSM / 0600 Software KMS Master KEK
 //   - HMAC-authenticated MetadataIndex + hash-chained audit log
-//   - Data-bound M-of-N Compliance Quorum Gate
+//   - True Asymmetric Ed25519 M-of-N Compliance Quorum Gate (public keys only on Gateway)
 //   - Exact column-level token filtering (supports raw PII or TOK_... queries with zero merchant false positives)
 
 #include <algorithm>
@@ -62,6 +62,13 @@ struct OffloadArtifact {
     double records_per_sec = 0.0;
 };
 
+struct ReleaseChallenge {
+    std::string target_token;
+    std::vector<vault_index::BlobEntry> candidate_blobs;
+    std::vector<std::string> registered_officers;
+    std::size_t quorum_threshold = 2;
+};
+
 struct AuditorQueryResult {
     bool authorized = false;
     bool found = false;
@@ -91,22 +98,22 @@ public:
         std::filesystem::create_directories(staging_dir_);
         std::filesystem::create_directories(shards_dir_);
     }
-    const vault_index::QuorumGate& quorum_gate() const noexcept { return quorum_gate_; }
-    const vault_index::MetadataIndex& metadata_index() const noexcept { return metadata_index_; }
 
-    // Collects cryptographic officer signatures bound to each candidate blob for `identifier`
-    std::vector<std::pair<std::string, std::string>> collect_officer_approvals(
-        const std::string& officer_id,
-        const std::string& raw_or_token_identifier)  {
+    const vault_index::QuorumGate& quorum_gate() const noexcept { return quorum_gate_; }
+    vault_index::QuorumGate& quorum_gate() noexcept { return quorum_gate_; }
+    const vault_index::MetadataIndex& metadata_index() const noexcept { return metadata_index_; }
+    std::filesystem::path officer_pubkey_directory() const { return state_dir_ / "officers"; }
+
+    // Read-only challenge lookup so Compliance Officers can sign offline on their own devices
+    ReleaseChallenge prepare_release_challenge(const std::string& raw_or_token_identifier) {
+        quorum_gate_.reload_public_keys();
         const std::string token = resolve_to_token(raw_or_token_identifier);
-        const auto blobs = metadata_index_.find_candidate_blobs(token);
-        std::vector<std::pair<std::string, std::string>> signed_releases;
-        for (const auto& blob : blobs) {
-            signed_releases.emplace_back(
-                officer_id,
-                quorum_gate_.sign_blob_release(officer_id, token, blob));
-        }
-        return signed_releases;
+        return ReleaseChallenge{
+            token,
+            metadata_index_.find_candidate_blobs(token),
+            quorum_gate_.registered_officers(),
+            quorum_gate_.threshold()
+        };
     }
 
     std::filesystem::path generate_synthetic_cbe_batch(std::size_t row_count = 10000) const {
@@ -159,7 +166,6 @@ public:
         std::string sanitized_csv = token_vault_.sanitize_csv_batch(raw_csv, &stats);
         OPENSSL_cleanse(raw_csv.data(), raw_csv.size());
 
-        // Structured CSV column extraction (columns 2, 3, 4 only)
         std::vector<std::string> tokens_in_blob = extract_tokens_from_columns(sanitized_csv);
 
         vault_crypto::SecretKey dek = vault_crypto::generate_key();
@@ -197,27 +203,38 @@ public:
         };
     }
 
-    // Per-blob data-bound quorum verification + exact column token filtering BEFORE re-hydration
+    // Per-blob Ed25519 data-bound quorum verification + exact column token filtering BEFORE re-hydration
     AuditorQueryResult auditor_query(
         const std::string& raw_or_token_identifier,
         const std::filesystem::path& cloud_storage_dir,
-        const std::vector<std::pair<std::string, std::string>>& blob_quorum_approvals,
+        const std::vector<vault_index::OfficerApproval>& blob_quorum_approvals,
         const std::string& auditor_id = "CBE-Auditor-01") {
 
+        quorum_gate_.reload_public_keys();
         AuditorQueryResult res;
         const std::string token = resolve_to_token(raw_or_token_identifier);
         res.matched_token = token;
 
+        if (quorum_gate_.registered_officer_count() < quorum_gate_.threshold()) {
+            res.authorized = false;
+            res.denial_reason = "QUORUM UNCONFIGURED: Found " +
+                                std::to_string(quorum_gate_.registered_officer_count()) +
+                                " officer public key(s) in '" + officer_pubkey_directory().string() +
+                                "', need at least " + std::to_string(quorum_gate_.threshold()) + " (*.pub).";
+            metadata_index_.log_security_event(
+                "QUORUM_DENIED",
+                "Blocked query by '" + auditor_id + "': insufficient registered officer public keys");
+            return res;
+        }
+
         const auto candidate_blobs = metadata_index_.find_candidate_blobs(token);
         if (candidate_blobs.empty()) {
-            // Even when no blobs match, verify at least threshold distinct officers signed off
-            // so unauthorized callers cannot probe token existence
             vault_index::BlobEntry dummy{"NONE", "NONE", 0, 0, ""};
             if (!quorum_gate_.verify_blob_release(token, dummy, blob_quorum_approvals)) {
                 res.authorized = false;
                 res.denial_reason = "QUORUM DENIED: Requires at least " +
                                     std::to_string(quorum_gate_.threshold()) +
-                                    " valid Compliance Officer signatures.";
+                                    " valid detached Ed25519 officer signatures.";
                 metadata_index_.log_security_event(
                     "QUORUM_DENIED",
                     "Blocked unauthorized probe by '" + auditor_id + "' for token '" + token + "'");
@@ -263,7 +280,6 @@ public:
             std::string sanitized_csv = decrypted.as_string();
             decrypted.cleanse();
 
-            // Filter exact tokenized PII columns (cols 2, 3, 4) BEFORE re-hydrating
             std::istringstream lines(sanitized_csv);
             std::string line;
             bool header = true;
@@ -296,7 +312,7 @@ public:
             res.authorized = false;
             res.denial_reason = "QUORUM DENIED: Requires at least " +
                                 std::to_string(quorum_gate_.threshold()) +
-                                " valid Compliance Officer signatures bound to target blob.";
+                                " valid detached Ed25519 officer signatures bound to target blob.";
             return res;
         }
 
@@ -385,8 +401,7 @@ private:
         if (raw_or_token.rfind("TOK_", 0) == 0) {
             return raw_or_token;
         }
-        // Const-safe lookup or deterministic compute via TokenVault
-        return const_cast<vault_token::TokenVault&>(token_vault_).tokenize(raw_or_token);
+        return token_vault_.tokenize(raw_or_token);
     }
 
     static std::string make_blob_filename() {

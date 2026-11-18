@@ -1,6 +1,8 @@
 #pragma once
 #include <QObject>
 #include <QString>
+#include <QList>
+#include <QPair>
 #include <thread>
 #include <memory>
 #include <boost/asio.hpp>
@@ -24,8 +26,11 @@ public:
     // BlindVault Hardened RegTech Pipeline Methods
     void generateSyntheticBatch(quint64 rowCount);
     void ingestAndOffloadCsv(const QString& host, uint16_t port, const QString& csvPath);
-    void queryAuditorRecords(const QString& identifier, const QString& cloudDir,
-                             bool officer1Approved, bool officer2Approved, bool officer3Approved);
+    void prepareReleaseChallenge(const QString& identifier);
+    void importOfficerPublicKey(const QString& pubKeyPath);
+    void queryAuditorRecords(const QString& identifier,
+                             const QString& cloudDir,
+                             const QList<QPair<QString, QString>>& detachedApprovals);
 
 signals:
     void logMessage(const QString& msg);
@@ -41,6 +46,10 @@ signals:
     void offloadTelemetryReady(quint64 records, quint64 piiTokenized, quint64 ipsMasked,
                                quint64 paddedBytes, quint64 shardBytes,
                                double elapsedMs, double recordsPerSec, const QString& blobName);
+    void releaseChallengeReady(const QString& targetToken,
+                               const QString& challengeSummary,
+                               const QString& registeredOfficersSummary);
+    void officerPublicKeyImported(const QString& statusMessage);
     void auditorQueryCompleted(bool authorized, bool found, const QString& statusOrToken,
                                const QString& restoredCsv, const QString& rawCloudHex);
 

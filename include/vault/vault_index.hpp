@@ -1,7 +1,14 @@
 #pragma once
-// Hardened Metadata Index, Data-Bound M-of-N Compliance Quorum Gate,
+// Hardened Metadata Index, Asymmetric Ed25519 M-of-N Compliance Quorum Gate,
 // & Tamper-Evident HMAC Hash-Chained Audit Log.
+//
+// Separation of Duties:
+//   - Each Compliance Officer generates an Ed25519 keypair offline on their own workstation/HSM.
+//   - Only the officer public keys (*.pub) are installed on the Gateway host.
+//   - The Gateway holds ZERO officer private keys and has NO in-process signing capability.
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <ctime>
 #include <filesystem>
@@ -17,6 +24,10 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <openssl/bio.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
 #include "at_rest_crypto.hpp"
 #include "kms_provider.hpp"
 
@@ -30,85 +41,199 @@ struct BlobEntry {
     std::string created_utc;
 };
 
-// M-of-N Dual-Custody Quorum Gate:
-//   - Generates per-officer 256-bit secrets on disk (0600 permissions) — zero hardcoded passwords in source
-//   - Binds approvals to (target_token, blob_name, wrapped_dek_hex) so forged index entries cannot bypass quorum
-//   - Verifies signatures in constant time (CRYPTO_memcmp)
+struct OfficerApproval {
+    std::string officer_id;
+    std::string signature_hex;    // 128-char hex (64-byte Ed25519 signature)
+};
+
+// Canonical payload signed offline by each Compliance Officer
+inline std::string build_release_payload(const std::string& officer_id,
+                                         const std::string& target_token,
+                                         const std::string& blob_name,
+                                         const std::string& wrapped_dek_hex) {
+    return officer_id + "|" + target_token + "|" + blob_name + "|" + wrapped_dek_hex;
+}
+
+// Offline Officer Keygen (run on each officer's own workstation/HSM)
+inline void generate_officer_ed25519_keypair(const std::filesystem::path& priv_pem_path,
+                                             const std::filesystem::path& pub_pem_path) {
+    using PkeyCtx = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
+    using Pkey    = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+    using BioPtr  = std::unique_ptr<BIO, decltype(&BIO_free)>;
+
+    if (priv_pem_path.has_parent_path()) {
+        std::filesystem::create_directories(priv_pem_path.parent_path());
+    }
+    if (pub_pem_path.has_parent_path()) {
+        std::filesystem::create_directories(pub_pem_path.parent_path());
+    }
+
+    PkeyCtx kctx(EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr), &EVP_PKEY_CTX_free);
+    if (!kctx || EVP_PKEY_keygen_init(kctx.get()) <= 0) {
+        throw std::runtime_error("QuorumGate: Ed25519 keygen init failed");
+    }
+    EVP_PKEY* raw_pkey = nullptr;
+    if (EVP_PKEY_keygen(kctx.get(), &raw_pkey) <= 0 || !raw_pkey) {
+        throw std::runtime_error("QuorumGate: Ed25519 keygen failed");
+    }
+    Pkey pkey(raw_pkey, &EVP_PKEY_free);
+
+    BioPtr priv_bio(BIO_new(BIO_s_mem()), &BIO_free);
+    BioPtr pub_bio(BIO_new(BIO_s_mem()), &BIO_free);
+    if (!priv_bio || !pub_bio ||
+        PEM_write_bio_PrivateKey(priv_bio.get(), pkey.get(), nullptr, nullptr, 0, nullptr, nullptr) != 1 ||
+        PEM_write_bio_PUBKEY(pub_bio.get(), pkey.get()) != 1) {
+        throw std::runtime_error("QuorumGate: failed serializing Ed25519 PEM keys");
+    }
+
+    char* priv_data = nullptr;
+    const long priv_len = BIO_get_mem_data(priv_bio.get(), &priv_data);
+    std::string priv_pem(priv_data, static_cast<std::size_t>(priv_len));
+    vault_crypto::write_secret_file_0600(priv_pem_path, priv_pem);
+    OPENSSL_cleanse(priv_pem.data(), priv_pem.size());
+
+    char* pub_data = nullptr;
+    const long pub_len = BIO_get_mem_data(pub_bio.get(), &pub_data);
+    std::ofstream pub_out(pub_pem_path, std::ios::binary | std::ios::trunc);
+    if (!pub_out) {
+        throw std::runtime_error("QuorumGate: cannot write public key " + pub_pem_path.string());
+    }
+    pub_out.write(pub_data, pub_len);
+    pub_out.flush();
+    if (!pub_out) {
+        throw std::runtime_error("QuorumGate: failed flushing public key " + pub_pem_path.string());
+    }
+}
+
+// Offline Officer Signing (run on each officer's own device; never called by GatewayEngine)
+inline std::string sign_blob_release_offline(const std::filesystem::path& priv_pem_path,
+                                             const std::string& officer_id,
+                                             const std::string& target_token,
+                                             const std::string& blob_name,
+                                             const std::string& wrapped_dek_hex) {
+    using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
+    using Pkey   = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+    using MdCtx  = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+
+    std::ifstream in(priv_pem_path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("QuorumGate: cannot open private key " + priv_pem_path.string());
+    }
+    std::string pem((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    BioPtr bio(BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), &BIO_free);
+    Pkey pkey(PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, const_cast<char*>("")), &EVP_PKEY_free);
+    OPENSSL_cleanse(pem.data(), pem.size());
+    if (!pkey || EVP_PKEY_id(pkey.get()) != EVP_PKEY_ED25519) {
+        throw std::runtime_error("QuorumGate: invalid Ed25519 private key");
+    }
+
+    const std::string payload = build_release_payload(officer_id, target_token, blob_name, wrapped_dek_hex);
+    MdCtx mctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+    if (!mctx || EVP_DigestSignInit(mctx.get(), nullptr, nullptr, nullptr, pkey.get()) <= 0) {
+        throw std::runtime_error("QuorumGate: EVP_DigestSignInit failed");
+    }
+
+    std::array<uint8_t, 64> sig{};
+    std::size_t sig_len = sig.size();
+    if (EVP_DigestSign(mctx.get(), sig.data(), &sig_len,
+                       reinterpret_cast<const uint8_t*>(payload.data()), payload.size()) <= 0 ||
+        sig_len != 64) {
+        throw std::runtime_error("QuorumGate: Ed25519 signing failed");
+    }
+    return vault_crypto::bytes_to_hex(sig.data(), sig.size());
+}
+
+// Gateway-Side Verifier:
+//   - Holds ONLY officer Ed25519 public keys (*.pub) on disk. Zero private keys on the Gateway host.
+//   - Binds approvals to (target_token, blob_name, wrapped_dek_hex) so forged index entries cannot bypass quorum.
 class QuorumGate {
 public:
-    explicit QuorumGate(std::filesystem::path  officer_key_dir, std::size_t threshold = 2)
-        : officer_key_dir_(std::move(officer_key_dir)), threshold_(threshold) {
-        std::filesystem::create_directories(officer_key_dir_);
-        const std::vector<std::string> default_officers = {
-            "CBE-Officer-1", "CBE-Officer-2", "CBE-Officer-3"
-        };
-        for (const auto& officer : default_officers) {
-            officer_keys_.emplace(officer, load_or_create_officer_key(officer));
+    using PkeyPtr = std::shared_ptr<EVP_PKEY>;
+
+    explicit QuorumGate(std::filesystem::path officer_pubkey_dir, std::size_t threshold = 2)
+        : officer_pubkey_dir_(std::move(officer_pubkey_dir)), threshold_(threshold) {
+        std::filesystem::create_directories(officer_pubkey_dir_);
+        reload_public_keys();
+    }
+
+    void reload_public_keys() {
+        officer_pubkeys_.clear();
+        if (!std::filesystem::exists(officer_pubkey_dir_)) return;
+        for (const auto& entry : std::filesystem::directory_iterator(officer_pubkey_dir_)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".pub") continue;
+            const std::string officer_id = entry.path().stem().string();
+            officer_pubkeys_.emplace(officer_id, load_public_key(entry.path()));
         }
     }
 
     std::size_t threshold() const noexcept { return threshold_; }
+    std::size_t registered_officer_count() const noexcept { return officer_pubkeys_.size(); }
 
-    // Signs an authorization bound to the specific token, cloud blob, and wrapped DEK
-    std::string sign_blob_release(const std::string& officer_id,
-                                  const std::string& target_token,
-                                  const BlobEntry& blob) const {
-        auto it = officer_keys_.find(officer_id);
-        if (it == officer_keys_.end()) {
-            throw std::runtime_error("QuorumGate: unknown compliance officer '" + officer_id + "'");
-        }
-        const std::string payload = build_release_payload(officer_id, target_token, blob);
-        return vault_crypto::hmac_sha256_hex(it->second.data(), vault_crypto::SecretKey::size(), payload);
+    std::vector<std::string> registered_officers() const {
+        std::vector<std::string> ids;
+        ids.reserve(officer_pubkeys_.size());
+        for (const auto& [id, _] : officer_pubkeys_) ids.push_back(id);
+        std::ranges::sort(ids);
+        return ids;
     }
 
-    // Constant-time verification that >= threshold distinct officers signed this exact blob release
+    // Verifies that >= threshold distinct officers signed this exact blob release with their Ed25519 private keys
     bool verify_blob_release(const std::string& target_token,
                              const BlobEntry& blob,
-                             const std::vector<std::pair<std::string, std::string>>& approvals) const {
+                             const std::vector<OfficerApproval>& approvals) const {
+        if (officer_pubkeys_.size() < threshold_) return false;
+
         std::unordered_set<std::string> valid_officers;
-        for (const auto& [officer_id, sig_hex] : approvals) {
-            auto it = officer_keys_.find(officer_id);
-            if (it == officer_keys_.end()) continue;
-            const std::string payload = build_release_payload(officer_id, target_token, blob);
-            const std::string expected_hex =
-                vault_crypto::hmac_sha256_hex(it->second.data(), vault_crypto::SecretKey::size(), payload);
-            if (vault_crypto::constant_time_hex_equal(sig_hex, expected_hex)) {
-                valid_officers.insert(officer_id);
+        for (const auto& approval : approvals) {
+            auto it = officer_pubkeys_.find(approval.officer_id);
+            if (it == officer_pubkeys_.end()) continue;
+
+            std::vector<uint8_t> sig_bytes;
+            try {
+                sig_bytes = vault_crypto::hex_to_bytes(approval.signature_hex);
+            } catch (...) {
+                continue;
+            }
+            if (sig_bytes.size() != 64) continue;
+
+            const std::string payload = build_release_payload(
+                approval.officer_id, target_token, blob.blob_name, blob.wrapped_dek_hex);
+
+            using MdCtx = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+            MdCtx mctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+            if (!mctx ||
+                EVP_DigestVerifyInit(mctx.get(), nullptr, nullptr, nullptr, it->second.get()) <= 0) {
+                continue;
+            }
+            if (EVP_DigestVerify(mctx.get(), sig_bytes.data(), sig_bytes.size(),
+                                 reinterpret_cast<const uint8_t*>(payload.data()),
+                                 payload.size()) == 1) {
+                valid_officers.insert(approval.officer_id);
             }
         }
         return valid_officers.size() >= threshold_;
     }
 
 private:
-    static std::string build_release_payload(const std::string& officer_id,
-                                             const std::string& target_token,
-                                             const BlobEntry& blob) {
-        return officer_id + "|" + target_token + "|" + blob.blob_name + "|" + blob.wrapped_dek_hex;
-    }
+    static PkeyPtr load_public_key(const std::filesystem::path& pub_path) {
+        std::ifstream in(pub_path, std::ios::binary);
+        if (!in) throw std::runtime_error("QuorumGate: cannot open public key " + pub_path.string());
+        std::string pem((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
-    vault_crypto::SecretKey load_or_create_officer_key(const std::string& officer_id) const {
-        const auto key_path = officer_key_dir_ / (officer_id + ".key");
-        if (std::filesystem::exists(key_path)) {
-            std::ifstream in(key_path, std::ios::binary);
-            std::string hex_str;
-            std::getline(in, hex_str);
-            const auto raw = vault_crypto::hex_to_bytes(hex_str);
-            if (raw.size() != vault_crypto::KEY_LEN) {
-                throw std::runtime_error("QuorumGate: corrupted key for " + officer_id);
-            }
-            vault_crypto::SecretKey k;
-            std::memcpy(k.data(), raw.data(), vault_crypto::KEY_LEN);
-            return k;
+        using BioPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
+        BioPtr bio(BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), &BIO_free);
+        EVP_PKEY* raw = PEM_read_bio_PUBKEY(bio.get(), nullptr, nullptr, nullptr);
+        if (!raw || EVP_PKEY_id(raw) != EVP_PKEY_ED25519) {
+            if (raw) EVP_PKEY_free(raw);
+            throw std::runtime_error("QuorumGate: invalid Ed25519 public key in " + pub_path.string());
         }
-        vault_crypto::SecretKey k = vault_crypto::generate_key();
-        vault_crypto::write_secret_file_0600(
-            key_path, vault_crypto::bytes_to_hex(k.data(), vault_crypto::SecretKey::size()) + "\n");
-        return k;
+        return PkeyPtr(raw, &EVP_PKEY_free);
     }
 
-    std::filesystem::path officer_key_dir_;
+    std::filesystem::path officer_pubkey_dir_;
     std::size_t threshold_;
-    std::unordered_map<std::string, vault_crypto::SecretKey> officer_keys_;
+    std::unordered_map<std::string, PkeyPtr> officer_pubkeys_;
 };
 
 // HMAC-Authenticated Metadata Index & Cryptographic Hash-Chained Audit Log
@@ -153,6 +278,7 @@ public:
                 }
             }
         }
+        std::ranges::sort(results, {}, &BlobEntry::blob_name);
         return results;
     }
 
@@ -322,7 +448,6 @@ private:
     }
 
     std::string serialize_canonical_body_unlocked() const {
-        // Deterministic sorted serialization so MAC verification is invariant
         std::vector<std::string> blob_names;
         blob_names.reserve(blobs_.size());
         for (const auto &name: blobs_ | std::views::keys) blob_names.push_back(name);

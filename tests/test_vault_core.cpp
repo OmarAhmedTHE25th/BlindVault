@@ -73,6 +73,33 @@ private:
     vault_crypto::SecretKey master_;
 };
 
+// Helper: generates 3 offline officer Ed25519 keypairs and installs ONLY *.pub on the Gateway
+void setup_offline_officers(const std::filesystem::path& offline_priv_dir,
+                            const std::filesystem::path& gateway_pub_dir) {
+    std::filesystem::create_directories(offline_priv_dir);
+    std::filesystem::create_directories(gateway_pub_dir);
+    for (const std::string& id : {"CBE-Officer-1", "CBE-Officer-2", "CBE-Officer-3"}) {
+        vault_index::generate_officer_ed25519_keypair(
+            offline_priv_dir / (id + ".priv"),
+            gateway_pub_dir  / (id + ".pub"));
+    }
+}
+
+vault_index::OfficerApproval sign_offline(const std::filesystem::path& offline_priv_dir,
+                                          const std::string& officer_id,
+                                          const std::string& target_token,
+                                          const vault_index::BlobEntry& blob) {
+    return vault_index::OfficerApproval{
+        officer_id,
+        vault_index::sign_blob_release_offline(
+            offline_priv_dir / (officer_id + ".priv"),
+            officer_id,
+            target_token,
+            blob.blob_name,
+            blob.wrapped_dek_hex)
+    };
+}
+
 } // namespace
 
 // ---------------- AES-256-GCM At-Rest Crypto (v2 BVL2 Envelope) ----------------
@@ -194,7 +221,7 @@ TEST(Tokenizer, PersistsAcrossReloads) {
     }
 }
 
-// ---------------- Hardened Vault Features (RFC 3394, 64KiB Pad, 2-of-3 Erasure, 2-of-3 Quorum) ----------------
+// ---------------- Hardened Vault Features (RFC 3394, 64KiB Pad, 2-of-3 Erasure, Ed25519 2-of-3 Quorum) ----------------
 
 TEST(VaultHardening, Rfc3394KeyWrapAnd64KiBTrafficPadding) {
     const auto kek = vault_crypto::generate_key();
@@ -232,13 +259,17 @@ TEST(VaultHardening, TwoOfThreeErasureCodingSurvivesCloudNodeLoss) {
 
 TEST(VaultHardening, EndToEndTokenSearchExactColumnMatchTamperIndexAndChainedAudit) {
     TempDir dir;
-    const auto cloud_bucket = dir.file("cloud_bucket");
-    const auto state_dir    = dir.file("bank_state");
+    const auto cloud_bucket     = dir.file("cloud_bucket");
+    const auto state_dir        = dir.file("bank_state");
+    const auto offline_priv_dir = dir.file("offline_officers");
     std::filesystem::create_directories(cloud_bucket);
+
+    // Install ONLY officer Ed25519 public keys (*.pub) in bank_state/officers
+    setup_offline_officers(offline_priv_dir, state_dir / "officers");
+    EXPECT_FALSE(std::filesystem::exists(state_dir / "officers" / "CBE-Officer-1.priv"));
 
     vault_gateway::GatewayEngine gateway(state_dir, /*quorum_threshold=*/2);
 
-    // Create a custom CSV where a merchant is named "Ahmed-Electronics" while the customer is "Mona El-Sayed"
     const auto custom_csv = dir.file("custom_tx.csv");
     {
         std::ofstream out(custom_csv);
@@ -250,15 +281,30 @@ TEST(VaultHardening, EndToEndTokenSearchExactColumnMatchTamperIndexAndChainedAud
     const auto artifact = gateway.prepare_encrypted_offload(custom_csv);
     std::filesystem::copy_file(artifact.encrypted_file_path, cloud_bucket / artifact.blob_name);
 
-    // 1. Solo officer must be DENIED
-    const auto solo = gateway.collect_officer_approvals("CBE-Officer-1", "Ahmed Hassan");
-    const auto denied = gateway.auditor_query("Ahmed Hassan", cloud_bucket, solo, "Solo-Auditor");
+    const auto challenge = gateway.prepare_release_challenge("Ahmed Hassan");
+    ASSERT_EQ(challenge.candidate_blobs.size(), 1u);
+    const auto& target_blob = challenge.candidate_blobs[0];
+
+    // 1. Solo officer Ed25519 signature must be DENIED
+    const auto solo_sig = sign_offline(offline_priv_dir, "CBE-Officer-1", challenge.target_token, target_blob);
+    const auto denied = gateway.auditor_query("Ahmed Hassan", cloud_bucket, {solo_sig}, "Solo-Auditor");
     EXPECT_FALSE(denied.authorized);
 
-    // 2. Searching "Ahmed Hassan" must return ONLY TXN1, NOT TXN2 ("Ahmed-Electronics")
-    auto dual = gateway.collect_officer_approvals("CBE-Officer-1", "Ahmed Hassan");
-    auto sig2 = gateway.collect_officer_approvals("CBE-Officer-2", "Ahmed Hassan");
-    dual.insert(dual.end(), sig2.begin(), sig2.end());
+    // 2. Duplicate signature from same officer twice must be DENIED
+    const auto dup_denied = gateway.auditor_query("Ahmed Hassan", cloud_bucket, {solo_sig, solo_sig}, "Dup-Auditor");
+    EXPECT_FALSE(dup_denied.authorized);
+
+    // 3. Forged / corrupted Ed25519 signature must be DENIED
+    auto forged_sig = sign_offline(offline_priv_dir, "CBE-Officer-2", challenge.target_token, target_blob);
+    forged_sig.signature_hex[0] = (forged_sig.signature_hex[0] == 'a') ? 'b' : 'a';
+    const auto forged_denied = gateway.auditor_query("Ahmed Hassan", cloud_bucket, {solo_sig, forged_sig}, "Forged-Auditor");
+    EXPECT_FALSE(forged_denied.authorized);
+
+    // 4. Two distinct valid offline Ed25519 signatures -> AUTHORIZED, returning ONLY TXN1 (NOT TXN2 "Ahmed-Electronics")
+    const std::vector<vault_index::OfficerApproval> dual = {
+        sign_offline(offline_priv_dir, "CBE-Officer-1", challenge.target_token, target_blob),
+        sign_offline(offline_priv_dir, "CBE-Officer-2", challenge.target_token, target_blob)
+    };
 
     const auto by_name = gateway.auditor_query("Ahmed Hassan", cloud_bucket, dual, "Dual-Auditor");
     EXPECT_TRUE(by_name.authorized);
@@ -267,20 +313,16 @@ TEST(VaultHardening, EndToEndTokenSearchExactColumnMatchTamperIndexAndChainedAud
     EXPECT_EQ(by_name.restored_csv.find("TXN2"), std::string::npos);
     EXPECT_EQ(by_name.restored_csv.find("Ahmed-Electronics"), std::string::npos);
 
-    // 3. Searching directly by TOK_... must work identically
-    auto tok_approvals = gateway.collect_officer_approvals("CBE-Officer-1", by_name.matched_token);
-    auto tok_sig2      = gateway.collect_officer_approvals("CBE-Officer-2", by_name.matched_token);
-    tok_approvals.insert(tok_approvals.end(), tok_sig2.begin(), tok_sig2.end());
-
-    const auto by_tok = gateway.auditor_query(by_name.matched_token, cloud_bucket, tok_approvals, "Dual-Auditor");
+    // 5. Searching directly by TOK_... must work identically
+    const auto by_tok = gateway.auditor_query(by_name.matched_token, cloud_bucket, dual, "Dual-Auditor");
     EXPECT_TRUE(by_tok.authorized);
     EXPECT_TRUE(by_tok.found);
     EXPECT_NE(by_tok.restored_csv.find("Ahmed Hassan"), std::string::npos);
 
-    // 4. Audit log hash chain must verify intact
+    // 6. Audit log hash chain must verify intact
     EXPECT_TRUE(gateway.metadata_index().verify_audit_chain());
 
-    // 5. Tampering with vault_index.tsv must fail HMAC authentication on load
+    // 7. Tampering with vault_index.tsv must fail HMAC authentication on load
     {
         std::ofstream tamper(state_dir / "vault_index.tsv", std::ios::app);
         tamper << "MAP\tTOK_deadbeefcafebabe\t" << artifact.blob_name << "\n";
@@ -302,7 +344,6 @@ TEST(Tokenizer, PersistsAcrossReloadsEncryptedAtRest) {
         v1.flush();
     }
 
-    // Verify the file on disk is BVTK-encrypted and contains zero plaintext PII
     const auto raw_disk = vault_crypto::read_bytes_from_file(token_file.string());
     ASSERT_GT(raw_disk.size(), 84u);
     EXPECT_EQ(raw_disk[0], 'B');
@@ -376,9 +417,11 @@ TEST(VaultHardening, HsmRotationFailsBeforeBlobOrIndexMutation) {
 
 TEST(VaultHardening, MasterKekRotationRewrapsAndReauthenticates) {
     TempDir dir;
-    const auto state_dir = dir.file("bank_state");
-    const auto cloud_bucket = dir.file("cloud_bucket");
+    const auto state_dir        = dir.file("bank_state");
+    const auto cloud_bucket     = dir.file("cloud_bucket");
+    const auto offline_priv_dir = dir.file("offline_officers");
     std::filesystem::create_directories(cloud_bucket);
+    setup_offline_officers(offline_priv_dir, state_dir / "officers");
 
     vault_gateway::GatewayEngine gateway(state_dir, 2);
     const auto custom_csv = dir.file("rotation_tx.csv");
@@ -396,12 +439,15 @@ TEST(VaultHardening, MasterKekRotationRewrapsAndReauthenticates) {
 
     EXPECT_TRUE(gateway.metadata_index().verify_audit_chain());
     const auto blob_entries = gateway.metadata_index().blob_entries();
+    ASSERT_EQ(blob_entries.size(), 1u);
     EXPECT_FALSE(blob_entries[0].wrapped_dek_hex.empty());
 
-    const auto approvals = gateway.collect_officer_approvals("CBE-Officer-1", "Rotation Customer");
-    auto second = gateway.collect_officer_approvals("CBE-Officer-2", "Rotation Customer");
-    std::vector<std::pair<std::string, std::string>> dual = approvals;
-    dual.insert(dual.end(), second.begin(), second.end());
+    const auto challenge = gateway.prepare_release_challenge("Rotation Customer");
+    ASSERT_EQ(challenge.candidate_blobs.size(), 1u);
+    const std::vector<vault_index::OfficerApproval> dual = {
+        sign_offline(offline_priv_dir, "CBE-Officer-1", challenge.target_token, challenge.candidate_blobs[0]),
+        sign_offline(offline_priv_dir, "CBE-Officer-2", challenge.target_token, challenge.candidate_blobs[0])
+    };
     const auto result = gateway.auditor_query("Rotation Customer", cloud_bucket, dual);
     EXPECT_TRUE(result.authorized);
     EXPECT_TRUE(result.found);

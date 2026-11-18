@@ -8,7 +8,6 @@
 #include <QTableWidget>
 #include <QLabel>
 #include <QFrame>
-#include <QCheckBox>
 #include "network_bridge.hpp"
 
 class MainWindow : public QMainWindow {
@@ -24,6 +23,8 @@ private slots:
     void onGenerateSynthetic();
     void onOffloadCsv();
     void onStartServer();
+    void onImportOfficerPubKey();
+    void onPrepareChallenge();
     void onAuditorSearch();
     void onAddPeer();
     void onRemovePeer();
@@ -35,6 +36,10 @@ private slots:
     void onOffloadTelemetryReady(quint64 records, quint64 piiTokenized, quint64 ipsMasked,
                                  quint64 paddedBytes, quint64 shardBytes,
                                  double elapsedMs, double recordsPerSec, const QString& blobName);
+    void onReleaseChallengeReady(const QString& targetToken,
+                                 const QString& challengeSummary,
+                                 const QString& registeredOfficersSummary);
+    void onOfficerPublicKeyImported(const QString& statusMessage);
     void onAuditorQueryCompleted(bool authorized, bool found, const QString& statusOrToken,
                                  const QString& restoredCsv, const QString& rawCloudHex);
 
@@ -68,12 +73,16 @@ private:
     QLabel* telemetry_lbl_ = nullptr;
     QLabel* hardening_lbl_ = nullptr;
 
-    // Tab 2: Auditor Re-Hydration & Cloud Proof widgets
+    // Tab 2: Asymmetric Ed25519 Quorum Auditor & Cloud Proof widgets
     QLineEdit* auditor_query_input_ = nullptr;
+    QPushButton* prep_challenge_btn_ = nullptr;
+    QPushButton* import_officer_pub_btn_ = nullptr;
+    QTextEdit* challenge_view_ = nullptr;
+    QLineEdit* officer1_id_input_ = nullptr;
+    QLineEdit* officer1_sig_input_ = nullptr;
+    QLineEdit* officer2_id_input_ = nullptr;
+    QLineEdit* officer2_sig_input_ = nullptr;
     QPushButton* auditor_search_btn_ = nullptr;
-    QCheckBox* officer1_chk_ = nullptr;
-    QCheckBox* officer2_chk_ = nullptr;
-    QCheckBox* officer3_chk_ = nullptr;
     QLabel* auditor_token_lbl_ = nullptr;
     QTableWidget* auditor_table_ = nullptr;
     QTextEdit* cloud_hex_view_ = nullptr;
