@@ -68,7 +68,7 @@ public:
     // Collects cryptographic officer signatures bound to each candidate blob for `identifier`
     std::vector<std::pair<std::string, std::string>> collect_officer_approvals(
         const std::string& officer_id,
-        const std::string& raw_or_token_identifier) const {
+        const std::string& raw_or_token_identifier)  {
         const std::string token = resolve_to_token(raw_or_token_identifier);
         const auto blobs = metadata_index_.find_candidate_blobs(token);
         std::vector<std::pair<std::string, std::string>> signed_releases;
@@ -280,7 +280,7 @@ public:
     }
 
 private:
-    std::string resolve_to_token(const std::string& raw_or_token) const {
+    std::string resolve_to_token(const std::string& raw_or_token) {
         if (raw_or_token.rfind("TOK_", 0) == 0) {
             return raw_or_token;
         }
@@ -304,7 +304,7 @@ private:
         }
         vault_crypto::SecretKey kek = vault_crypto::generate_key();
         vault_crypto::write_secret_file_0600(
-            kek_path, vault_crypto::bytes_to_hex(kek.data(), kek.size()) + "\n");
+            kek_path, vault_crypto::bytes_to_hex(kek.data(), vault_crypto::SecretKey::size()) + "\n");
         return kek;
     }
 
