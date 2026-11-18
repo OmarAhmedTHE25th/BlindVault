@@ -14,7 +14,7 @@
 #include <filesystem>
 #include "identity.hpp"
 #include "trust_store.hpp"
-#include "../tokenizer.hpp"
+#include "tokenizer.hpp"
 
 namespace {
 std::filesystem::path getIdentityDirectory() {

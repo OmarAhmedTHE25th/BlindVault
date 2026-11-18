@@ -192,23 +192,14 @@ mkdir -p corpus-work
 ## Project Structure
 
 ```text
-main.cpp              CLI entry point and argument parsing
-vault_gateway.hpp     Hardened RegTech pipeline orchestrator & synthetic CBE data generator
-tokenizer.hpp         Deterministic HMAC-SHA256 PII tokenizer & IP scrubber
-at_rest_crypto.hpp    BVL2 AES-256-GCM, 64 KiB padding, RFC 3394 key wrap, 2-of-3 erasure coding & RAM cleansing
-vault_index.hpp       Local wrapped-DEK index, 2-of-3 QuorumGate & immutable compliance audit logger
-cli_identity.hpp      Identity generation, fingerprint display, and trust commands
-identity.hpp          EC P-256 keypair & self-signed X.509 certificate management
-trust_store.hpp       Pinned SHA-256 peer fingerprint allowlist
-tls_trust.hpp         Mutual TLS 1.3 fingerprint verification callbacks
-p2p_node.hpp          Interactive P2P node wrapper
-server_node.hpp       Async TCP/TLS acceptor with connection limits & handshake timeouts
-server_session.hpp    Per-transfer receiving state machine with atomic .part writes
-client_node.hpp       Async outgoing TLS 1.3 file/blob streamer
-validation.hpp        Pure header and filename sanitization rules
-disk_budget.hpp       Thread-safe shared disk-space reservation pool
-protocol.hpp          47-byte big-endian wire protocol definitions
-file_streaming.hpp    64 KiB chunked SHA-256 file hashing
+src/main.cpp          CLI entry point and argument parsing
+include/
+  vault/              Bank-side RegTech and zero-knowledge engine
+  transport/
+    client/           Outgoing transfer and P2P client headers
+    server/           Cloud receiver and transfer session headers
+    common/           Wire protocol, streaming, and shared events
+  security/           mTLS, identities, allowlists, and input/disk guards
 gui/                  Qt 6 desktop application and Boost.Asio thread bridge
 tests/                GoogleTest unit & integration test suites
 fuzz/                 libFuzzer target and seed corpus

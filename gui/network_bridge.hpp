@@ -5,10 +5,10 @@
 #include <memory>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
-#include "../trust_store.hpp"
-#include "../server_node.hpp"
-#include "../client_node.hpp"
-#include "../vault_gateway.hpp"
+#include "trust_store.hpp"
+#include "server_node.hpp"
+#include "client_node.hpp"
+#include "vault_gateway.hpp"
 #include "log_redirect.hpp"
 
 class NetworkBridge : public QObject {

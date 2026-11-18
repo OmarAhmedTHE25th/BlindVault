@@ -26,25 +26,32 @@ find_package(Boost REQUIRED COMPONENTS system)
 
 # ---------------- CLI Application ----------------
 add_executable(P2P_Secure_File_Sharing
-        main.cpp
-        protocol.hpp
-        validation.hpp
-        disk_budget.hpp
-        trust_store.hpp
-        identity.hpp
-        cli_identity.hpp
-        tls_trust.hpp
-        file_streaming.hpp
-        client_node.hpp
-        server_session.hpp
-        server_node.hpp
-        p2p_node.hpp
+        src/main.cpp
+        include/transport/common/protocol.hpp
+        include/security/validation.hpp
+        include/security/disk_budget.hpp
+        include/security/trust_store.hpp
+        include/security/identity.hpp
+        include/security/cli_identity.hpp
+        include/security/tls_trust.hpp
+        include/transport/common/file_streaming.hpp
+        include/transport/client/client_node.hpp
+        include/transport/server/server_session.hpp
+        include/transport/server/server_node.hpp
+        include/transport/client/p2p_node.hpp
         gui/log_redirect.hpp
-        events.hpp
-        at_rest_crypto.hpp
-        tokenizer.hpp
-        vault_index.hpp
-        vault_gateway.hpp
+        include/transport/common/events.hpp
+        include/vault/at_rest_crypto.hpp
+        include/vault/tokenizer.hpp
+        include/vault/vault_index.hpp
+        include/vault/vault_gateway.hpp
+)
+target_include_directories(P2P_Secure_File_Sharing PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/security
 )
 target_link_libraries(P2P_Secure_File_Sharing PRIVATE
         OpenSSL::SSL
@@ -66,17 +73,17 @@ if(P2P_BUILD_GUI)
             gui/main_window.cpp
             gui/network_bridge.hpp
             gui/network_bridge.cpp
-            protocol.hpp
-            validation.hpp
-            disk_budget.hpp
-            trust_store.hpp
-            identity.hpp
-            cli_identity.hpp
-            tls_trust.hpp
-            file_streaming.hpp
-            client_node.hpp
-            server_session.hpp
-            server_node.hpp
+            include/transport/common/protocol.hpp
+            include/security/validation.hpp
+            include/security/disk_budget.hpp
+            include/security/trust_store.hpp
+            include/security/identity.hpp
+            include/security/cli_identity.hpp
+            include/security/tls_trust.hpp
+            include/transport/common/file_streaming.hpp
+            include/transport/client/client_node.hpp
+            include/transport/server/server_session.hpp
+            include/transport/server/server_node.hpp
             gui/network_bridge.hpp
             gui/main_window.cpp
             gui/main_window.hpp
@@ -84,15 +91,20 @@ if(P2P_BUILD_GUI)
             gui/main_gui.cpp
             gui/network_bridge.cpp
             gui/log_redirect.hpp
-            events.hpp
-            at_rest_crypto.hpp
-            tokenizer.hpp
-            vault_index.hpp
-            vault_gateway.hpp
+            include/transport/common/events.hpp
+            include/vault/at_rest_crypto.hpp
+            include/vault/tokenizer.hpp
+            include/vault/vault_index.hpp
+            include/vault/vault_gateway.hpp
     )
 
     target_include_directories(P2P_Secure_File_Sharing_GUI PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/security
             ${CMAKE_CURRENT_SOURCE_DIR}/gui
     )
 
@@ -113,11 +125,17 @@ if(P2P_BUILD_FUZZERS)
         message(FATAL_ERROR "P2P_BUILD_FUZZERS needs Clang (it uses libFuzzer)")
     endif()
     add_executable(fuzz_validation fuzz/fuzz_validation.cpp
-            at_rest_crypto.hpp
-            tokenizer.hpp
-            vault_index.hpp
-            vault_gateway.hpp)
-    target_include_directories(fuzz_validation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            include/vault/at_rest_crypto.hpp
+            include/vault/tokenizer.hpp
+            include/vault/vault_index.hpp
+            include/vault/vault_gateway.hpp)
+    target_include_directories(fuzz_validation PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/security)
     target_compile_options(fuzz_validation PRIVATE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -O1 -g)
     target_link_options(fuzz_validation PRIVATE -fsanitize=fuzzer,address,undefined)
     target_link_libraries(fuzz_validation PRIVATE Boost::system)
@@ -144,13 +162,19 @@ if(P2P_BUILD_TESTS)
             tests/test_tls_trust.cpp
             tests/test_hashing.cpp
             tests/test_e2e_trust.cpp
-            at_rest_crypto.hpp
-            tokenizer.hpp
-            vault_index.hpp
-            vault_gateway.hpp
+            include/vault/at_rest_crypto.hpp
+            include/vault/tokenizer.hpp
+            include/vault/vault_index.hpp
+            include/vault/vault_gateway.hpp
             tests/test_vault_core.cpp
     )
-    target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(unit_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/security)
     target_link_libraries(unit_tests PRIVATE GTest::gtest_main OpenSSL::Crypto OpenSSL::SSL Boost::system)
 
     include(GoogleTest)
