@@ -10,7 +10,10 @@ option(P2P_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer (G
 option(P2P_BUILD_GUI "Build the Qt6 desktop application" OFF)
 
 if (WIN32)
-    add_compile_definitions(_WIN32_WINNT=0x0A00) # Windows 10/11
+    add_compile_definitions(_WIN32_WINNT=0x0A00 _CRT_SECURE_NO_WARNINGS)
+    if (MSVC)
+        add_compile_options(/bigobj)
+    endif()
 endif()
 
 # Sanitizers add checks that turn memory errors into loud crashes
