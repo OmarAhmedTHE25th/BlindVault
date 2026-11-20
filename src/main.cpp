@@ -14,7 +14,7 @@
 #include "cli_identity.hpp"
 #include "tls_trust.hpp"
 #include "vault_index.hpp"
-
+#include "cli_benchmark.hpp"
 namespace {
 
 // Every mode needs an identity of its own; an empty trust list is legal but means nobody gets in
@@ -96,6 +96,7 @@ int main(int argc, char* argv[]) {
         if (identity_result >= 0) return identity_result;
 
         net::io_context io_ctx;
+        
 
         if (mode == "p2p" && argc >= 3) {
             uint16_t port = parse_port(argv[2]);

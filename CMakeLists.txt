@@ -45,6 +45,7 @@ add_executable(BlindVault
         include/vault/vault_index.hpp
         include/vault/vault_gateway.hpp
         include/vault/kms_provider.hpp
+        include/vault/cli_benchmark.hpp
 )
 target_include_directories(BlindVault PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
@@ -175,4 +176,37 @@ if(P2P_BUILD_TESTS)
         add_test(NAME end_to_end
                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/e2e_test.sh $<TARGET_FILE:BlindVault>)
     endif()
+endif()
+
+# ---------------- Microbenchmarks (Google Benchmark) ----------------
+option(P2P_BUILD_BENCHMARKS "Build Google Benchmark suite for CI tracking" OFF)
+if(P2P_BUILD_BENCHMARKS)
+    include(FetchContent)
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(googlebenchmark
+            URL https://github.com/google/benchmark/archive/refs/tags/v1.9.2.zip
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(googlebenchmark)
+
+    add_executable(bench_vault
+            benchmarks/bench_vault.cpp
+            include/vault/at_rest_crypto.hpp
+            include/vault/kms_provider.hpp
+            include/vault/tokenizer.hpp
+            include/vault/vault_index.hpp
+            include/vault/vault_gateway.hpp
+    )
+    target_include_directories(bench_vault PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/security
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
+    )
+    target_link_libraries(bench_vault PRIVATE
+            benchmark::benchmark_main
+            OpenSSL::Crypto
+            OpenSSL::SSL
+            Boost::system
+    )
 endif()

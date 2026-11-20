@@ -2,7 +2,7 @@
 
 A high-throughput, zero-knowledge storage gateway and secure transfer engine written in C++20 with Boost.Asio, OpenSSL 3, and Qt 6. Designed for banking and RegTech compliance, **BlindVault** sits between a bank's core transaction perimeter and low-cost commodity cloud storage—stripping PII, masking internal/client IP addresses, padding payloads to fixed 64 KiB buckets, encrypting at rest with **AES-256-GCM (`BVL2`)** bound to blob-name AAD, wrapping batch keys under a Master KEK via **RFC 3394** (backed by PKCS#11 HSM or local software KMS), and streaming blobs over **mutual TLS 1.3** with strict certificate fingerprint pinning.
 
-Even if the remote storage server is compromised or inspected by an untrusted administrator, the cloud node holds zero customer identities, zero IP metadata, zero batch-size signals, and zero decryption keys. Inside the bank perimeter, unmasking customer PII requires **2-of-3 Compliance Officer Quorum** cryptographic sign-off bound to the target token and blob.
+Even if the remote storage server is compromised or inspected by an untrusted administrator, the cloud node holds zero customer identities, zero IP metadata, zero batch-size signals, and zero decryption keys. Inside the bank perimeter, unmasking customer PII requires **2-of-3 Compliance Officer Quorum** cryptographic sign-off using **offline Ed25519 signatures**—the gateway stores only officer public keys (`*.pub`) and cannot mint approvals on its own.
 
 ## Contents
 
@@ -25,14 +25,21 @@ BlindVault separates **identity, key custody, and quorum governance** (strictly 
 
 ```mermaid
 flowchart LR
+    subgraph Officers["Offline Compliance Officers (Separate Devices)"]
+        O1["CBE-Officer-1 (.priv)"]
+        O2["CBE-Officer-2 (.priv)"]
+        O3["CBE-Officer-3 (.priv)"]
+    end
+
     subgraph Bank["Bank On-Premise Perimeter (Trusted)"]
         Core["Core Banking Batch (CSV)"] --> Tok["TokenVault (tokenizer.hpp)<br/>HMAC-SHA256 PII & IP Scrubbing + BVTK"]
         Tok --> Enc["At-Rest Crypto (at_rest_crypto.hpp)<br/>64 KiB Pad + AES-256-GCM (BVL2 + AAD)"]
         Enc --> KMS["KMS / PKCS#11 HSM (kms_provider.hpp)<br/>RFC 3394 KEK Wrap + Non-Extractable KEK"]
-        KMS --> Idx["MetadataIndex & Quorum (vault_index.hpp)<br/>Data-Bound 2-of-3 Quorum + Chained Audit"]
+        KMS --> Idx["MetadataIndex & Quorum (vault_index.hpp)<br/>Ed25519 2-of-3 PubKey Gate + Chained Audit"]
         Enc --> Shards["2-of-3 XOR Erasure Shards"]
     end
 
+    O1 & O2 -.->|"Detached Ed25519 Signatures"| Idx
     Enc --> Client["ClientNode (client_node.hpp)<br/>Mutual TLS 1.3 + SHA-256 Stream"]
     Client -->|"64 KiB-Padded .enc Blob Only"| Cloud["Cloud Vault Node (ServerNode)<br/>Zero-Knowledge Storage"]
 ```
@@ -41,14 +48,14 @@ flowchart LR
 2. **Traffic-Analysis Padding & AAD-Bound Encryption at Rest (`at_rest_crypto.hpp`):** Pads the scrubbed payload with CSPRNG noise to an exact multiple of **64 KiB** (`65,536` bytes) to defeat file-size traffic analysis, then seals it in a binary `BVL2` envelope using **AES-256-GCM** (96-bit IV, 128-bit authentication tag, and the blob filename bound as Additional Authenticated Data to block blob-swap attacks).
 3. **PKCS#11 HSM / KMS Key Wrapping, Memory Cleansing & Erasure Sharding (`kms_provider.hpp`, `at_rest_crypto.hpp`):** Wraps each batch's Data Encryption Key (DEK) under a Master Key Encryption Key (KEK) via **RFC 3394 (`CKM_AES_KEY_WRAP` / `EVP_aes_256_wrap`)** so zero plaintext keys ever touch disk, wipes plaintext keys and decrypted buffers from RAM via move-only RAII `OPENSSL_cleanse` (`RLIMIT_CORE=0`), and splits blobs into **2-of-3 XOR erasure shards**.
 4. **Zero-Trust Transport (`client_node.hpp` & `tls_trust.hpp`):** Streams `.enc` blobs over **TLS 1.3** with mutual certificate fingerprint verification and end-to-end **SHA-256** integrity checks.
-5. **Data-Bound M-of-N Quorum Auditor Re-Hydration (`vault_index.hpp` & `vault_gateway.hpp`):** Authorized auditors query by customer name, National ID, IBAN, or `TOK_...` identifier only after collecting constant-time HMAC approvals from at least **2 of 3 Compliance Officers** cryptographically bound to `(target_token, blob_name, wrapped_dek_hex)`. The gateway unwraps the DEK, decrypts in memory, filters exact PII columns, re-hydrates tokens, cleanses RAM, and appends an entry to the HMAC hash-chained `regtech_audit.log`.
+5. **Asymmetric Ed25519 M-of-N Quorum Auditor Re-Hydration (`vault_index.hpp` & `vault_gateway.hpp`):** Each Compliance Officer generates an Ed25519 keypair offline (`officer-keygen`) and installs only their public key (`*.pub`) on the gateway. Authorized auditors request a signing challenge (`prepare_release_challenge`) and collect detached 64-byte Ed25519 signatures from at least **2 of 3 Compliance Officers** bound to `(officer_id|target_token|blob_name|wrapped_dek_hex)`. The gateway verifies signatures via `EVP_DigestVerify`, unwraps the DEK, decrypts in memory, filters exact PII columns, re-hydrates tokens, cleanses RAM, and appends an entry to the HMAC hash-chained `regtech_audit.log`.
 
 ## Core & Hardening Features
 
 * **Zero-Knowledge Cloud Offloading:** Remote storage nodes only receive 64 KiB-padded `BVL2` AES-256-GCM ciphertext blobs—never plaintext PII, internal IP addresses, batch size signatures, or AES keys.
+* **True Separation of Duties (Offline Ed25519 2-of-3 Quorum):** `QuorumGate` stores **only** officer Ed25519 public keys (`*.pub`) on the gateway host and has zero in-process signing capability. Even full root compromise of the gateway host cannot forge a 2-of-3 approval without the officers' offline private keys.
 * **PKCS#11 Hardware HSM & Software KMS (`kms_provider.hpp`):** Pluggable `KeyManagementProvider` supporting FIPS 140-3 PKCS#11 v2.40 HSMs (SoftHSMv2, AWS CloudHSM, Thales Luna, Utimaco) where the Master KEK never enters process memory (`CKA_EXTRACTABLE=FALSE`), with seamless local `0600` KEK fallback and full Master KEK rotation (`rotate_master_kek`).
 * **RFC 3394 Envelope Key Wrapping & Blob-Swap Protection:** Per-batch DEKs are wrapped with a 256-bit Master KEK before persisting to `vault_index.tsv`; blob filenames are authenticated via GCM AAD so ciphertext blobs cannot be swapped across index records.
-* **Data-Bound 2-of-3 Compliance Officer Quorum Gate:** Enforces multi-custody constant-time (`CRYPTO_memcmp`) HMAC authorization bound to the specific token, blob name, and wrapped DEK before `detokenize()` unmasks customer PII.
 * **Tamper-Evident Index & Hash-Chained Audit Log:** `vault_index.tsv` is authenticated with a domain-separated HMAC-SHA256 MAC (`blindvault:index-auth:v1`), and `regtech_audit.log` links every sequence entry to the previous entry's HMAC (`blindvault:audit-auth:v1`).
 * **RAII Memory Zeroization & Core-Dump Lock:** Move-only `SecretKey` and `SecretBuffer` types scrub sensitive material from RAM with `OPENSSL_cleanse()` on move and destruction, paired with `RLIMIT_CORE=0` process hardening.
 * **2-of-3 XOR Erasure Coding:** Generates 3 parity/data shards per encrypted batch so any 2 storage providers reconstruct the full ciphertext while 1 compromised or offline provider reveals nothing.
@@ -70,6 +77,11 @@ git clone https://github.com/OmarAhmedTHE25th/CipherVault.git
 cd CipherVault
 cmake -S . -B build -G Ninja
 cmake --build build
+
+# 3. (Optional) Symlink into ~/.local/bin so `BlindVault` and `bv` work from anywhere
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/build/BlindVault" ~/.local/bin/BlindVault
+ln -sf "$(pwd)/build/BlindVault" ~/.local/bin/bv
 ```
 
 ## Hardware HSM Configuration (PKCS#11)
@@ -88,7 +100,7 @@ The HSM token must contain three non-extractable secret keys labeled `blindvault
 The desktop application provides a three-tab RegTech operations and audit console:
 
 1. **Bank Egress Gateway:** Generate synthetic Egyptian banking transaction batches (`10,000` records) or load a CSV, scrub PII/IPs, pad to 64 KiB, wrap DEKs via RFC 3394, generate 2-of-3 erasure shards, inspect live `records/sec` throughput telemetry, and stream `.enc` blobs to the cloud node.
-2. **Quorum Auditor & Cloud Proof:** Toggle **2-of-3 Compliance Officer** cryptographic sign-offs, query records by Customer Name, National ID, IBAN, or `TOK_...` token to inspect the decrypted/re-hydrated bank table alongside a raw hex dump proving what resides on the cloud disk.
+2. **Quorum Auditor & Cloud Proof:** Import officer Ed25519 public keys (`*.pub`), click **1. Prepare Signing Challenge** to inspect the target token, blob name, wrapped DEK, and exact offline `officer-sign` CLI command, paste detached 128-hex Ed25519 signatures from at least 2 officers, and click **2. Verify & Re-Hydrate** to view the decrypted bank table alongside a raw hex dump proving what resides on the cloud disk.
 3. **Cloud Vault & Node Trust:** Start the local cloud storage receiver node and manage pinned SHA-256 node fingerprints.
 
 ```bash
@@ -105,27 +117,32 @@ cmake --build build-gui --target BlindVault_GUI
 
 ## CLI Usage
 
-The underlying transport binary supports headless CLI transfers, bidirectional P2P sessions, and node identity management:
+The underlying transport binary supports headless CLI transfers, bidirectional P2P sessions, offline officer Ed25519 quorum ceremonies, and node identity management:
 
 ```text
 BlindVault receive <port> [save_folder]
 BlindVault send <host> <port> <file>
 BlindVault p2p <port> [save_folder]
 
-BlindVault init [--force] [name]
-BlindVault fingerprint
-BlindVault trust add <fingerprint> <name>
-BlindVault trust list
-BlindVault trust remove <name|fingerprint>
+Compliance Officer Offline Quorum Commands (run on officer workstation):
+  BlindVault officer-keygen <officer_id> [out_dir]
+  BlindVault officer-sign <priv_key.pem> <officer_id> <token> <blob_name> <wrapped_dek_hex>
+
+Identity Management:
+  BlindVault init [--force] [name]
+  BlindVault fingerprint
+  BlindVault trust add <fingerprint> <name>
+  BlindVault trust list
+  BlindVault trust remove <name|fingerprint>
 ```
 
-### Setting Up Two Nodes Locally
+### Setting Up Two Nodes & Offline Officer Keys Locally
 
 ```bash
 cd build
-mkdir bank_gateway cloud_vault
+mkdir bank_gateway cloud_vault offline_officers
 
-# 1. Generate EC P-256 identities
+# 1. Generate EC P-256 node identities
 (cd bank_gateway && ../BlindVault init bank_gateway < /dev/null)
 (cd cloud_vault  && ../BlindVault init cloud_vault < /dev/null)
 
@@ -133,10 +150,17 @@ mkdir bank_gateway cloud_vault
 (cd bank_gateway && ../BlindVault trust add "$(cd ../cloud_vault && ../BlindVault fingerprint | sed 's/^Your fingerprint: //')" cloud_vault)
 (cd cloud_vault  && ../BlindVault trust add "$(cd ../bank_gateway && ../BlindVault fingerprint | sed 's/^Your fingerprint: //')" bank_gateway)
 
-# 3. Start Cloud Vault listener (Terminal 1)
+# 3. Generate offline Ed25519 officer keypairs and install ONLY *.pub on the gateway
+../BlindVault officer-keygen CBE-Officer-1 offline_officers
+../BlindVault officer-keygen CBE-Officer-2 offline_officers
+../BlindVault officer-keygen CBE-Officer-3 offline_officers
+mkdir -p ~/.local/share/BlindVault/BlindVault/officers
+cp offline_officers/*.pub ~/.local/share/BlindVault/BlindVault/officers/
+
+# 4. Start Cloud Vault listener (Terminal 1)
 (cd cloud_vault && ../BlindVault receive 8080)
 
-# 4. Send an encrypted blob from Bank Gateway (Terminal 2)
+# 5. Send an encrypted blob from Bank Gateway (Terminal 2)
 (cd bank_gateway && ../BlindVault send localhost 8080 payload.enc)
 ```
 
@@ -181,7 +205,7 @@ The bidirectional PII lookup table (`vault_tokens.enc`) is stored at rest using 
 | ------ | ---------- | ------------ |
 | Cloud breach or rogue cloud admin | Client-side AES-256-GCM (`BVL2`) + HMAC-SHA256 PII tokenization prior to egress; keys never leave bank | Unit tests (`test_vault_core.cpp`) |
 | IP-based tracking or topology leakage | Source/internal IP fields redacted (`REDACTED_IP`) before packaging; nodes authenticate via SHA-256 cert fingerprints | Unit tests (`test_vault_core.cpp`) |
-| Rogue insider bulk PII scraping | **Data-bound 2-of-3 Compliance Officer Quorum Gate** requiring multi-officer constant-time HMAC sign-offs bound to `(token, blob_name, wrapped_dek_hex)` | Unit tests (`VaultHardening.EndToEndTokenSearchExactColumnMatchTamperIndexAndChainedAudit`) |
+| Rogue insider or compromised gateway host forging quorum approvals | **Asymmetric Ed25519 2-of-3 Quorum Gate**: gateway holds only `*.pub` keys and verifies detached signatures bound to `(officer_id\|token\|blob_name\|wrapped_dek_hex)` via `EVP_DigestVerify` | Unit tests (`VaultHardening.EndToEndTokenSearchExactColumnMatchTamperIndexAndChainedAudit`) |
 | Index tampering, blob swapping, or audit log deletion | HMAC-authenticated `vault_index.tsv`, blob-name GCM AAD binding, and HMAC hash-chained `regtech_audit.log` | Unit tests (`VaultCrypto.RejectsBlobNameSwapViaAad`, `test_vault_core.cpp`) |
 | Host disk compromise / key scraping | **PKCS#11 HSM** or **RFC 3394 AES-256 Key Wrapping** (no raw DEKs on disk; `BVTK`-encrypted token map) + RAII `OPENSSL_cleanse` + `RLIMIT_CORE=0` | Unit tests (`VaultHardening.Rfc3394KeyWrapAnd64KiBTrafficPadding`, `Tokenizer.PersistsAcrossReloadsEncryptedAtRest`) |
 | Cloud file-size / traffic inference | Fixed-bucket **64 KiB CSPRNG padding** on every `BVL2` envelope | Unit tests (`VaultHardening.Rfc3394KeyWrapAnd64KiBTrafficPadding`) |
@@ -218,7 +242,7 @@ mkdir -p corpus-work
 ## Project Structure
 
 ```text
-src/main.cpp          CLI entry point and argument parsing
+src/main.cpp          CLI entry point, transfer modes, and offline officer-keygen/officer-sign commands
 include/
   vault/              Bank-side RegTech engine (at_rest_crypto, kms_provider, tokenizer, vault_index, vault_gateway)
   transport/
