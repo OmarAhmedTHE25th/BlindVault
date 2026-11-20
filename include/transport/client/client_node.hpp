@@ -82,6 +82,17 @@ private:
         }
     }
 
+    bool handle_unknown_ca(const boost::system::error_code& ec) {
+        if (ec && ec != net::error::operation_aborted &&
+            ec.message().find("unknown ca") != string::npos) {
+            log("The receiver may not trust you yet.", true);
+            finish("The receiver doesn't trust your fingerprint yet. "
+                   "Send them your fingerprint so they can add you.");
+            return true;
+        }
+        return false;
+    }
+
     // ---------- timeout ----------
     void arm_timeout() {
         timer_.expires_after(std::chrono::seconds(30));
@@ -164,9 +175,21 @@ private:
             net::async_write(ssl_socket_, net::buffer(&header_, sizeof(PacketHeader)),
                 [self = shared_from_this()](const boost::system::error_code& ec, size_t) {
                     if (ec) {
-                        if (ec != net::error::operation_aborted)
-                            self->log("Failed to send header: " + ec.message(), true);
-                        self->finish("Failed to send header: " + ec.message());
+                        if (ec == net::error::operation_aborted) {
+                            self->finish("Failed to send header: " + ec.message());
+                            return;
+                        }
+                        if (self->handle_unknown_ca(ec)) {
+                            return;
+                        }
+                        net::async_read(self->ssl_socket_, net::buffer(&self->ack_header_, sizeof(PacketHeader)),
+                            [self, ec](const boost::system::error_code& read_ec, size_t) {
+                                if (read_ec && self->handle_unknown_ca(read_ec)) {
+                                    return;
+                                }
+                                self->log("Failed to send header: " + ec.message(), true);
+                                self->finish("Failed to send header: " + ec.message());
+                            });
                         return;
                     }
                     self->reset_timeout();
@@ -182,9 +205,21 @@ private:
         net::async_write(ssl_socket_, net::buffer(file_name_),
             [self = shared_from_this()](const boost::system::error_code& ec, size_t) {
                 if (ec) {
-                    if (ec != net::error::operation_aborted)
-                        self->log("Failed to send filename: " + ec.message(), true);
-                    self->finish("Failed to send filename: " + ec.message());
+                    if (ec == net::error::operation_aborted) {
+                        self->finish("Failed to send filename: " + ec.message());
+                        return;
+                    }
+                    if (self->handle_unknown_ca(ec)) {
+                        return;
+                    }
+                    net::async_read(self->ssl_socket_, net::buffer(&self->ack_header_, sizeof(PacketHeader)),
+                        [self, ec](const boost::system::error_code& read_ec, size_t) {
+                            if (read_ec && self->handle_unknown_ca(read_ec)) {
+                                return;
+                            }
+                            self->log("Failed to send filename: " + ec.message(), true);
+                            self->finish("Failed to send filename: " + ec.message());
+                        });
                     return;
                 }
                 self->reset_timeout();
@@ -206,20 +241,14 @@ private:
         net::async_read(ssl_socket_, net::buffer(&ack_header_, sizeof(PacketHeader)),
             [self = shared_from_this(), handler = std::move(handler)](const boost::system::error_code& ec, size_t bytes_read) mutable {
                 if (ec) {
-                    const string reason = ec.message();
-                    string friendly = "No reply from receiver: " + reason;
                     if (ec != net::error::operation_aborted) {
                         self->log("No reply from receiver after reading " + std::to_string(bytes_read) +
-                                  " bytes: " + reason, true);
-                        if (reason.find("unknown ca") != string::npos) {
-                            self->log("The receiver may not trust you yet.", true);
-                        }
+                                  " bytes: " + ec.message(), true);
                     }
-                    if (reason.find("unknown ca") != string::npos) {
-                        friendly = "The receiver doesn't trust your fingerprint yet. "
-                                   "Send them your fingerprint so they can add you.";
+                    if (self->handle_unknown_ca(ec)) {
+                        return;
                     }
-                    self->finish(friendly);
+                    self->finish("No reply from receiver: " + ec.message());
                     return;
                 }
                 self->reset_timeout();

@@ -6,7 +6,7 @@
 # Usage: bash scripts/e2e_test.sh <path-to-P2P_Secure_File_Sharing-executable>
 # Needs python3 (raw sockets and a hand-made TLS client).
 set -uo pipefail
-
+exec < /dev/null
 if [[ $# -ne 1 || ! -x "$1" ]]; then
     echo "Usage: $0 <path-to-executable>" >&2
     exit 2
