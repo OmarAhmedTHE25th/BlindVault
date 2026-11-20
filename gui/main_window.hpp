@@ -37,6 +37,8 @@ private slots:
                                  quint64 paddedBytes, quint64 shardBytes,
                                  double elapsedMs, double recordsPerSec, const QString& blobName);
     void onReleaseChallengeReady(const QString& targetToken,
+                                 const QString& challengeNonce,
+                                 const QString& expiresUtc,
                                  const QString& challengeSummary,
                                  const QString& registeredOfficersSummary);
     void onOfficerPublicKeyImported(const QString& statusMessage);
@@ -86,6 +88,8 @@ private:
     QLabel* auditor_token_lbl_ = nullptr;
     QTableWidget* auditor_table_ = nullptr;
     QTextEdit* cloud_hex_view_ = nullptr;
+    QString active_challenge_nonce_;
+    QString active_challenge_expires_;
 
     // Tab 3: Untrusted Cloud Vault & Peer Trust widgets
     QLineEdit* server_port_input_ = nullptr;

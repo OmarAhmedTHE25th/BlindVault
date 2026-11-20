@@ -3,21 +3,15 @@
 //   - KEK never enters GatewayEngine process memory when backed by Pkcs11HsmProvider.
 //   - Supports any FIPS 140-3 HSM or SoftHSMv2 module via standard PKCS#11 CKM_AES_KEY_WRAP & CKM_SHA256_HMAC.
 
-#include <algorithm>
 #include <array>
-#include <cstring>
+#include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <memory>
-#include <stdexcept>
+#include <mutex>
 #include <string>
 #include <string_view>
-#include <vector>
-#include "at_rest_crypto.hpp"
 
-#ifndef _WIN32
-#include <dlfcn.h>
-#endif
+#include "at_rest_crypto.hpp"
 
 namespace vault_kms {
 
@@ -45,75 +39,21 @@ public:
 // Local fallback provider for laptops/CI without a PKCS#11 HSM daemon attached
 class LocalSoftwareKmsProvider final : public KeyManagementProvider {
 public:
-    explicit LocalSoftwareKmsProvider(const std::filesystem::path& kek_path)
-        : master_kek_(load_or_create_kek(kek_path)),
-          index_key_(vault_crypto::derive_subkey(master_kek_, "blindvault:index-auth:v1")),
-          audit_key_(vault_crypto::derive_subkey(master_kek_, "blindvault:audit-auth:v1")),
-          pepper_(vault_crypto::derive_subkey(master_kek_, "blindvault:pepper:v1")),
-          kek_path_(kek_path) {}
+    explicit LocalSoftwareKmsProvider(const std::filesystem::path& kek_path);
 
-    [[nodiscard]] std::string wrap_dek_hex(const vault_crypto::SecretKey& dek) const override {
-        return vault_crypto::wrap_dek_hex(dek, master_kek_);
-    }
-
-    [[nodiscard]] vault_crypto::SecretKey unwrap_dek_hex(const std::string& wrapped_hex) const override {
-        return vault_crypto::unwrap_dek_hex(wrapped_hex, master_kek_);
-    }
-
-    [[nodiscard]] std::string hmac_index_hex(std::string_view body) const override {
-        return vault_crypto::hmac_sha256_hex(index_key_.data(), vault_crypto::SecretKey::size(), body);
-    }
-
-    [[nodiscard]] std::string hmac_audit_hex(std::string_view body) const override {
-        return vault_crypto::hmac_sha256_hex(audit_key_.data(), vault_crypto::SecretKey::size(), body);
-    }
-
-    [[nodiscard]] std::array<uint8_t, 32> derive_tokenizer_pepper() const override {
-        return pepper_.bytes;
-    }
-
-    [[nodiscard]] bool can_rotate_master_kek_in_app() const override {
-        return true;
-    }
-
-    void rotate_master_kek(const vault_crypto::SecretKey& new_master_kek) override {
-        std::memcpy(
-            master_kek_.data(),
-            new_master_kek.data(),
-            vault_crypto::KEY_LEN);
-        index_key_ = vault_crypto::derive_subkey(master_kek_, "blindvault:index-auth:v1");
-        audit_key_ = vault_crypto::derive_subkey(master_kek_, "blindvault:audit-auth:v1");
-        pepper_ = vault_crypto::derive_subkey(master_kek_, "blindvault:pepper:v1");
-        vault_crypto::write_secret_file_0600(
-            kek_path_,
-            vault_crypto::bytes_to_hex(master_kek_.data(), vault_crypto::SecretKey::size()) + "\n");
-    }
-
-    [[nodiscard]] std::string backend_description() const override {
-        return "Software-KMS-Fallback (0600 local KEK; set BLINDVAULT_PKCS11_MODULE for hardware HSM)";
-    }
+    [[nodiscard]] std::string wrap_dek_hex(const vault_crypto::SecretKey& dek) const override;
+    [[nodiscard]] vault_crypto::SecretKey unwrap_dek_hex(const std::string& wrapped_hex) const override;
+    [[nodiscard]] std::string hmac_index_hex(std::string_view body) const override;
+    [[nodiscard]] std::string hmac_audit_hex(std::string_view body) const override;
+    [[nodiscard]] std::array<uint8_t, 32> derive_tokenizer_pepper() const override;
+    [[nodiscard]] bool can_rotate_master_kek_in_app() const override { return true; }
+    void rotate_master_kek(const vault_crypto::SecretKey& new_master_kek) override;
+    [[nodiscard]] std::string backend_description() const override;
 
 private:
-    static vault_crypto::SecretKey load_or_create_kek(const std::filesystem::path& kek_path) {
-        std::filesystem::create_directories(kek_path.parent_path());
-        if (std::filesystem::exists(kek_path)) {
-            std::ifstream in(kek_path, std::ios::binary);
-            std::string hex_str;
-            std::getline(in, hex_str);
-            const auto raw = vault_crypto::hex_to_bytes(hex_str);
-            if (raw.size() != vault_crypto::KEY_LEN) {
-                throw std::runtime_error("LocalSoftwareKmsProvider: corrupted master KEK");
-            }
-            vault_crypto::SecretKey kek;
-            std::memcpy(kek.data(), raw.data(), vault_crypto::KEY_LEN);
-            return kek;
-        }
-        vault_crypto::SecretKey kek = vault_crypto::generate_key();
-        vault_crypto::write_secret_file_0600(
-            kek_path, vault_crypto::bytes_to_hex(kek.data(), vault_crypto::SecretKey::size()) + "\n");
-        return kek;
-    }
+    static vault_crypto::SecretKey load_or_create_kek(const std::filesystem::path& kek_path);
 
+    mutable std::mutex mutex_;
     vault_crypto::SecretKey master_kek_;
     vault_crypto::SecretKey index_key_;
     vault_crypto::SecretKey audit_key_;
@@ -138,13 +78,17 @@ namespace pkcs11_abi {
     using CK_BBOOL         = unsigned char;
 
     constexpr CK_RV CKR_OK                        = 0x00000000UL;
+    constexpr CK_RV CKR_USER_ALREADY_LOGGED_IN    = 0x00000100UL;
+    constexpr CK_RV CKR_CRYPTOKI_ALREADY_INITIALIZED = 0x00000191UL;
     constexpr CK_FLAGS CKF_SERIAL_SESSION         = 0x00000004UL;
     constexpr CK_FLAGS CKF_RW_SESSION             = 0x00000002UL;
     constexpr CK_USER_TYPE CKU_USER               = 1UL;
     constexpr CK_MECHANISM_TYPE CKM_AES_KEY_WRAP  = 0x00002109UL; // RFC 3394
     constexpr CK_MECHANISM_TYPE CKM_SHA256_HMAC   = 0x00000251UL;
     constexpr CK_ATTRIBUTE_TYPE CKA_CLASS         = 0x00000000UL;
+    constexpr CK_ATTRIBUTE_TYPE CKA_TOKEN         = 0x00000001UL;
     constexpr CK_ATTRIBUTE_TYPE CKA_KEY_TYPE      = 0x00000100UL;
+    constexpr CK_ATTRIBUTE_TYPE CKA_SENSITIVE     = 0x00000103UL;
     constexpr CK_ATTRIBUTE_TYPE CKA_LABEL         = 0x00000003UL;
     constexpr CK_ATTRIBUTE_TYPE CKA_VALUE         = 0x00000011UL;
     constexpr CK_ATTRIBUTE_TYPE CKA_VALUE_LEN     = 0x00000161UL;
@@ -241,196 +185,31 @@ public:
                       const std::string& user_pin,
                       const std::string& kek_label   = "blindvault-master-kek",
                       const std::string& index_label = "blindvault-index-hmac",
-                      const std::string& audit_label = "blindvault-audit-hmac")
-        : module_path_(module_path) {
-        using namespace pkcs11_abi;
-        dl_handle_ = dlopen(module_path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (!dl_handle_) {
-            throw std::runtime_error("Pkcs11HsmProvider: dlopen failed: " + std::string(dlerror()));
-        }
-        using GetFnList = CK_RV (*)(CK_FUNCTION_LIST**);
-        auto get_list = reinterpret_cast<GetFnList>(dlsym(dl_handle_, "C_GetFunctionList"));
-        if (!get_list || get_list(&fn_) != CKR_OK || !fn_) {
-            throw std::runtime_error("Pkcs11HsmProvider: C_GetFunctionList failed");
-        }
-        if (fn_->C_Initialize(nullptr) != CKR_OK) {
-            throw std::runtime_error("Pkcs11HsmProvider: C_Initialize failed");
-        }
-        initialized_ = true;
+                      const std::string& audit_label = "blindvault-audit-hmac");
 
-        CK_ULONG slot_count = 0;
-        if (fn_->C_GetSlotList(1, nullptr, &slot_count) != CKR_OK || slot_count == 0) {
-            throw std::runtime_error("Pkcs11HsmProvider: no initialized PKCS#11 token slots found");
-        }
-        pkcs11_abi::CK_SLOT_ID first_slot = 0;
-        fn_->C_GetSlotList(1, &first_slot, &slot_count);
-        if (slot_count == 0) {
-            throw std::runtime_error("Pkcs11HsmProvider: no PKCS#11 token slots available");
-        }
+    ~Pkcs11HsmProvider() override;
 
-        if (fn_->C_OpenSession(first_slot, CKF_SERIAL_SESSION | CKF_RW_SESSION,
-                               nullptr, nullptr, &session_) != CKR_OK) {
-            throw std::runtime_error("Pkcs11HsmProvider: C_OpenSession failed");
-        }
-        if (fn_->C_Login(session_, CKU_USER,
-                         reinterpret_cast<CK_UTF8CHAR*>(const_cast<char*>(user_pin.data())),
-                         static_cast<CK_ULONG>(user_pin.size())) != CKR_OK) {
-            throw std::runtime_error("Pkcs11HsmProvider: HSM C_Login failed (invalid PIN)");
-        }
+    Pkcs11HsmProvider(const Pkcs11HsmProvider&) = delete;
+    Pkcs11HsmProvider& operator=(const Pkcs11HsmProvider&) = delete;
 
-        kek_handle_   = find_key_by_label(kek_label);
-        index_handle_ = find_key_by_label(index_label);
-        audit_handle_ = find_key_by_label(audit_label);
-    }
+    [[nodiscard]] std::string wrap_dek_hex(const vault_crypto::SecretKey& dek) const override;
+    [[nodiscard]] vault_crypto::SecretKey unwrap_dek_hex(const std::string& wrapped_hex) const override;
+    [[nodiscard]] std::string hmac_index_hex(std::string_view body) const override;
+    [[nodiscard]] std::string hmac_audit_hex(std::string_view body) const override;
+    [[nodiscard]] std::array<uint8_t, 32> derive_tokenizer_pepper() const override;
+    [[nodiscard]] bool can_rotate_master_kek_in_app() const override { return false; }
+    void rotate_master_kek(const vault_crypto::SecretKey&) override;
+    [[nodiscard]] std::string backend_description() const override;
 
-    ~Pkcs11HsmProvider() override {
-        if (session_ && fn_) {
-            fn_->C_Logout(session_);
-            fn_->C_CloseSession(session_);
-        }
-        if (initialized_ && fn_) {
-            fn_->C_Finalize(nullptr);
-        }
-        if (dl_handle_) {
-            dlclose(dl_handle_);
-        }
-    }
-
-    [[nodiscard]] std::string wrap_dek_hex(const vault_crypto::SecretKey& dek) const override {
-        using namespace pkcs11_abi;
-        // Import transient DEK handle into HSM session, wrap with non-extractable Master KEK, destroy session handle
-        CK_ULONG obj_class = CKO_SECRET_KEY;
-        CK_ULONG key_type  = CKK_AES;
-        CK_BBOOL ck_true   = 1;
-        CK_BBOOL ck_false  = 0;
-        CK_ATTRIBUTE tmpl[] = {
-            {CKA_CLASS,       &obj_class, sizeof(obj_class)},
-            {CKA_KEY_TYPE,    &key_type,  sizeof(key_type)},
-            {CKA_EXTRACTABLE, &ck_true,   sizeof(ck_true)},
-            {CKA_VALUE,       const_cast<uint8_t*>(dek.data()), (vault_crypto::SecretKey::size())}
-        };
-        CK_OBJECT_HANDLE dek_obj = 0;
-        if (fn_->C_CreateObject(session_, tmpl, 4, &dek_obj) != CKR_OK) {
-            throw std::runtime_error("Pkcs11HsmProvider: failed to stage DEK in HSM");
-        }
-
-        CK_MECHANISM mech{CKM_AES_KEY_WRAP, nullptr, 0};
-        CK_BYTE wrapped[vault_crypto::WRAPPED_KEY_LEN]{};
-        CK_ULONG wrapped_len = sizeof(wrapped);
-        const CK_RV rv = fn_->C_WrapKey(session_, &mech, kek_handle_, dek_obj, wrapped, &wrapped_len);
-        fn_->C_DestroyObject(session_, dek_obj);
-        (void)ck_false;
-
-        if (rv != CKR_OK || wrapped_len != vault_crypto::WRAPPED_KEY_LEN) {
-            throw std::runtime_error("Pkcs11HsmProvider: HSM C_WrapKey (RFC 3394) failed");
-        }
-        return vault_crypto::bytes_to_hex(wrapped, wrapped_len);
-    }
-
-    [[nodiscard]] vault_crypto::SecretKey unwrap_dek_hex(const std::string& wrapped_hex) const override {
-        using namespace pkcs11_abi;
-        const auto wrapped = vault_crypto::hex_to_bytes(wrapped_hex);
-        if (wrapped.size() != vault_crypto::WRAPPED_KEY_LEN) {
-            throw std::runtime_error("Pkcs11HsmProvider: invalid wrapped DEK length");
-        }
-
-        CK_ULONG obj_class = CKO_SECRET_KEY;
-        CK_ULONG key_type  = CKK_AES;
-        CK_BBOOL ck_true   = 1;
-        CK_ATTRIBUTE unwrap_tmpl[] = {
-            {CKA_CLASS,       &obj_class, sizeof(obj_class)},
-            {CKA_KEY_TYPE,    &key_type,  sizeof(key_type)},
-            {CKA_EXTRACTABLE, &ck_true,   sizeof(ck_true)}
-        };
-
-        CK_MECHANISM mech{CKM_AES_KEY_WRAP, nullptr, 0};
-        CK_OBJECT_HANDLE dek_obj = 0;
-        if (fn_->C_UnwrapKey(session_, &mech, kek_handle_,
-                             const_cast<CK_BYTE*>(wrapped.data()), static_cast<CK_ULONG>(wrapped.size()),
-                             unwrap_tmpl, 3, &dek_obj) != CKR_OK) {
-            throw std::runtime_error("Pkcs11HsmProvider: HSM C_UnwrapKey failed");
-        }
-
-        vault_crypto::SecretKey dek;
-        CK_ATTRIBUTE val_attr{CKA_VALUE, dek.data(), (vault_crypto::SecretKey::size())};
-        const CK_RV rv = fn_->C_GetAttributeValue(session_, dek_obj, &val_attr, 1);
-        fn_->C_DestroyObject(session_, dek_obj);
-        if (rv != CKR_OK) {
-            throw std::runtime_error("Pkcs11HsmProvider: failed to read unwrapped session DEK");
-        }
-        return dek;
-    }
-
-    [[nodiscard]] std::string hmac_index_hex(std::string_view body) const override {
-        return sign_hmac_in_hsm(index_handle_, body);
-    }
-
-    [[nodiscard]] std::string hmac_audit_hex(std::string_view body) const override {
-        return sign_hmac_in_hsm(audit_handle_, body);
-    }
-
-    [[nodiscard]] std::array<uint8_t, 32> derive_tokenizer_pepper() const override {
-        const std::string mac = sign_hmac_in_hsm(kek_handle_, "blindvault:pepper:v1");
-        const auto raw = vault_crypto::hex_to_bytes(mac);
-        std::array<uint8_t, 32> pepper{};
-        if (raw.size() != pepper.size()) {
-            throw std::runtime_error("Pkcs11HsmProvider: invalid derived tokenizer pepper");
-        }
-        std::copy(raw.begin(), raw.end(), pepper.begin());
-        return pepper;
-    }
-
-    [[nodiscard]] bool can_rotate_master_kek_in_app() const override {
-        return false;
-    }
-
-    void rotate_master_kek(const vault_crypto::SecretKey&) override {
-        throw std::runtime_error("Pkcs11HsmProvider: rotate_master_kek must be performed through HSM administration");
-    }
-
-    [[nodiscard]] std::string backend_description() const override {
-        return "Hardware-HSM-PKCS11 (" + module_path_ + ", KEK non-extractable in hardware)";
-    }
+    // Verifies Master KEK inside HSM reports CKA_EXTRACTABLE=FALSE and refuses raw key export
+    [[nodiscard]] bool is_master_kek_non_extractable() const;
 
 private:
-    [[nodiscard]] pkcs11_abi::CK_OBJECT_HANDLE find_key_by_label(const std::string& label) const {
-        using namespace pkcs11_abi;
-        CK_ATTRIBUTE search_attr{
-            CKA_LABEL,
-            const_cast<char*>(label.data()),
-            static_cast<CK_ULONG>(label.size())
-        };
-        if (fn_->C_FindObjectsInit(session_, &search_attr, 1) != CKR_OK) {
-            throw std::runtime_error("Pkcs11HsmProvider: C_FindObjectsInit failed");
-        }
-        CK_OBJECT_HANDLE obj = 0;
-        CK_ULONG found = 0;
-        fn_->C_FindObjects(session_, &obj, 1, &found);
-        fn_->C_FindObjectsFinal(session_);
-        if (found == 0) {
-            throw std::runtime_error("Pkcs11HsmProvider: HSM key label not found: " + label);
-        }
-        return obj;
-    }
-
-    [[nodiscard]] std::string sign_hmac_in_hsm(pkcs11_abi::CK_OBJECT_HANDLE key_handle, std::string_view body) const {
-        using namespace pkcs11_abi;
-        CK_MECHANISM mech{CKM_SHA256_HMAC, nullptr, 0};
-        if (fn_->C_SignInit(session_, &mech, key_handle) != CKR_OK) {
-            throw std::runtime_error("Pkcs11HsmProvider: C_SignInit failed");
-        }
-        CK_BYTE mac[32]{};
-        CK_ULONG mac_len = sizeof(mac);
-        if (fn_->C_Sign(session_,
-                        reinterpret_cast<CK_BYTE*>(const_cast<char*>(body.data())),
-                        static_cast<CK_ULONG>(body.size()),
-                        mac, &mac_len) != CKR_OK || mac_len != 32) {
-            throw std::runtime_error("Pkcs11HsmProvider: HSM C_Sign HMAC-SHA256 failed");
-        }
-        return vault_crypto::bytes_to_hex(mac, mac_len);
-    }
+    [[nodiscard]] pkcs11_abi::CK_OBJECT_HANDLE find_key_by_label(const std::string& label) const;
+    [[nodiscard]] std::string sign_hmac_in_hsm(pkcs11_abi::CK_OBJECT_HANDLE key_handle, std::string_view body) const;
 
     std::string module_path_;
+    mutable std::mutex pkcs11_mutex_;
     void* dl_handle_ = nullptr;
     pkcs11_abi::CK_FUNCTION_LIST* fn_ = nullptr;
     pkcs11_abi::CK_SESSION_HANDLE session_ = 0;
@@ -438,22 +217,13 @@ private:
     pkcs11_abi::CK_OBJECT_HANDLE index_handle_ = 0;
     pkcs11_abi::CK_OBJECT_HANDLE audit_handle_ = 0;
     bool initialized_ = false;
+    bool we_initialized_ = false;
+    bool we_logged_in_ = false;
 };
 #endif
 
 // Factory: automatically connects to PKCS#11 HSM when BLINDVAULT_PKCS11_MODULE is set,
 // otherwise falls back cleanly to LocalSoftwareKmsProvider.
-inline std::shared_ptr<KeyManagementProvider> create_default_kms(const std::filesystem::path& state_dir) {
-#ifndef _WIN32
-    if (const char* mod = std::getenv("BLINDVAULT_PKCS11_MODULE"); mod && *mod) {
-        const char* pin = std::getenv("BLINDVAULT_PKCS11_PIN");
-        if (!pin || !*pin) {
-            throw std::runtime_error("BLINDVAULT_PKCS11_MODULE is set, but BLINDVAULT_PKCS11_PIN is missing");
-        }
-        return std::make_shared<Pkcs11HsmProvider>(mod, pin);
-    }
-#endif
-    return std::make_shared<LocalSoftwareKmsProvider>(state_dir / "hsm_master.kek");
-}
+std::shared_ptr<KeyManagementProvider> create_default_kms(const std::filesystem::path& state_dir);
 
 } // namespace vault_kms

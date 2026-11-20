@@ -1,8 +1,8 @@
 # BlindVault — Hardened Zero-Knowledge RegTech Storage Gateway
 
-A high-throughput, zero-knowledge storage gateway and secure transfer engine written in C++20 with Boost.Asio, OpenSSL 3, and Qt 6. Designed for banking and RegTech compliance, **BlindVault** sits between a bank's core transaction perimeter and low-cost commodity cloud storage—stripping PII, masking internal/client IP addresses, padding payloads to fixed 64 KiB buckets, encrypting at rest with **AES-256-GCM (`BVL2`)** bound to blob-name AAD, wrapping batch keys under a Master KEK via **RFC 3394** (backed by PKCS#11 HSM or local software KMS), and streaming blobs over **mutual TLS 1.3** with strict certificate fingerprint pinning.
+A high-throughput, zero-knowledge storage gateway and secure transfer engine written in C++20 with Boost.Asio, Boost.Beast, OpenSSL 3, and Qt 6. Designed for banking and RegTech compliance, **BlindVault** sits between a bank's core transaction perimeter and low-cost commodity cloud storage—streaming CSV batches through an `O(1)`-RAM HMAC tokenizer, encrypting payloads at rest with **chunked streaming AES-256-GCM (`BVL3`)** aligned to fixed 64 KiB buckets (with automatic legacy `BVL2` read compatibility), wrapping batch keys under a Master KEK via **RFC 3394** (backed by PKCS#11 HSM or local software KMS), splitting 2-of-3 erasure shards across local or multi-bucket S3 object stores, and streaming blobs over **mutual TLS 1.3** (direct or via the companion `blindvault-control` NAT-traversal / relay control plane).
 
-Even if the remote storage server is compromised or inspected by an untrusted administrator, the cloud node holds zero customer identities, zero IP metadata, zero batch-size signals, and zero decryption keys. Inside the bank perimeter, unmasking customer PII requires **2-of-3 Compliance Officer Quorum** cryptographic sign-off using **offline Ed25519 signatures**—the gateway stores only officer public keys (`*.pub`) and cannot mint approvals on its own.
+Even if the remote storage server is compromised or inspected by an untrusted administrator, the cloud node holds zero customer identities, zero IP metadata, zero batch-size signals, and zero decryption keys. Inside the bank perimeter, unmasking customer PII requires **2-of-3 Compliance Officer Quorum** cryptographic sign-off using **offline detached Ed25519 signatures** bound to single-use CSPRNG challenge nonces and UTC expirations—the gateway stores only officer public keys (`*.pub`) and cannot mint approvals or replay consumed challenges.
 
 ## Contents
 
@@ -12,6 +12,7 @@ Even if the remote storage server is compromised or inspected by an untrusted ad
 * [Hardware HSM Configuration (PKCS#11)](#hardware-hsm-configuration-pkcs11)
 * [Opening the Qt 6 Desktop Console](#opening-the-qt-6-desktop-console)
 * [CLI Usage](#cli-usage)
+* [Multi-Bucket S3 Erasure & Control-Plane Rendezvous](#multi-bucket-s3-erasure--control-plane-rendezvous)
 * [Performance Benchmarks](#performance-benchmarks)
 * [How It Works](#how-it-works)
 * [Threat Model](#threat-model)
@@ -33,27 +34,27 @@ flowchart LR
     end
 
     subgraph Bank["Bank On-Premise Perimeter (Trusted)"]
-        Core["Core Banking Batch (CSV)"] --> Tok["TokenVault (tokenizer.hpp)<br/>HMAC-SHA256 PII & IP Scrubbing + BVTK"]
-        Tok --> Enc["At-Rest Crypto (at_rest_crypto.hpp)<br/>64 KiB Pad + AES-256-GCM (BVL2 + AAD)"]
+        Core["Core Banking Batch (CSV)"] --> Tok["TokenVault (tokenizer.hpp)<br/>O(1)-RAM HMAC-SHA256 Scrubbing + BVTK"]
+        Tok --> Enc["At-Rest Crypto (at_rest_crypto.hpp)<br/>64 KiB Frames + Chunked AES-256-GCM (BVL3/BVL2)"]
         Enc --> KMS["KMS / PKCS#11 HSM (kms_provider.hpp)<br/>RFC 3394 KEK Wrap + Non-Extractable KEK"]
-        KMS --> Idx["MetadataIndex & Quorum (vault_index.hpp)<br/>Ed25519 2-of-3 PubKey Gate + Chained Audit"]
-        Enc --> Shards["2-of-3 XOR Erasure Shards"]
+        KMS --> Idx["MetadataIndex & Quorum (vault_index.hpp)<br/>Ed25519 Nonce+TTL Quorum + Chained Audit"]
+        Enc --> Shards["2-of-3 XOR Erasure Shards<br/>(Local or Multi-Bucket S3 SigV4)"]
     end
 
     O1 & O2 -.->|"Detached Ed25519 Signatures"| Idx
-    Enc --> Client["ClientNode (client_node.hpp)<br/>Mutual TLS 1.3 + SHA-256 Stream"]
-    Client -->|"64 KiB-Padded .enc Blob Only"| Cloud["Cloud Vault Node (ServerNode)<br/>Zero-Knowledge Storage"]
+    Enc --> Client["ClientNode & ControlClient<br/>mTLS 1.3 (+ Optional Control/Relay Bridge)"]
+    Client -->|"64 KiB-Aligned .enc Blob Only"| Cloud["Cloud Vault Node (ServerNode)<br/>Zero-Knowledge Storage"]
 ```
 
-1. **Pre-Egress Sanitization & Encrypted Token Vault (`tokenizer.hpp`):** Parses RFC 4180 transaction records in memory, replaces customer names, National IDs, and IBANs with deterministic `TOK_<16-hex>` HMAC-SHA256 tokens using a KMS-derived pepper, and redacts source IP addresses (`REDACTED_IP`). Persists bidirectional mappings atomically in `vault_tokens.enc` (`BVTK` AES-256-GCM envelope with a KMS-wrapped DEK and `0600` permissions).
-2. **Traffic-Analysis Padding & AAD-Bound Encryption at Rest (`at_rest_crypto.hpp`):** Pads the scrubbed payload with CSPRNG noise to an exact multiple of **64 KiB** (`65,536` bytes) to defeat file-size traffic analysis, then seals it in a binary `BVL2` envelope using **AES-256-GCM** (96-bit IV, 128-bit authentication tag, and the blob filename bound as Additional Authenticated Data to block blob-swap attacks).
-3. **PKCS#11 HSM / KMS Key Wrapping, Memory Cleansing & Erasure Sharding (`kms_provider.hpp`, `at_rest_crypto.hpp`):** Wraps each batch's Data Encryption Key (DEK) under a Master Key Encryption Key (KEK) via **RFC 3394 (`CKM_AES_KEY_WRAP` / `EVP_aes_256_wrap`)** so zero plaintext keys ever touch disk, wipes plaintext keys and decrypted buffers from RAM via move-only RAII `OPENSSL_cleanse` (`RLIMIT_CORE=0`), and splits blobs into **2-of-3 XOR erasure shards**.
-4. **Zero-Trust Transport (`client_node.hpp` & `tls_trust.hpp`):** Streams `.enc` blobs over **TLS 1.3** with mutual certificate fingerprint verification and end-to-end **SHA-256** integrity checks. Features resilient alert propagation: if an untrusted peer is rejected during early writes (packet header or filename payload) causing a socket broken pipe or reset, the client initiates a single read drain to pick up the pending TLS alert (`unknown ca`) and display actionable trust hints instead of raw socket failure errors.
-5. **Asymmetric Ed25519 M-of-N Quorum Auditor Re-Hydration (`vault_index.hpp` & `vault_gateway.hpp`):** Each Compliance Officer generates an Ed25519 keypair offline (`officer-keygen`) and installs only their public key (`*.pub`) on the gateway. Authorized auditors request a signing challenge (`prepare_release_challenge`) and collect detached 64-byte Ed25519 signatures from at least **2 of 3 Compliance Officers** bound to `(officer_id|target_token|blob_name|wrapped_dek_hex)`. The gateway verifies signatures via `EVP_DigestVerify`, unwraps the DEK, decrypts in memory, filters exact PII columns, re-hydrates tokens, cleanses RAM, and appends an entry to the HMAC hash-chained `regtech_audit.log`.
+1. **O(1)-RAM Streaming Tokenization & Encrypted Token Vault (`tokenizer.hpp` / `tokenizer.cpp`):** Parses RFC 4180 transaction records line-by-line via `sanitize_csv_stream`, replaces customer names, National IDs, and IBANs with deterministic `TOK_<16-hex>` HMAC-SHA256 tokens using a KMS-derived pepper, and redacts source IP addresses (`REDACTED_IP`). Persists bidirectional mappings atomically in `vault_tokens.enc` (`BVTK` AES-256-GCM envelope with a KMS-wrapped DEK and `0600` permissions).
+2. **Chunked Streaming AEAD & Traffic-Analysis Padding (`at_rest_crypto.hpp` / `at_rest_crypto.cpp`):** Seals tokenized output in fixed **65,536-byte (`64 KiB`)** **AES-256-GCM** frames (`BVL3`) using per-chunk deterministic nonces (`base_iv XOR uint64_be(chunk_index)`) and AAD binding `(blob_name || chunk_index || is_final)` to prevent truncation, reordering, and blob-swap attacks—while keeping memory strictly `O(1)` (~64 KiB per stream) and automatically decrypting legacy `BVL2` blobs.
+3. **PKCS#11 HSM / KMS Key Wrapping, Crash-Safe KEK Rotation & Erasure Sharding (`kms_provider.hpp`, `s3_shard_backend.hpp`):** Wraps each batch's Data Encryption Key (DEK) under a Master Key Encryption Key (KEK) via **RFC 3394 (`CKM_AES_KEY_WRAP` / `EVP_aes_256_wrap`)**, enforces non-extractable keys (`CKA_EXTRACTABLE=FALSE`), performs crash-safe atomic KEK rotation via `rotation.journal` + `.rotation_backup`, and distributes **2-of-3 XOR erasure shards** across local disk or 3 independent S3-compatible buckets using AWS SigV4 (`PUT`/`GET`/`HEAD`). If the primary cloud `.enc` blob is missing or fails GCM authentication, `auditor_query` automatically reconstructs and verifies the blob from any 2 surviving shards and records a `SHARD_RECOVERY` entry in the hash-chained audit log.
+4. **Zero-Trust Transport & Control-Plane Rendezvous (`client_node.hpp`, `control_client.hpp`):** Streams `.enc` blobs over **TLS 1.3** with mutual certificate fingerprint pinning, SHA-256 verification, and resilient early TLS alert (`unknown ca`) draining. Optionally integrates with [`blindvault-control`](blindvault-control/README.md) over WebSockets + Ed25519-signed UDP reflection (`BVST`) + `RelayTcpBridge` (passing bearer tokens in `Authorization` headers and preserving end-to-end mTLS 1.3 inside binary WebSocket frames).
+5. **Replay-Proof Ed25519 Quorum Auditor Re-Hydration (`vault_index.hpp` & `vault_gateway.hpp`):** Each Compliance Officer generates an Ed25519 keypair offline (`officer-keygen`) and installs only their public key (`*.pub`) on the gateway. `prepare_release_challenge` mints a fresh 16-byte CSPRNG `challenge_nonce_hex` and UTC ISO-8601 `expires_utc` (default 5 minutes), persisted under `MetadataIndex` HMAC. At least **2 of 3 Compliance Officers** sign `(officer_id|target_token|blob_name|wrapped_dek_hex|challenge_nonce_hex|expires_utc)`. Upon quorum verification, the gateway consumes the challenge single-use, stream-decrypts matching rows in `O(1)` memory, re-hydrates tokens, cleanses RAM, and appends to the HMAC hash-chained `regtech_audit.log`.
 
 ## Core & Hardening Features
 
-* **Zero-Knowledge Cloud Offloading:** Remote storage nodes only receive 64 KiB-padded `BVL2` AES-256-GCM ciphertext blobs—never plaintext PII, internal IP addresses, batch size signatures, or AES keys.
+* **Zero-Knowledge Cloud Offloading:** Remote storage nodes only receive 64 KiB-aligned `BVL3`/`BVL2` AES-256-GCM ciphertext blobs—never plaintext PII, internal IP addresses, batch size signatures, or AES keys.
 * **True Separation of Duties (Offline Ed25519 2-of-3 Quorum):** `QuorumGate` stores **only** officer Ed25519 public keys (`*.pub`) on the gateway host and has zero in-process signing capability. Even full root compromise of the gateway host cannot forge a 2-of-3 approval without the officers' offline private keys.
 * **PKCS#11 Hardware HSM & Software KMS (`kms_provider.hpp`):** Pluggable `KeyManagementProvider` supporting FIPS 140-3 PKCS#11 v2.40 HSMs (SoftHSMv2, AWS CloudHSM, Thales Luna, Utimaco) where the Master KEK never enters process memory (`CKA_EXTRACTABLE=FALSE`), with seamless local `0600` KEK fallback and full Master KEK rotation (`rotate_master_kek`).
 * **RFC 3394 Envelope Key Wrapping & Blob-Swap Protection:** Per-batch DEKs are wrapped with a 256-bit Master KEK before persisting to `vault_index.tsv`; blob filenames are authenticated via GCM AAD so ciphertext blobs cannot be swapped across index records.
@@ -74,8 +75,8 @@ sudo apt update
 sudo apt install -y build-essential cmake ninja-build libboost-dev libboost-system-dev libssl-dev
 
 # 2. Clone and build
-git clone https://github.com/OmarAhmedTHE25th/CipherVault.git
-cd CipherVault
+git clone https://github.com/OmarAhmedTHE25th/BlindVault.git
+cd BlindVault
 cmake -S . -B build -G Ninja
 cmake --build build
 
@@ -121,13 +122,21 @@ cmake --build build-gui --target BlindVault_GUI
 The underlying transport binary supports headless CLI transfers, bidirectional P2P sessions, offline officer Ed25519 quorum ceremonies, and node identity management:
 
 ```text
-BlindVault receive <port> [save_folder]
+BlindVault receive <port> [save_folder] [--control <url> --invite|--claim <code>]
 BlindVault send <host> <port> <file>
-BlindVault p2p <port> [save_folder]
+BlindVault send <file> --control <url> (--invite|--claim <code>) [--force-relay]
+BlindVault p2p <port> [save_folder] [--control <url> --invite|--claim <code>]
+
+RegTech Vault Gateway & Benchmark Commands:
+  BlindVault vault offload <raw_csv> [--state-dir DIR] [--cloud-dir DIR]
+  BlindVault vault challenge <identifier> [--state-dir DIR] [--ttl SECONDS]
+  BlindVault vault query <identifier> <cloud_dir> --nonce <hex> --expires <iso> --approval <officer_id>:<sig_hex> [--approval ...] [--state-dir DIR]
+  BlindVault vault rotate-kek [--state-dir DIR] [--cloud-dir DIR]
+  BlindVault bench [rows]
 
 Compliance Officer Offline Quorum Commands (run on officer workstation):
   BlindVault officer-keygen <officer_id> [out_dir]
-  BlindVault officer-sign <priv_key.pem> <officer_id> <token> <blob_name> <wrapped_dek_hex>
+  BlindVault officer-sign <priv_key.pem> <officer_id> <token> <blob_name> <wrapped_dek_hex> <challenge_nonce_hex> <expires_utc>
 
 Identity Management:
   BlindVault init [--force] [name]
@@ -163,6 +172,35 @@ cp offline_officers/*.pub ~/.local/share/BlindVault/BlindVault/officers/
 
 # 5. Send an encrypted blob from Bank Gateway (Terminal 2)
 (cd bank_gateway && ../BlindVault send localhost 8080 payload.enc)
+```
+
+## Multi-Bucket S3 Erasure & Control-Plane Rendezvous
+
+### Multi-Bucket S3 Erasure Coding (`S3MultiBucketShardBackend`)
+
+Spin up 3 independent MinIO buckets locally and offload shards via AWS SigV4:
+
+```bash
+docker compose -f docker-compose.vault.yml up -d
+export BLINDVAULT_SHARD0_URL=http://127.0.0.1:9000/blindvault-shard0
+export BLINDVAULT_SHARD1_URL=http://127.0.0.1:9002/blindvault-shard1
+export BLINDVAULT_SHARD2_URL=http://127.0.0.1:9004/blindvault-shard2
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=minioadmin
+
+./build/BlindVault vault offload batch.csv --state-dir ./bank_state --cloud-dir ./cloud_archive
+```
+
+### Control-Plane NAT Traversal & Encrypted Fallback Relay
+
+Pair peers via Crockford invite codes and stream end-to-end mTLS 1.3 directly or through `blindvault-control` WebSocket relay bridges:
+
+```bash
+# Terminal 1 (Receiver)
+./build/BlindVault receive 8443 ./received --control http://127.0.0.1:8000 --invite
+
+# Terminal 2 (Sender — direct TCP if reachable, or automatic / forced relay fallback)
+./build/BlindVault send ./payload.enc --control http://127.0.0.1:8000 --claim ABCD1234 --force-relay
 ```
 
 ## Performance Benchmarks
@@ -235,16 +273,13 @@ Every control message uses a packed **47-byte big-endian header**:
 | 13 | 2 | `filename_len` | Filename byte length |
 | 15 | 32 | `file_hash` | SHA-256 digest of the complete file |
 
-### At-Rest Encrypted Envelope (`at_rest_crypto.hpp` — `BVL2`)
+### At-Rest Encrypted Envelope (`at_rest_crypto.hpp` — `BVL3` & Legacy `BVL2`)
 
-Every `.enc` object offloaded to cloud storage uses a 32-byte binary header followed by 64 KiB-aligned AES-256-GCM ciphertext (with `blob_name` authenticated as GCM AAD):
+Every newly offloaded `.enc` object uses the streaming chunked **BVL3** format (with `BVL2` retained for small internal envelopes and seamless backward-compatible decryption):
 
-| Offset | Size | Field | Meaning |
-| -----: | ---: | ----- | ------- |
-| 0 | 4 | `magic` | ASCII `BVL2` (`0x42 0x56 0x4C 0x32`) |
-| 4 | 12 | `iv` | 96-bit CSPRNG nonce (`RAND_bytes`) |
-| 16 | 16 | `auth_tag` | 128-bit AES-GCM integrity tag |
-| 32 | *64 KiB × k* | `ciphertext` | AES-256-GCM encrypted `[8B real_len \| tokenized CSV \| CSPRNG padding]` |
+* **`BVL3` Streaming Header (32 bytes):** `[0:4]` = `"BVL3"`, `[4:16]` = 96-bit `base_iv`, `[16:32]` = reserved flags/version (`0`).
+* **Fixed 64 KiB Frames (`65,536` bytes each):** `[0:2]` = uint16 big-endian `plain_len` (`<= 65,516`), `[2:65,518]` = AES-256-GCM ciphertext (`[plain | CSPRNG pad]`), `[65,518:65,534]` = 16-byte GCM auth tag (`nonce = base_iv XOR uint64_be(chunk_index)`, `AAD = blob_name || uint64_be(chunk_index) || is_final_byte`), trailing 2 reserved bytes (`0`).
+* **Legacy `BVL2` Format (32B header + `64 KiB × k`):** `[0:4]` = `"BVL2"`, `[4:16]` = 96-bit IV, `[16:32]` = 128-bit GCM tag, followed by padded ciphertext (`blob_name` AAD).
 
 ### Encrypted Token Vault Envelope (`tokenizer.hpp` — `BVTK`)
 
@@ -262,11 +297,11 @@ The bidirectional PII lookup table (`vault_tokens.enc`) is stored at rest using 
 | ------ | ---------- | ------------ |
 | Cloud breach or rogue cloud admin | Client-side AES-256-GCM (`BVL2`) + HMAC-SHA256 PII tokenization prior to egress; keys never leave bank | Unit tests (`test_vault_core.cpp`) |
 | IP-based tracking or topology leakage | Source/internal IP fields redacted (`REDACTED_IP`) before packaging; nodes authenticate via SHA-256 cert fingerprints | Unit tests (`test_vault_core.cpp`) |
-| Rogue insider or compromised gateway host forging quorum approvals | **Asymmetric Ed25519 2-of-3 Quorum Gate**: gateway holds only `*.pub` keys and verifies detached signatures bound to `(officer_id\|token\|blob_name\|wrapped_dek_hex)` via `EVP_DigestVerify` | Unit tests (`VaultHardening.EndToEndTokenSearchExactColumnMatchTamperIndexAndChainedAudit`) |
-| Index tampering, blob swapping, or audit log deletion | HMAC-authenticated `vault_index.tsv`, blob-name GCM AAD binding, and HMAC hash-chained `regtech_audit.log` | Unit tests (`VaultCrypto.RejectsBlobNameSwapViaAad`, `test_vault_core.cpp`) |
-| Host disk compromise / key scraping | **PKCS#11 HSM** or **RFC 3394 AES-256 Key Wrapping** (no raw DEKs on disk; `BVTK`-encrypted token map) + RAII `OPENSSL_cleanse` + `RLIMIT_CORE=0` | Unit tests (`VaultHardening.Rfc3394KeyWrapAnd64KiBTrafficPadding`, `Tokenizer.PersistsAcrossReloadsEncryptedAtRest`) |
-| Cloud file-size / traffic inference | Fixed-bucket **64 KiB CSPRNG padding** on every `BVL2` envelope | Unit tests (`VaultHardening.Rfc3394KeyWrapAnd64KiBTrafficPadding`) |
-| Single-cloud outage or ransomware | **2-of-3 XOR Erasure Sharding** reconstructing full ciphertext from any 2 surviving shards | Unit tests (`VaultHardening.TwoOfThreeErasureCodingSurvivesCloudNodeLoss`) |
+| Rogue insider or compromised gateway host forging or replaying quorum approvals | **Replay-Proof Asymmetric Ed25519 2-of-3 Quorum Gate**: gateway holds only `*.pub` keys and verifies detached signatures bound to `(officer_id\|token\|blob_name\|wrapped_dek_hex\|challenge_nonce_hex\|expires_utc)` with HMAC-persisted single-use consumption | Unit tests (`QuorumGate.ReplayAndExpiryAndTargetBinding`, `test_vault_core.cpp`) |
+| Index tampering, blob swapping, or audit log deletion | HMAC-authenticated `vault_index.tsv`, per-chunk blob-name/index/final AAD binding, and HMAC hash-chained `regtech_audit.log` | Unit tests (`VaultCrypto.Bvl3StreamingAndAutoLegacyBvl2Decrypt`, `test_vault_core.cpp`) |
+| Host disk compromise / key scraping | **PKCS#11 HSM** (verified against SoftHSMv2 with `CKA_EXTRACTABLE=FALSE`) or **RFC 3394 AES-256 Key Wrapping** + crash-safe `rotation.journal` rollback + RAII `OPENSSL_cleanse` + `RLIMIT_CORE=0` | Unit tests (`VaultHsm.Pkcs11HardwareRoundTripAndNonExtractableKek`, `VaultHardening.CrashSafeKekRotationRecoveryOnRestart`) |
+| Cloud file-size / traffic inference | Fixed-bucket **64 KiB CSPRNG padding** across `BVL3` streaming frames & `BVL2` envelopes | Unit tests (`VaultCrypto.Bvl3StreamingAndAutoLegacyBvl2Decrypt`) |
+| Single-cloud outage, ransomware, or bit-rot | **2-of-3 XOR Erasure Sharding** (`LocalErasureShardBackend` or `S3MultiBucketShardBackend` with AWS SigV4) + automatic recovery & `SHARD_RECOVERY` audit logging | Unit tests (`VaultHardening.AutomaticTwoOfThreeErasureShardRecovery`, `S3ShardBackend.ParseUrlSigV4AndMockMultiBucketRecovery`) |
 | Eavesdropping or MITM in transit | Mutual TLS 1.3 only (TLS 1.2 refused) with strict SHA-256 fingerprint allowlisting on both ends; resilient early alert drain (`unknown ca`) diagnoses untrusted senders | Unit & E2E tests (`test_e2e_trust.cpp`, `e2e_test.sh`) |
 | Path traversal & parser corruption | Cross-OS strict filename/header validation + continuous libFuzzer + ASan/UBSan CI builds | GitHub Actions CI (`fuzz_validation`) |
 
@@ -299,19 +334,25 @@ mkdir -p corpus-work
 ## Project Structure
 
 ```text
-src/main.cpp          CLI entry point, transfer modes, and offline officer-keygen/officer-sign commands
+CMakeLists.txt              Static core library (blindvault_core) + CLI, GUI, unit tests, fuzzer, benchmarks
+docker-compose.vault.yml    3-node MinIO stack + bucket init for S3 2-of-3 erasure sharding
+blindvault-control/         Python 3.12 FastAPI + Redis Pub/Sub control plane, Ed25519 UDP reflector & WS relay
+src/
+  main.cpp                  CLI entry point (send/receive/p2p + --control, vault subcommands, bench, officer ops)
+  security/, transport/,    Compiled C++20 core modules backing BlindVault, GUI, tests, fuzzers & benchmarks
+  vault/
 include/
-  vault/              Bank-side RegTech engine (at_rest_crypto, kms_provider, tokenizer, vault_index, vault_gateway)
+  vault/                    Bank-side RegTech engine (at_rest_crypto, kms_provider, tokenizer, vault_index,
+                            erasure_shard_backend, s3_shard_backend, vault_gateway, cli_benchmark)
   transport/
-    client/           Outgoing transfer and P2P client headers
-    server/           Cloud receiver and transfer session headers
-    common/           Wire protocol, streaming, and shared events
-  security/           mTLS, identities, allowlists, and input/disk guards
-gui/                  Qt 6 desktop application and Boost.Asio thread bridge
-tests/                GoogleTest unit & integration test suites
-fuzz/                 libFuzzer target and seed corpus
-scripts/              End-to-end TLS test harness and certificate helpers
-.github/workflows/    CI (GCC/Clang, ASan/UBSan, libFuzzer) and Linux/Windows Release pipelines
+    client/, server/,       mTLS 1.3 transport, P2P node, wire protocol, and control-plane/relay client
+    common/, control/
+  security/                 mTLS, identities, allowlists, and input/disk guards
+gui/                        Qt 6 desktop application and Boost.Asio thread_pool / io_context bridge
+tests/                      GoogleTest unit & integration test suites
+fuzz/                       libFuzzer target and seed corpus
+scripts/                    End-to-end TLS test harness and certificate helpers
+.github/workflows/          CI (GCC/Clang, ASan/UBSan, SoftHSMv2 PKCS#11, libFuzzer) & Release pipelines
 ```
 
 ## License

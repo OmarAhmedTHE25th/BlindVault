@@ -5,6 +5,7 @@
 #include <QPair>
 #include <thread>
 #include <memory>
+#include <mutex>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include "trust_store.hpp"
@@ -30,7 +31,9 @@ public:
     void importOfficerPublicKey(const QString& pubKeyPath);
     void queryAuditorRecords(const QString& identifier,
                              const QString& cloudDir,
-                             const QList<QPair<QString, QString>>& detachedApprovals);
+                             const QList<QPair<QString, QString>>& detachedApprovals,
+                             const QString& challengeNonce,
+                             const QString& expiresUtc);
 
 signals:
     void logMessage(const QString& msg);
@@ -47,6 +50,8 @@ signals:
                                quint64 paddedBytes, quint64 shardBytes,
                                double elapsedMs, double recordsPerSec, const QString& blobName);
     void releaseChallengeReady(const QString& targetToken,
+                               const QString& challengeNonce,
+                               const QString& expiresUtc,
                                const QString& challengeSummary,
                                const QString& registeredOfficersSummary);
     void officerPublicKeyImported(const QString& statusMessage);
@@ -57,6 +62,8 @@ private:
     boost::asio::io_context io_ctx_;
     boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_guard_;
     std::thread worker_thread_;
+    boost::asio::thread_pool cpu_pool_;
+    std::mutex gateway_mutex_;
 
     std::shared_ptr<trust::TrustStore> trust_store_;
     std::unique_ptr<vault_gateway::GatewayEngine> gateway_engine_;

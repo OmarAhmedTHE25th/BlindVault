@@ -8,9 +8,11 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 option(P2P_BUILD_TESTS "Build the unit tests" ON)
 option(P2P_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer (GCC/Clang only)" OFF)
 option(P2P_BUILD_GUI "Build the Qt6 desktop application" OFF)
+
 if (WIN32)
     add_compile_definitions(_WIN32_WINNT=0x0A00) # Windows 10/11
 endif()
+
 # Sanitizers add checks that turn memory errors into loud crashes
 if(P2P_SANITIZE)
     if(MSVC)
@@ -23,42 +25,56 @@ endif()
 # Find core backend dependencies
 find_package(OpenSSL REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
-# ---------------- CLI Application ----------------
-add_executable(BlindVault
-        src/main.cpp
-        include/transport/common/protocol.hpp
-        include/security/validation.hpp
-        include/security/disk_budget.hpp
-        include/security/trust_store.hpp
-        include/security/identity.hpp
-        include/security/cli_identity.hpp
-        include/security/tls_trust.hpp
-        include/transport/common/file_streaming.hpp
-        include/transport/client/client_node.hpp
-        include/transport/server/server_session.hpp
-        include/transport/server/server_node.hpp
-        include/transport/client/p2p_node.hpp
-        gui/log_redirect.hpp
-        include/transport/common/events.hpp
-        include/vault/at_rest_crypto.hpp
-        include/vault/tokenizer.hpp
-        include/vault/vault_index.hpp
-        include/vault/vault_gateway.hpp
-        include/vault/kms_provider.hpp
-        include/vault/cli_benchmark.hpp
+
+# ---------------- Core Static Library ----------------
+add_library(blindvault_core STATIC
+        src/security/identity.cpp
+        src/security/trust_store.cpp
+        src/security/tls_trust.cpp
+        src/transport/client_node.cpp
+        src/transport/server_session.cpp
+        src/transport/server_node.cpp
+        src/transport/control/control_client.cpp
+        src/vault/at_rest_crypto.cpp
+        src/vault/kms_provider.cpp
+        src/vault/tokenizer.cpp
+        src/vault/vault_index.cpp
+        src/vault/s3_shard_backend.cpp
+        src/vault/vault_gateway.cpp
 )
-target_include_directories(BlindVault PRIVATE
+target_include_directories(blindvault_core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
         ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
         ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
         ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/control
         ${CMAKE_CURRENT_SOURCE_DIR}/include/security
 )
-target_link_libraries(BlindVault PRIVATE
+target_compile_options(blindvault_core PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>
+)
+target_link_libraries(blindvault_core PUBLIC
         OpenSSL::SSL
         OpenSSL::Crypto
         Boost::system
+        ${CMAKE_DL_LIBS}
 )
+
+# ---------------- CLI Application ----------------
+add_executable(BlindVault
+        src/main.cpp
+        include/vault/cli_benchmark.hpp
+        include/transport/client/p2p_node.hpp
+        include/security/cli_identity.hpp
+        gui/log_redirect.hpp
+)
+target_compile_options(BlindVault PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/W4>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>
+)
+target_link_libraries(BlindVault PRIVATE blindvault_core)
 
 # ---------------- Qt 6 GUI Application ----------------
 if(P2P_BUILD_GUI)
@@ -75,47 +91,21 @@ if(P2P_BUILD_GUI)
             gui/network_bridge.hpp
             gui/network_bridge.cpp
             gui/log_redirect.hpp
-            include/transport/common/protocol.hpp
-            include/security/validation.hpp
-            include/security/disk_budget.hpp
-            include/security/trust_store.hpp
-            include/security/identity.hpp
-            include/security/cli_identity.hpp
-            include/security/tls_trust.hpp
-            include/transport/common/file_streaming.hpp
-            include/transport/client/client_node.hpp
-            include/transport/server/server_session.hpp
-            include/transport/server/server_node.hpp
-            include/transport/common/events.hpp
-            include/vault/at_rest_crypto.hpp
-            include/vault/tokenizer.hpp
-            include/vault/vault_index.hpp
-            include/vault/vault_gateway.hpp
-            include/vault/kms_provider.hpp
     )
-
     target_include_directories(BlindVault_GUI PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/security
             ${CMAKE_CURRENT_SOURCE_DIR}/gui
     )
-
+    target_compile_options(BlindVault_GUI PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/W4>
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>
+    )
     target_link_libraries(BlindVault_GUI PRIVATE
+            blindvault_core
             Qt6::Core
             Qt6::Gui
             Qt6::Widgets
-            OpenSSL::SSL
-            OpenSSL::Crypto
-            Boost::system
     )
 endif()
-
-
-
 
 # ---------------- Fuzzing (Clang only) ----------------
 option(P2P_BUILD_FUZZERS "Build the libFuzzer fuzz targets (Clang only)" OFF)
@@ -124,13 +114,9 @@ if(P2P_BUILD_FUZZERS)
         message(FATAL_ERROR "P2P_BUILD_FUZZERS needs Clang (it uses libFuzzer)")
     endif()
     add_executable(fuzz_validation fuzz/fuzz_validation.cpp)
-    target_include_directories(fuzz_validation PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/security)
     target_compile_options(fuzz_validation PRIVATE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -O1 -g)
     target_link_options(fuzz_validation PRIVATE -fsanitize=fuzzer,address,undefined)
-    target_link_libraries(fuzz_validation PRIVATE Boost::system)
+    target_link_libraries(fuzz_validation PRIVATE blindvault_core)
 endif()
 
 # ---------------- Unit tests ----------------
@@ -154,20 +140,13 @@ if(P2P_BUILD_TESTS)
             tests/test_tls_trust.cpp
             tests/test_hashing.cpp
             tests/test_e2e_trust.cpp
-            include/vault/at_rest_crypto.hpp
-            include/vault/tokenizer.hpp
-            include/vault/vault_index.hpp
-            include/vault/vault_gateway.hpp
             tests/test_vault_core.cpp
     )
-    target_include_directories(unit_tests PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/client
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/server
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/security)
-    target_link_libraries(unit_tests PRIVATE GTest::gtest_main OpenSSL::Crypto OpenSSL::SSL Boost::system)
+    target_compile_options(unit_tests PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/W4>
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>
+    )
+    target_link_libraries(unit_tests PRIVATE blindvault_core GTest::gtest_main)
 
     include(GoogleTest)
     gtest_discover_tests(unit_tests)
@@ -190,23 +169,10 @@ if(P2P_BUILD_BENCHMARKS)
     )
     FetchContent_MakeAvailable(googlebenchmark)
 
-    add_executable(bench_vault
-            benchmarks/bench_vault.cpp
-            include/vault/at_rest_crypto.hpp
-            include/vault/kms_provider.hpp
-            include/vault/tokenizer.hpp
-            include/vault/vault_index.hpp
-            include/vault/vault_gateway.hpp
+    add_executable(bench_vault benchmarks/bench_vault.cpp)
+    target_compile_options(bench_vault PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/W4>
+            $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra>
     )
-    target_include_directories(bench_vault PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/vault
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/security
-            ${CMAKE_CURRENT_SOURCE_DIR}/include/transport/common
-    )
-    target_link_libraries(bench_vault PRIVATE
-            benchmark::benchmark_main
-            OpenSSL::Crypto
-            OpenSSL::SSL
-            Boost::system
-    )
+    target_link_libraries(bench_vault PRIVATE blindvault_core benchmark::benchmark_main)
 endif()

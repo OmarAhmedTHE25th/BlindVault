@@ -27,6 +27,7 @@ std::filesystem::path getIdentityDirectory() {
 NetworkBridge::NetworkBridge(QObject* parent)
     : QObject(parent),
       work_guard_(boost::asio::make_work_guard(io_ctx_)),
+      cpu_pool_(std::max(2u, std::thread::hardware_concurrency())),
       trust_store_(std::make_shared<trust::TrustStore>(getIdentityDirectory() / identity::TRUST_FILE)),
       gateway_engine_(std::make_unique<vault_gateway::GatewayEngine>(getIdentityDirectory(), /*quorum_threshold=*/2)) {
     worker_thread_ = std::thread([this]() {
@@ -45,6 +46,8 @@ NetworkBridge::~NetworkBridge() {
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
+    cpu_pool_.stop();
+    cpu_pool_.join();
 }
 
 void NetworkBridge::setIdentityPassphrase(const QString& passphrase) {
@@ -73,7 +76,7 @@ void NetworkBridge::startServer(uint16_t port, const QString& saveDir) {
             server_node_ = std::make_shared<ServerNode>(io_ctx_, *server_ssl_ctx_, port, save_path, trust_store_, std::move(events));
             server_node_->start();
 
-            emit serverStatus(true, QString("Cloud Vault Node active on port %1 (storing BVLT v2 ciphertext in '%2')")
+            emit serverStatus(true, QString("Cloud Vault Node active on port %1 (storing BVL3/BVL2 ciphertext in '%2')")
                                         .arg(port).arg(saveDir));
         } catch (const std::exception& e) {
             emit logMessage(QString("[CLOUD NODE ERROR] %1").arg(e.what()));
@@ -104,7 +107,7 @@ void NetworkBridge::sendFile(const QString& host, uint16_t port, const QString& 
             };
 
             auto client = std::make_shared<ClientNode>(io_ctx_, *client_ssl_ctx_, std::move(events), trust_store_);
-            emit logMessage(QString("[GATEWAY] Streaming 64KiB-padded BVLT v2 blob %1 to Cloud Node %2:%3...")
+            emit logMessage(QString("[GATEWAY] Streaming 64KiB-aligned BVL3 blob %1 to Cloud Node %2:%3...")
                                 .arg(filePath, host).arg(port));
             client->send_file(std::to_string(port), host.toStdString(), filePath.toStdString());
         } catch (const std::exception& e) {
@@ -115,10 +118,14 @@ void NetworkBridge::sendFile(const QString& host, uint16_t port, const QString& 
 }
 
 void NetworkBridge::generateSyntheticBatch(quint64 rowCount) {
-    boost::asio::post(io_ctx_, [this, rowCount]() {
+    boost::asio::post(cpu_pool_, [this, rowCount]() {
         try {
-            emit logMessage(QString("[GATEWAY] Generating %1 synthetic Egyptian banking transactions...").arg(rowCount));
-            const auto path = gateway_engine_->generate_synthetic_cbe_batch(static_cast<std::size_t>(rowCount));
+            std::filesystem::path path;
+            {
+                std::lock_guard<std::mutex> lock(gateway_mutex_);
+                emit logMessage(QString("[GATEWAY] Generating %1 synthetic Egyptian banking transactions...").arg(rowCount));
+                path = gateway_engine_->generate_synthetic_cbe_batch(static_cast<std::size_t>(rowCount));
+            }
             emit logMessage(QString("[GATEWAY] Synthetic batch ready: %1").arg(QString::fromStdString(path.string())));
             emit syntheticBatchReady(QString::fromStdString(path.string()));
         } catch (const std::exception& e) {
@@ -128,10 +135,14 @@ void NetworkBridge::generateSyntheticBatch(quint64 rowCount) {
 }
 
 void NetworkBridge::ingestAndOffloadCsv(const QString& host, uint16_t port, const QString& csvPath) {
-    boost::asio::post(io_ctx_, [this, host, port, csvPath]() {
+    boost::asio::post(cpu_pool_, [this, host, port, csvPath]() {
         try {
-            emit logMessage("[GATEWAY] Hardened Egress: Tokenizing PII -> 64KiB Traffic Padding -> AES-256-GCM -> RFC 3394 DEK Wrap -> 2-of-3 Erasure Shards...");
-            const auto artifact = gateway_engine_->prepare_encrypted_offload(csvPath.toStdString());
+            emit logMessage("[GATEWAY] Hardened Egress (CPU Pool): Tokenizing -> Chunked BVL3 AEAD -> RFC 3394 DEK Wrap -> 2-of-3 Erasure Shards...");
+            vault_gateway::OffloadArtifact artifact;
+            {
+                std::lock_guard<std::mutex> lock(gateway_mutex_);
+                artifact = gateway_engine_->prepare_encrypted_offload(csvPath.toStdString());
+            }
 
             emit logMessage(QString("[GATEWAY] Processed %1 records (%2 PII tokenized, %3 IPs masked) in %4 ms (%5 rec/s)")
                                 .arg(artifact.stats.records_processed)
@@ -139,7 +150,7 @@ void NetworkBridge::ingestAndOffloadCsv(const QString& host, uint16_t port, cons
                                 .arg(artifact.stats.ips_masked)
                                 .arg(artifact.elapsed_ms, 0, 'f', 2)
                                 .arg(artifact.records_per_sec, 0, 'f', 0));
-            emit logMessage(QString("[HARDENING] Padded Envelope: %1 bytes | 3x Erasure Shards (%2 bytes each) | DEK Wrapped & Cleansed from RAM")
+            emit logMessage(QString("[HARDENING] BVL3 Envelope: %1 bytes | 3x Erasure Shards (%2 bytes each) | DEK Wrapped & Cleansed from RAM")
                                 .arg(artifact.padded_size_bytes)
                                 .arg(artifact.erasure_shard_bytes));
 
@@ -162,17 +173,21 @@ void NetworkBridge::ingestAndOffloadCsv(const QString& host, uint16_t port, cons
 }
 
 void NetworkBridge::importOfficerPublicKey(const QString& pubKeyPath) {
-    boost::asio::post(io_ctx_, [this, pubKeyPath]() {
+    boost::asio::post(cpu_pool_, [this, pubKeyPath]() {
         try {
             const std::filesystem::path src(pubKeyPath.toStdString());
             if (!std::filesystem::exists(src) || src.extension() != ".pub") {
                 throw std::runtime_error("Select a valid officer Ed25519 public key file (*.pub)");
             }
-            const auto dest = gateway_engine_->officer_pubkey_directory() / src.filename();
-            std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing);
-            gateway_engine_->quorum_gate().reload_public_keys();
+            std::vector<std::string> officers;
+            {
+                std::lock_guard<std::mutex> lock(gateway_mutex_);
+                const auto dest = gateway_engine_->officer_pubkey_directory() / src.filename();
+                std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing);
+                gateway_engine_->quorum_gate().reload_public_keys();
+                officers = gateway_engine_->quorum_gate().registered_officers();
+            }
 
-            const auto officers = gateway_engine_->quorum_gate().registered_officers();
             QStringList names;
             for (const auto& o : officers) names << QString::fromStdString(o);
             const QString summary = QString("Installed '%1' | Registered Officers (%2): %3")
@@ -189,39 +204,52 @@ void NetworkBridge::importOfficerPublicKey(const QString& pubKeyPath) {
 }
 
 void NetworkBridge::prepareReleaseChallenge(const QString& identifier) {
-    boost::asio::post(io_ctx_, [this, identifier]() {
+    boost::asio::post(cpu_pool_, [this, identifier]() {
         try {
-            const auto challenge = gateway_engine_->prepare_release_challenge(identifier.toStdString());
+            vault_gateway::ReleaseChallenge challenge;
+            std::filesystem::path pub_dir;
+            {
+                std::lock_guard<std::mutex> lock(gateway_mutex_);
+                challenge = gateway_engine_->prepare_release_challenge(identifier.toStdString());
+                pub_dir = gateway_engine_->officer_pubkey_directory();
+            }
             QStringList officerNames;
             for (const auto& id : challenge.registered_officers) {
                 officerNames << QString::fromStdString(id);
             }
             const QString officersStr = officerNames.isEmpty()
                 ? QString("None registered yet (import *.pub keys in %1)")
-                      .arg(QString::fromStdString(gateway_engine_->officer_pubkey_directory().string()))
+                      .arg(QString::fromStdString(pub_dir.string()))
                 : officerNames.join(", ");
 
             std::ostringstream ss;
-            ss << "Target Token: " << challenge.target_token << "\n";
+            ss << "Target Token: " << challenge.target_token << "\n"
+               << "Challenge Nonce: " << challenge.challenge_nonce_hex << "\n"
+               << "Expires (UTC): " << challenge.expires_utc << "\n";
             if (challenge.candidate_blobs.empty()) {
                 ss << "Candidate Blobs: None matched (sign against blob_name=NONE, wrapped_dek_hex=NONE)\n"
                    << "CLI: BlindVault officer-sign <officer.priv> <officer_id> "
-                   << challenge.target_token << " NONE NONE";
+                   << challenge.target_token << " NONE NONE "
+                   << challenge.challenge_nonce_hex << " " << challenge.expires_utc;
             } else {
                 for (const auto& blob : challenge.candidate_blobs) {
                     ss << "Blob: " << blob.blob_name << "\n"
                        << "Wrapped DEK: " << blob.wrapped_dek_hex << "\n"
                        << "Offline Sign Command:\n"
                        << "  BlindVault officer-sign <officer.priv> <officer_id> "
-                       << challenge.target_token << " " << blob.blob_name << " " << blob.wrapped_dek_hex << "\n";
+                       << challenge.target_token << " " << blob.blob_name << " " << blob.wrapped_dek_hex
+                       << " " << challenge.challenge_nonce_hex << " " << challenge.expires_utc << "\n";
                 }
             }
 
-            emit logMessage(QString("[QUORUM] Prepared signing challenge for token %1 (%2 candidate blob(s))")
+            emit logMessage(QString("[QUORUM] Prepared replay-proof challenge (expires %1) for token %2 (%3 candidate blob(s))")
+                                .arg(QString::fromStdString(challenge.expires_utc))
                                 .arg(QString::fromStdString(challenge.target_token))
                                 .arg(challenge.candidate_blobs.size()));
             emit releaseChallengeReady(
                 QString::fromStdString(challenge.target_token),
+                QString::fromStdString(challenge.challenge_nonce_hex),
+                QString::fromStdString(challenge.expires_utc),
                 QString::fromStdString(ss.str()),
                 officersStr);
         } catch (const std::exception& e) {
@@ -232,8 +260,10 @@ void NetworkBridge::prepareReleaseChallenge(const QString& identifier) {
 
 void NetworkBridge::queryAuditorRecords(const QString& identifier,
                                         const QString& cloudDir,
-                                        const QList<QPair<QString, QString>>& detachedApprovals) {
-    boost::asio::post(io_ctx_, [this, identifier, cloudDir, detachedApprovals]() {
+                                        const QList<QPair<QString, QString>>& detachedApprovals,
+                                        const QString& challengeNonce,
+                                        const QString& expiresUtc) {
+    boost::asio::post(cpu_pool_, [this, identifier, cloudDir, detachedApprovals, challengeNonce, expiresUtc]() {
         try {
             std::vector<vault_index::OfficerApproval> approvals;
             approvals.reserve(static_cast<std::size_t>(detachedApprovals.size()));
@@ -245,14 +275,25 @@ void NetworkBridge::queryAuditorRecords(const QString& identifier,
                 }
             }
 
-            const auto res = gateway_engine_->auditor_query(
-                identifier.toStdString(), cloudDir.toStdString(), approvals);
+            vault_gateway::AuditorQueryResult res;
+            {
+                std::lock_guard<std::mutex> lock(gateway_mutex_);
+                res = gateway_engine_->auditor_query(
+                    identifier.toStdString(),
+                    cloudDir.toStdString(),
+                    approvals,
+                    challengeNonce.toStdString(),
+                    expiresUtc.toStdString());
+            }
             if (!res.authorized) {
                 emit logMessage(QString("[SECURITY BLOCK] %1").arg(QString::fromStdString(res.denial_reason)));
                 emit auditorQueryCompleted(false, false, QString::fromStdString(res.denial_reason), "", "");
                 return;
             }
 
+            if (res.recovered_from_shards) {
+                emit logMessage("[RECOVERY] Primary cloud blob missing/corrupted — reconstructed seamlessly via 2-of-3 erasure shards (SHARD_RECOVERY logged).");
+            }
             if (res.found) {
                 emit logMessage(QString("[AUDITOR] Ed25519 Quorum Verified! Unwrapped DEK via RFC 3394 & re-hydrated %1.")
                                     .arg(QString::fromStdString(res.matched_token)));

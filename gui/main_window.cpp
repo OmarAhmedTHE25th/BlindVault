@@ -661,10 +661,15 @@ void MainWindow::onPrepareChallenge() {
 }
 
 void MainWindow::onReleaseChallengeReady(const QString& targetToken,
+                                         const QString& challengeNonce,
+                                         const QString& expiresUtc,
                                          const QString& challengeSummary,
                                          const QString& registeredOfficersSummary) {
+    active_challenge_nonce_ = challengeNonce;
+    active_challenge_expires_ = expiresUtc;
     challenge_view_->setPlainText(challengeSummary);
-    auditor_token_lbl_->setText("Token: " + targetToken + " | Registered Officers: " + registeredOfficersSummary);
+    auditor_token_lbl_->setText("Token: " + targetToken + " | Expires: " + expiresUtc +
+                                " | Registered Officers: " + registeredOfficersSummary);
 }
 
 void MainWindow::onAuditorSearch() {
@@ -678,7 +683,8 @@ void MainWindow::onAuditorSearch() {
     approvals.append({officer1_id_input_->text().trimmed(), officer1_sig_input_->text().trimmed()});
     approvals.append({officer2_id_input_->text().trimmed(), officer2_sig_input_->text().trimmed()});
 
-    bridge_->queryAuditorRecords(query, save_dir_input_->text().trimmed(), approvals);
+    bridge_->queryAuditorRecords(query, save_dir_input_->text().trimmed(), approvals,
+                                active_challenge_nonce_, active_challenge_expires_);
 }
 
 void MainWindow::onAuditorQueryCompleted(bool authorized, bool found, const QString& statusOrToken,
@@ -781,7 +787,7 @@ void MainWindow::onTransferCompleted(bool success, const QString& status) const 
     send_btn_->setEnabled(true);
     if (success) {
         progress_bar_->setValue(100);
-        transfer_status_lbl_->setText("64KiB-padded BVLT v2 encrypted blob verified and stored on Cloud Node!");
+        transfer_status_lbl_->setText("64KiB-aligned BVL3 encrypted blob verified and stored on Cloud Node!");
     } else {
         transfer_status_lbl_->setText("Offload failed: " + status);
     }

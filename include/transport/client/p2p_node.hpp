@@ -1,21 +1,34 @@
 #ifndef P2P_SECURE_FILE_SHARING_P2P_NODE_HPP
 #define P2P_SECURE_FILE_SHARING_P2P_NODE_HPP
 
-#include "server_node.hpp"
-#include "client_node.hpp"
+#include <filesystem>
+#include <iostream>
 #include <map>
+#include <memory>
 #include <string>
+
+#include "client_node.hpp"
+#include "server_node.hpp"
 
 class P2PNode {
 public:
-    P2PNode(net::io_context& io_ctx, net::ssl::context& server_ctx, net::ssl::context& client_ctx, uint16_t port, fs::path save_dir,
+    P2PNode(boost::asio::io_context& io_ctx,
+            boost::asio::ssl::context& server_ctx,
+            boost::asio::ssl::context& client_ctx,
+            uint16_t port,
+            const std::filesystem::path& save_dir,
             std::shared_ptr<trust::TrustStore> trust_store = nullptr)
         : io_ctx_(io_ctx),
-          server_node_(std::make_shared<ServerNode>(io_ctx, server_ctx, port, save_dir, std::move(trust_store))),
-          client_ctx_(client_ctx) {}
+          server_node_(std::make_shared<ServerNode>(io_ctx, server_ctx, port, save_dir, trust_store)),
+          client_ctx_(client_ctx),
+          trust_store_(std::move(trust_store)) {}
 
     void start() {
         server_node_->start();
+    }
+
+    uint16_t listening_port() const {
+        return server_node_->port();
     }
 
     void send_file(const std::string& peer_name, const std::string& file_path) {
@@ -28,9 +41,8 @@ public:
     }
 
     void send_file_to_addr(const std::string& host, const std::string& port, const std::string& file_path) {
-        auto client = std::make_shared<ClientNode>(io_ctx_, client_ctx_);
+        auto client = std::make_shared<ClientNode>(io_ctx_, client_ctx_, TransferEvents{}, trust_store_);
         client->send_file(port, host, file_path);
-        // client_node manages its own lifetime via shared_from_this in its async ops
     }
 
     void add_peer(const std::string& name, const std::string& host, const std::string& port) {
@@ -43,10 +55,11 @@ private:
         std::string port;
     };
 
-    net::io_context& io_ctx_;
+    boost::asio::io_context& io_ctx_;
     std::shared_ptr<ServerNode> server_node_;
-    net::ssl::context& client_ctx_;
+    boost::asio::ssl::context& client_ctx_;
+    std::shared_ptr<trust::TrustStore> trust_store_;
     std::map<std::string, PeerInfo> address_book_;
 };
 
-#endif //P2P_SECURE_FILE_SHARING_P2P_NODE_HPP
+#endif // P2P_SECURE_FILE_SHARING_P2P_NODE_HPP

@@ -36,6 +36,9 @@ private:
 class NullShardBackend final : public vault_gateway::ErasureShardBackend {
 public:
     void write_shard(const fs::path&, std::size_t, const std::vector<uint8_t>&) override {}
+    std::optional<std::vector<uint8_t>> read_shard(const fs::path&, std::size_t) override {
+        return std::nullopt;
+    }
 };
 
 std::string make_synthetic_csv_string(std::size_t rows) {

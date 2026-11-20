@@ -65,13 +65,16 @@ inline int run(std::size_t rows = 10000) {
         for (const std::string id : {"Officer-1", "Officer-2"}) {
             const std::string sig = vault_index::sign_blob_release_offline(
                 keys_dir / (id + ".priv"), id, challenge.target_token,
-                blob.blob_name, blob.wrapped_dek_hex);
+                blob.blob_name, blob.wrapped_dek_hex,
+                challenge.challenge_nonce_hex, challenge.expires_utc);
             approvals.push_back({id, sig});
         }
     }
 
     const auto t_aud0 = Clock::now();
-    const auto query_res = engine.auditor_query(target_customer, cloud_dir, approvals, "Bench-Auditor");
+    const auto query_res = engine.auditor_query(
+        target_customer, cloud_dir, approvals,
+        challenge.challenge_nonce_hex, challenge.expires_utc, "Bench-Auditor");
     const auto t_aud1 = Clock::now();
     const double audit_ms = std::chrono::duration<double, std::milli>(t_aud1 - t_aud0).count();
 
@@ -86,7 +89,7 @@ inline int run(std::size_t rows = 10000) {
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "=== BlindVault Standalone Pipeline Benchmark (" << rows << " records) ===\n"
               << "  Raw CSV Size:          " << (static_cast<double>(raw_bytes) / 1024.0) << " KiB\n"
-              << "  64KiB-Padded BVL2:     " << (static_cast<double>(artifact.padded_size_bytes) / 1024.0)
+              << "  64KiB-Aligned BVL3:    " << (static_cast<double>(artifact.padded_size_bytes) / 1024.0)
               << " KiB (3x shards @ " << (static_cast<double>(artifact.erasure_shard_bytes) / 1024.0) << " KiB)\n"
               << "  Synthetic CSV Gen:     " << gen_ms << " ms\n"
               << "  Full Egress Offload:   " << artifact.elapsed_ms << " ms  ("

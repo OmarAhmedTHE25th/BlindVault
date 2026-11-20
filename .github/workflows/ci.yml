@@ -98,3 +98,36 @@ jobs:
         with:
           name: fuzz-crash
           path: fuzz-artifacts/
+
+  pkcs11-hsm:
+    name: PKCS#11 Hardware HSM (SoftHSMv2)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies and SoftHSMv2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libboost-dev libboost-system-dev libssl-dev softhsm2 opensc
+
+      - name: Initialize SoftHSMv2 token & non-extractable keys
+        run: |
+          mkdir -p /tmp/softhsm2/tokens
+          printf "directories.tokendir = /tmp/softhsm2/tokens\nobjectstore.backend = file\nlog.level = INFO\n" > /tmp/softhsm2/softhsm2.conf
+          export SOFTHSM2_CONF=/tmp/softhsm2/softhsm2.conf
+          softhsm2-util --init-token --slot 0 --label "BlindVault-HSM" --so-pin 1234 --pin 1234
+          pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so --login --pin 1234 --token-label "BlindVault-HSM" --keygen --key-type aes:32 --label "blindvault-master-kek" --id 01
+          dd if=/dev/urandom bs=32 count=1 2>/dev/null | pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so --login --pin 1234 --token-label "BlindVault-HSM" --write-object /dev/stdin --type secrkey --key-type generic:32 --label "blindvault-index-hmac" --id 02
+          dd if=/dev/urandom bs=32 count=1 2>/dev/null | pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so --login --pin 1234 --token-label "BlindVault-HSM" --write-object /dev/stdin --type secrkey --key-type generic:32 --label "blindvault-audit-hmac" --id 03
+
+      - name: Configure and build unit tests
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target unit_tests
+
+      - name: Run Vault & PKCS#11 HSM tests
+        env:
+          SOFTHSM2_CONF: /tmp/softhsm2/softhsm2.conf
+          BLINDVAULT_PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
+          BLINDVAULT_PKCS11_PIN: "1234"
+        run: ./build/unit_tests --gtest_filter='*Vault*'
