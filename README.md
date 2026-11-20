@@ -12,6 +12,7 @@ Even if the remote storage server is compromised or inspected by an untrusted ad
 * [Hardware HSM Configuration (PKCS#11)](#hardware-hsm-configuration-pkcs11)
 * [Opening the Qt 6 Desktop Console](#opening-the-qt-6-desktop-console)
 * [CLI Usage](#cli-usage)
+* [Performance Benchmarks](#performance-benchmarks)
 * [How It Works](#how-it-works)
 * [Threat Model](#threat-model)
 * [Known Limitations](#known-limitations)
@@ -47,7 +48,7 @@ flowchart LR
 1. **Pre-Egress Sanitization & Encrypted Token Vault (`tokenizer.hpp`):** Parses RFC 4180 transaction records in memory, replaces customer names, National IDs, and IBANs with deterministic `TOK_<16-hex>` HMAC-SHA256 tokens using a KMS-derived pepper, and redacts source IP addresses (`REDACTED_IP`). Persists bidirectional mappings atomically in `vault_tokens.enc` (`BVTK` AES-256-GCM envelope with a KMS-wrapped DEK and `0600` permissions).
 2. **Traffic-Analysis Padding & AAD-Bound Encryption at Rest (`at_rest_crypto.hpp`):** Pads the scrubbed payload with CSPRNG noise to an exact multiple of **64 KiB** (`65,536` bytes) to defeat file-size traffic analysis, then seals it in a binary `BVL2` envelope using **AES-256-GCM** (96-bit IV, 128-bit authentication tag, and the blob filename bound as Additional Authenticated Data to block blob-swap attacks).
 3. **PKCS#11 HSM / KMS Key Wrapping, Memory Cleansing & Erasure Sharding (`kms_provider.hpp`, `at_rest_crypto.hpp`):** Wraps each batch's Data Encryption Key (DEK) under a Master Key Encryption Key (KEK) via **RFC 3394 (`CKM_AES_KEY_WRAP` / `EVP_aes_256_wrap`)** so zero plaintext keys ever touch disk, wipes plaintext keys and decrypted buffers from RAM via move-only RAII `OPENSSL_cleanse` (`RLIMIT_CORE=0`), and splits blobs into **2-of-3 XOR erasure shards**.
-4. **Zero-Trust Transport (`client_node.hpp` & `tls_trust.hpp`):** Streams `.enc` blobs over **TLS 1.3** with mutual certificate fingerprint verification and end-to-end **SHA-256** integrity checks.
+4. **Zero-Trust Transport (`client_node.hpp` & `tls_trust.hpp`):** Streams `.enc` blobs over **TLS 1.3** with mutual certificate fingerprint verification and end-to-end **SHA-256** integrity checks. Features resilient alert propagation: if an untrusted peer is rejected during early writes (packet header or filename payload) causing a socket broken pipe or reset, the client initiates a single read drain to pick up the pending TLS alert (`unknown ca`) and display actionable trust hints instead of raw socket failure errors.
 5. **Asymmetric Ed25519 M-of-N Quorum Auditor Re-Hydration (`vault_index.hpp` & `vault_gateway.hpp`):** Each Compliance Officer generates an Ed25519 keypair offline (`officer-keygen`) and installs only their public key (`*.pub`) on the gateway. Authorized auditors request a signing challenge (`prepare_release_challenge`) and collect detached 64-byte Ed25519 signatures from at least **2 of 3 Compliance Officers** bound to `(officer_id|target_token|blob_name|wrapped_dek_hex)`. The gateway verifies signatures via `EVP_DigestVerify`, unwraps the DEK, decrypts in memory, filters exact PII columns, re-hydrates tokens, cleanses RAM, and appends an entry to the HMAC hash-chained `regtech_audit.log`.
 
 ## Core & Hardening Features
@@ -60,7 +61,7 @@ flowchart LR
 * **RAII Memory Zeroization & Core-Dump Lock:** Move-only `SecretKey` and `SecretBuffer` types scrub sensitive material from RAM with `OPENSSL_cleanse()` on move and destruction, paired with `RLIMIT_CORE=0` process hardening.
 * **2-of-3 XOR Erasure Coding:** Generates 3 parity/data shards per encrypted batch so any 2 storage providers reconstruct the full ciphertext while 1 compromised or offline provider reveals nothing.
 * **Encrypted Bidirectional Token Vault (`BVTK`):** In-memory O(1) `TokenVault` backed by KMS-derived HMAC-SHA256 peppers and atomic AES-256-GCM disk persistence (`vault_tokens.enc`).
-* **Mutual TLS 1.3 with Per-Node Identities:** Only TLS 1.3 is accepted. Each node generates an EC P-256 keypair and self-signed certificate (with optional AES-256-CBC private key passphrase encryption), authenticating peers strictly via SHA-256 certificate fingerprints (`trusted_peers.txt`).
+* **Mutual TLS 1.3 with Per-Node Identities & Resilient Alert Propagation:** Only TLS 1.3 is accepted. Each node generates an EC P-256 keypair and self-signed certificate (with optional AES-256-CBC private key passphrase encryption), authenticating peers strictly via SHA-256 certificate fingerprints (`trusted_peers.txt`). If a receiver rejects an untrusted peer (e.g., Mallory test scenario) and drops the connection with an `unknown ca` TLS alert during early header or filename transmissions, the sender gracefully drains the pending alert from the socket rather than misattributing the failure to an ambiguous `Broken pipe` or connection reset.
 * **Disk Exhaustion Protection & Atomic Staging (`disk_budget.hpp`, `validation.hpp`):** Concurrent uploads reserve space from a shared mutex-protected budget keeping a 100 MiB safety margin, write to `.part` files, and rename atomically only after SHA-256 verification.
 
 ## Quick Start
@@ -164,6 +165,62 @@ cp offline_officers/*.pub ~/.local/share/BlindVault/BlindVault/officers/
 (cd bank_gateway && ../BlindVault send localhost 8080 payload.enc)
 ```
 
+## Performance Benchmarks
+
+Microbenchmarks and end-to-end pipeline benchmarks were executed using Google Benchmark (`bench_vault`) under the following environment:
+
+```text
+Run on (8 X 2419.2 MHz CPU s)
+CPU Caches:
+  L1 Data 48 KiB (x4)
+  L1 Instruction 32 KiB (x4)
+  L2 Unified 1280 KiB (x4)
+  L3 Unified 8192 KiB (x1)
+Load Average: 1.20, 0.81, 0.85
+```
+
+### Benchmark Summary
+
+| Benchmark | Batch / Payload Size | Real Time | CPU Time | Iterations | Throughput | Item Rate |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `BM_TokenizeCsvBatch/1000` | 1,000 records | 0.315 ms | 0.298 ms | 2,352 | 408.32 MiB/s | 3.36 M items/s |
+| `BM_TokenizeCsvBatch/10000` | 10,000 records | 2.15 ms | 2.04 ms | 336 | 595.96 MiB/s | 4.90 M items/s |
+| `BM_TokenizeCsvBatch/50000` | 50,000 records | 11.3 ms | 10.7 ms | 65 | 566.15 MiB/s | 4.66 M items/s |
+| `BM_EncryptEnvelope64KiB/65536` | 64 KiB | 45.0 µs | 42.6 µs | 16,962 | 1.43 GiB/s | — |
+| `BM_EncryptEnvelope64KiB/524288` | 512 KiB | 171 µs | 162 µs | 4,547 | 3.02 GiB/s | — |
+| `BM_EncryptEnvelope64KiB/2097152` | 2 MiB | 1,120 µs | 1,060 µs | 625 | 1.84 GiB/s | — |
+| `BM_ErasureSplit2of3/262144` | 256 KiB | 134 µs | 127 µs | 5,495 | 1.92 GiB/s | — |
+| `BM_ErasureSplit2of3/1048576` | 1 MiB | 627 µs | 593 µs | 1,085 | 1.65 GiB/s | — |
+| `BM_ErasureSplit2of3/4194304` | 4 MiB | 3,426 µs | 3,243 µs | 208 | 1.20 GiB/s | — |
+| `BM_EndToEndOffloadPipeline/1000` | 1,000 records | 2.67 ms | 2.52 ms | 288 | 48.35 MiB/s | 397.37 k items/s |
+| `BM_EndToEndOffloadPipeline/10000` | 10,000 records | 18.8 ms | 17.8 ms | 44 | 68.25 MiB/s | 561.22 k items/s |
+
+### Raw Benchmark Console Output
+
+```text
+-------------------------------------------------------------------------------------------
+Benchmark                                 Time             CPU   Iterations UserCounters...
+-------------------------------------------------------------------------------------------
+BM_TokenizeCsvBatch/1000              0.315 ms        0.298 ms         2352 bytes_per_second=408.319Mi/s items_per_second=3.35594M/s
+BM_TokenizeCsvBatch/10000              2.15 ms         2.04 ms          336 bytes_per_second=595.959Mi/s items_per_second=4.90051M/s
+BM_TokenizeCsvBatch/50000              11.3 ms         10.7 ms           65 bytes_per_second=566.146Mi/s items_per_second=4.65545M/s
+BM_EncryptEnvelope64KiB/65536          45.0 us         42.6 us        16962 bytes_per_second=1.43296Gi/s
+BM_EncryptEnvelope64KiB/524288          171 us          162 us         4547 bytes_per_second=3.0163Gi/s
+BM_EncryptEnvelope64KiB/2097152        1120 us         1060 us          625 bytes_per_second=1.84242Gi/s
+BM_ErasureSplit2of3/262144              134 us          127 us         5495 bytes_per_second=1.92418Gi/s
+BM_ErasureSplit2of3/1048576             627 us          593 us         1085 bytes_per_second=1.64593Gi/s
+BM_ErasureSplit2of3/4194304            3426 us         3243 us          208 bytes_per_second=1.20443Gi/s
+BM_EndToEndOffloadPipeline/1000        2.67 ms         2.52 ms          288 bytes_per_second=48.3479Mi/s items_per_second=397.367k/s
+BM_EndToEndOffloadPipeline/10000       18.8 ms         17.8 ms           44 bytes_per_second=68.2509Mi/s items_per_second=561.22k/s
+```
+
+### Analysis & Key Takeaways
+
+* **High-Throughput PII & IP Scrubbing:** In-memory batch tokenization peaks at **595.96 MiB/s** (~4.90 million banking transaction records/sec) via zero-copy field scanning and pre-warmed HMAC-SHA256 context re-use.
+* **Wire-Speed Envelope Encryption (`BVL2`):** Hardware-accelerated AES-256-GCM encryption with 64 KiB CSPRNG traffic padding peaks at **3.02 GiB/s** for 512 KiB payloads.
+* **Low-Overhead Erasure Sharding:** 2-of-3 XOR parity sharding sustains up to **1.92 GiB/s**, ensuring zero-knowledge multi-cloud distribution adds minimal latency.
+* **Full RegTech Egress Pipeline:** The complete end-to-end offload sequence (CSV parse $\to$ PII & IP scrubbing $\to$ 64 KiB CSPRNG padding $\to$ AES-256-GCM $\to$ RFC 3394 DEK wrap $\to$ authenticated metadata indexing $\to$ 2-of-3 erasure sharding) processes **561,220 records/sec** (~68.25 MiB/s).
+
 ## How It Works
 
 ### Wire Protocol (`protocol.hpp`)
@@ -210,7 +267,7 @@ The bidirectional PII lookup table (`vault_tokens.enc`) is stored at rest using 
 | Host disk compromise / key scraping | **PKCS#11 HSM** or **RFC 3394 AES-256 Key Wrapping** (no raw DEKs on disk; `BVTK`-encrypted token map) + RAII `OPENSSL_cleanse` + `RLIMIT_CORE=0` | Unit tests (`VaultHardening.Rfc3394KeyWrapAnd64KiBTrafficPadding`, `Tokenizer.PersistsAcrossReloadsEncryptedAtRest`) |
 | Cloud file-size / traffic inference | Fixed-bucket **64 KiB CSPRNG padding** on every `BVL2` envelope | Unit tests (`VaultHardening.Rfc3394KeyWrapAnd64KiBTrafficPadding`) |
 | Single-cloud outage or ransomware | **2-of-3 XOR Erasure Sharding** reconstructing full ciphertext from any 2 surviving shards | Unit tests (`VaultHardening.TwoOfThreeErasureCodingSurvivesCloudNodeLoss`) |
-| Eavesdropping or MITM in transit | Mutual TLS 1.3 only (TLS 1.2 refused) with strict SHA-256 fingerprint allowlisting on both ends | Unit & E2E tests (`test_e2e_trust.cpp`, `e2e_test.sh`) |
+| Eavesdropping or MITM in transit | Mutual TLS 1.3 only (TLS 1.2 refused) with strict SHA-256 fingerprint allowlisting on both ends; resilient early alert drain (`unknown ca`) diagnoses untrusted senders | Unit & E2E tests (`test_e2e_trust.cpp`, `e2e_test.sh`) |
 | Path traversal & parser corruption | Cross-OS strict filename/header validation + continuous libFuzzer + ASan/UBSan CI builds | GitHub Actions CI (`fuzz_validation`) |
 
 ## Known Limitations
