@@ -126,26 +126,23 @@ jobs:
 
       - name: Configure CMake
         run: |
+          $ref = "$env:GITHUB_REF_NAME"
+          if ($ref -match '^v?(\d+)\.(\d+)\.(\d+)') {
+            $msiVersion = "$($matches[1]).$($matches[2]).$($matches[3])"
+          } elseif ($ref -match '^v?(\d+)\.(\d+)$') {
+            $msiVersion = "$($matches[1]).$($matches[2]).0"
+          } else {
+            $msiVersion = "2.2.1"
+          }
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DP2P_BUILD_GUI=ON `
             -DP2P_BUILD_TESTS=OFF `
+            -DCPACK_PACKAGE_VERSION="$msiVersion" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
-      - name: Build Binary
-        run: cmake --build build --target BlindVault_GUI --config Release
-
-      - name: Bundle DLLs with windeployqt
-        run: |
-          mkdir dist
-          copy build\BlindVault_GUI.exe dist\
-
-          windeployqt --release --compiler-runtime dist\BlindVault_GUI.exe
-
-          copy "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\libssl-3-x64.dll" dist\
-          copy "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\libcrypto-3-x64.dll" dist\
-
-          Compress-Archive -Path dist\* -DestinationPath BlindVault-Windows-x64.zip
+      - name: Build Binaries (CLI & GUI)
+        run: cmake --build build --target BlindVault BlindVault_GUI --config Release
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
@@ -158,27 +155,43 @@ jobs:
           $env:Path = "$env:USERPROFILE\.dotnet\tools;$env:Path"
           wix extension add --global WixToolset.UI.wixext/5.0.2
 
-      - name: Build Windows MSI Installer
+      - name: Build Self-Contained Windows MSI with CPack
+        working-directory: build
         run: |
           $env:Path = "$env:USERPROFILE\.dotnet\tools;$env:Path"
-          $ref = "$env:GITHUB_REF_NAME"
-          if ($ref -match '^v?(\d+)\.(\d+)\.(\d+)') {
-            $msiVersion = "$($matches[1]).$($matches[2]).$($matches[3])"
-          } elseif ($ref -match '^v?(\d+)\.(\d+)$') {
-            $msiVersion = "$($matches[1]).$($matches[2]).0"
-          } else {
-            $msiVersion = "2.2.0"
+          cpack -G WIX -C Release --verbose
+          Copy-Item .\BlindVault-Windows-x64.msi ..\BlindVault-Windows-x64.msi -Force
+
+      - name: Verify MSI Contents
+        run: |
+          $msiPath = (Resolve-Path ".\BlindVault-Windows-x64.msi").Path
+          $extractDir = Join-Path $env:RUNNER_TEMP "msi_verify"
+          if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+          New-Item -ItemType Directory -Path $extractDir | Out-Null
+
+          $proc = Start-Process -FilePath "msiexec.exe" `
+            -ArgumentList "/a `"$msiPath`" /qn TARGETDIR=`"$extractDir`"" `
+            -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "msiexec administrative extraction failed with exit code $($proc.ExitCode)"
           }
-          wix build installer/BlindVault.wxs `
-            -arch x64 `
-            -ext WixToolset.UI.wixext `
-            -d "ProductVersion=$msiVersion" `
-            -d "DistDir=dist" `
-            -d "IconPath=assets/blindvault.ico" `
-            -d "LicenseRtf=installer/License.rtf" `
-            -d "BannerBmp=installer/banner.bmp" `
-            -d "DialogBmp=installer/dialog.bmp" `
-            -o BlindVault-Windows-x64.msi
+
+          $extractedFiles = Get-ChildItem -Path $extractDir -Recurse -File
+          foreach ($req in @("BlindVault.exe", "BlindVault_GUI.exe", "Qt6Core.dll", "libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+            if (-not ($extractedFiles | Where-Object { $_.Name -ieq $req })) {
+              throw "Missing required file inside MSI: $req"
+            }
+          }
+          if (-not ($extractedFiles | Where-Object { ($_.FullName -replace '/', '\') -ilike '*\platforms\qwindows.dll' })) {
+            throw "Missing required Qt platform plugin inside MSI: platforms\qwindows.dll"
+          }
+          $msiSizeMb = [math]::Round((Get-Item $msiPath).Length / 1MB, 2)
+          Write-Host "Verified BlindVault-Windows-x64.msi ($msiSizeMb MB) with $($extractedFiles.Count) extracted files."
+
+      - name: Package Portable Windows ZIP
+        run: |
+          cmake --install build --prefix dist --config Release
+          Compress-Archive -Path dist\bin\* -DestinationPath BlindVault-Windows-x64.zip -Force
 
       - name: Upload Windows Assets
         uses: actions/upload-artifact@v4

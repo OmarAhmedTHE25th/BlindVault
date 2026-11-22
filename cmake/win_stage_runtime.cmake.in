@@ -1,0 +1,91 @@
+# Install-time runtime staging helper for Windows MSI / portable ZIP packaging.
+# Invoked via install(CODE "include(...)") so ${CMAKE_INSTALL_PREFIX} resolves
+# to the active CPack or cmake --install staging directory.
+
+set(_bin_dir "${CMAKE_INSTALL_PREFIX}/bin")
+file(TO_CMAKE_PATH "${_bin_dir}" _bin_dir)
+
+set(_exes "")
+if(EXISTS "${_bin_dir}/BlindVault.exe")
+    list(APPEND _exes "${_bin_dir}/BlindVault.exe")
+endif()
+if(EXISTS "${_bin_dir}/BlindVault_GUI.exe")
+    list(APPEND _exes "${_bin_dir}/BlindVault_GUI.exe")
+endif()
+
+set(_search_dirs "@_runtime_search_dirs@")
+
+if(_exes)
+    file(GET_RUNTIME_DEPENDENCIES
+        EXECUTABLES ${_exes}
+        DIRECTORIES ${_search_dirs}
+        RESOLVED_DEPENDENCIES_VAR _resolved_deps
+        UNRESOLVED_DEPENDENCIES_VAR _unresolved_deps
+        PRE_EXCLUDE_REGEXES
+            "api-ms-.*"
+            "ext-ms-.*"
+            "hvsifiletrust.*"
+            "azureattestnormal.*"
+            "pdmutilities.*"
+        POST_EXCLUDE_REGEXES
+            ".*[Ss][Yy][Ss][Tt][Ee][Mm]32/.*\\.[Dd][Ll][Ll]$"
+            ".*[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/.*\\.[Dd][Ll][Ll]$"
+            ".*[Ww][Ii][Nn][Ss][Xx][Ss]/.*\\.[Dd][Ll][Ll]$"
+    )
+
+    foreach(_dep IN LISTS _resolved_deps)
+        file(INSTALL
+            DESTINATION "${_bin_dir}"
+            TYPE SHARED_LIBRARY
+            FOLLOW_SYMLINK_CHAIN
+            FILES "${_dep}"
+        )
+    endforeach()
+endif()
+
+foreach(_ssl_dll IN ITEMS "libcrypto-3-x64.dll" "libssl-3-x64.dll")
+    if(NOT EXISTS "${_bin_dir}/${_ssl_dll}")
+        find_file(_found_ssl_dll
+            NAMES "${_ssl_dll}"
+            PATHS ${_search_dirs}
+            NO_DEFAULT_PATH
+        )
+        if(_found_ssl_dll)
+            file(INSTALL
+                DESTINATION "${_bin_dir}"
+                TYPE SHARED_LIBRARY
+                FOLLOW_SYMLINK_CHAIN
+                FILES "${_found_ssl_dll}"
+            )
+        endif()
+        unset(_found_ssl_dll CACHE)
+    endif()
+    if(NOT EXISTS "${_bin_dir}/${_ssl_dll}")
+        message(FATAL_ERROR "Missing required OpenSSL DLL in ${_bin_dir}: ${_ssl_dll} (searched: ${_search_dirs})")
+    endif()
+endforeach()
+
+if(EXISTS "${_bin_dir}/BlindVault_GUI.exe")
+    set(_windeployqt "@WINDEPLOYQT_EXECUTABLE@")
+    if(NOT _windeployqt OR NOT EXISTS "${_windeployqt}")
+        message(FATAL_ERROR "windeployqt executable not found: ${_windeployqt}")
+    endif()
+
+    execute_process(
+        COMMAND "${_windeployqt}"
+            --release
+            --no-translations
+            --no-system-d3d-compiler
+            --no-opengl-sw
+            --dir "${_bin_dir}"
+            "${_bin_dir}/BlindVault_GUI.exe"
+        RESULT_VARIABLE _windeployqt_res
+    )
+    if(NOT _windeployqt_res EQUAL 0)
+        message(FATAL_ERROR "windeployqt failed with exit code ${_windeployqt_res}")
+    endif()
+
+    if(NOT EXISTS "${_bin_dir}/Qt6Core.dll" OR NOT EXISTS "${_bin_dir}/platforms/qwindows.dll")
+        message(FATAL_ERROR "windeployqt failed to stage Qt6Core.dll and platforms/qwindows.dll into ${_bin_dir}")
+    endif()
+endif()
