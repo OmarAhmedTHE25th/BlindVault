@@ -160,6 +160,7 @@ jobs:
         run: |
           $env:Path = "$env:USERPROFILE\.dotnet\tools;$env:Path"
           cpack -G WIX -C Release --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item .\BlindVault-Windows-x64.msi ..\BlindVault-Windows-x64.msi -Force
 
       - name: Verify MSI Contents
