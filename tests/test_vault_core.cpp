@@ -17,6 +17,12 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <openssl/evp.h>
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "at_rest_crypto.hpp"
 #include "control_client.hpp"
 #include "s3_shard_backend.hpp"
@@ -1184,4 +1190,343 @@ TEST(VaultHsm, Pkcs11HardwareRoundTripAndNonExtractableKek) {
     EXPECT_TRUE(gw2.metadata_index().verify_audit_chain());
 #endif
 }
+
+// ---------------- Atomic, Durable, 0600 Secret File Writer ----------------
+
+#ifndef _WIN32
+namespace {
+
+struct SyscallFaultState {
+    int fail_open_after = -1;
+    int open_errno = EACCES;
+    int fail_write_after = -1;
+    int write_errno = ENOSPC;
+    std::size_t max_write_chunk = 0; // 0 = unlimited
+    bool inject_eintr_on_write = false;
+    int fail_fsync_after = -1;
+    int fsync_errno = EIO;
+    int fail_close_after = -1;
+    int close_errno = EIO;
+    int fail_rename_after = -1;
+    int rename_errno = EXDEV;
+
+    int open_calls = 0;
+    int write_calls = 0;
+    int fsync_calls = 0;
+    int close_calls = 0;
+    int rename_calls = 0;
+    int unlink_calls = 0;
+    int first_open_flags = 0;
+    unsigned int first_open_mode = 0;
+    std::vector<std::string> call_sequence;
+};
+
+SyscallFaultState* g_fault_state = nullptr;
+
+int fault_open(const char* path, int flags, unsigned int mode) {
+    auto* st = g_fault_state;
+    const int idx = st->open_calls++;
+    if (idx == 0) {
+        st->first_open_flags = flags;
+        st->first_open_mode = mode;
+        st->call_sequence.push_back("open_tmp");
+    } else {
+        st->call_sequence.push_back("open_dir");
+    }
+    if (st->fail_open_after >= 0 && idx == st->fail_open_after) {
+        errno = st->open_errno;
+        return -1;
+    }
+    return ::open(path, flags, static_cast<mode_t>(mode));
+}
+
+ssize_t fault_write(int fd, const void* buf, std::size_t count) {
+    auto* st = g_fault_state;
+    const int idx = st->write_calls++;
+    st->call_sequence.push_back("write");
+    if (st->inject_eintr_on_write && idx == 0) {
+        errno = EINTR;
+        return -1;
+    }
+    if (st->fail_write_after >= 0 && idx == st->fail_write_after) {
+        errno = st->write_errno;
+        return -1;
+    }
+    const std::size_t n = (st->max_write_chunk > 0) ? std::min(count, st->max_write_chunk) : count;
+    return ::write(fd, buf, n);
+}
+
+int fault_fsync(int fd) {
+    auto* st = g_fault_state;
+    const int idx = st->fsync_calls++;
+    st->call_sequence.push_back(idx == 0 ? "fsync_file" : "fsync_dir");
+    if (st->fail_fsync_after >= 0 && idx == st->fail_fsync_after) {
+        errno = st->fsync_errno;
+        return -1;
+    }
+    return ::fsync(fd);
+}
+
+int fault_close(int fd) {
+    auto* st = g_fault_state;
+    const int idx = st->close_calls++;
+    st->call_sequence.push_back(idx == 0 ? "close_file" : "close_dir");
+    if (st->fail_close_after >= 0 && idx == st->fail_close_after) {
+        // Still close the real fd to avoid leaking descriptors in the test process, then report failure.
+        (void)::close(fd);
+        errno = st->close_errno;
+        return -1;
+    }
+    return ::close(fd);
+}
+
+int fault_rename(const char* oldpath, const char* newpath) {
+    auto* st = g_fault_state;
+    const int idx = st->rename_calls++;
+    st->call_sequence.push_back("rename");
+    if (st->fail_rename_after >= 0 && idx == st->fail_rename_after) {
+        errno = st->rename_errno;
+        return -1;
+    }
+    return ::rename(oldpath, newpath);
+}
+
+int fault_unlink(const char* path) {
+    auto* st = g_fault_state;
+    st->unlink_calls++;
+    st->call_sequence.push_back("unlink");
+    return ::unlink(path);
+}
+
+vault_crypto::detail::PosixFileOps make_fault_ops() {
+    return vault_crypto::detail::PosixFileOps{
+        &fault_open,
+        &fault_write,
+        &fault_fsync,
+        &fault_close,
+        &fault_rename,
+        &fault_unlink
+    };
+}
+
+std::size_t count_tmp_files(const std::filesystem::path& dir) {
+    std::size_t n = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().filename().string().find(".tmp.") != std::string::npos) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+} // namespace
+
+TEST(VaultCrypto, WriteSecretFile0600AtomicPermissionsAndDurability) {
+    TempDir dir;
+    const auto target = dir.file("master.secret");
+    const std::string payload = "TOP_SECRET_KEY_MATERIAL_1234567890";
+
+    // Temporarily set permissive umask (0000) to prove 0600 is enforced at open() time, not via umask/chmod
+    const mode_t old_umask = ::umask(0000);
+    struct UmaskRestore {
+        mode_t prev;
+        ~UmaskRestore() { ::umask(prev); }
+    } umask_guard{old_umask};
+
+    SyscallFaultState st;
+    st.max_write_chunk = 5;         // Force multiple partial writes
+    st.inject_eintr_on_write = true; // Force EINTR retry handling
+    g_fault_state = &st;
+
+    vault_crypto::detail::write_secret_file_0600_posix(target, payload, make_fault_ops());
+    g_fault_state = nullptr;
+
+    // Verify open() created with O_CREAT | O_EXCL | O_WRONLY and mode 0600 directly
+    EXPECT_EQ(st.first_open_flags & (O_CREAT | O_EXCL | O_WRONLY), (O_CREAT | O_EXCL | O_WRONLY));
+    EXPECT_EQ(st.first_open_mode, 0600u);
+
+    // Verify exact durability ordering: open_tmp -> write(s) -> fsync_file -> close_file -> rename -> open_dir -> fsync_dir -> close_dir
+    ASSERT_GE(st.call_sequence.size(), 8u);
+    EXPECT_EQ(st.call_sequence.front(), "open_tmp");
+    EXPECT_EQ(st.fsync_calls, 2);
+    EXPECT_EQ(st.rename_calls, 1);
+    EXPECT_EQ(st.unlink_calls, 0);
+    EXPECT_GT(st.write_calls, 2);
+    const auto n = st.call_sequence.size();
+    EXPECT_EQ(st.call_sequence[n - 6], "fsync_file");
+    EXPECT_EQ(st.call_sequence[n - 5], "close_file");
+    EXPECT_EQ(st.call_sequence[n - 4], "rename");
+    EXPECT_EQ(st.call_sequence[n - 3], "open_dir");
+    EXPECT_EQ(st.call_sequence[n - 2], "fsync_dir");
+    EXPECT_EQ(st.call_sequence[n - 1], "close_dir");
+
+    // Verify on-disk permissions are exactly 0600 and content matches byte-for-byte
+    struct stat sb{};
+    ASSERT_EQ(::stat(target.c_str(), &sb), 0);
+    EXPECT_EQ(sb.st_mode & 0777, 0600);
+    EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+
+    const auto disk_bytes = vault_crypto::read_bytes_from_file(target.string());
+    EXPECT_EQ(std::string(disk_bytes.begin(), disk_bytes.end()), payload);
+}
+
+TEST(VaultCrypto, WriteSecretFile0600SimulatedSyscallFailures) {
+    TempDir dir;
+    const auto target = dir.file("protected.secret");
+    vault_crypto::write_secret_file_0600(target, "ORIGINAL_CONTENT");
+
+    auto read_target = [&]() {
+        const auto bytes = vault_crypto::read_bytes_from_file(target.string());
+        return std::string(bytes.begin(), bytes.end());
+    };
+
+    // 1. open(tmp) failure -> reports EACCES, leaves target untouched and zero temp files
+    {
+        SyscallFaultState st;
+        st.fail_open_after = 0;
+        st.open_errno = EACCES;
+        g_fault_state = &st;
+        try {
+            vault_crypto::detail::write_secret_file_0600_posix(target, "NEW_DATA", make_fault_ops());
+            FAIL() << "Expected open failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("open(O_CREAT|O_EXCL, 0600)"), std::string::npos);
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(EACCES)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(read_target(), "ORIGINAL_CONTENT");
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 2. write() failure mid-stream -> reports ENOSPC (not clobbered by close/unlink), unlinks temp file
+    {
+        SyscallFaultState st;
+        st.max_write_chunk = 3;
+        st.fail_write_after = 1;
+        st.write_errno = ENOSPC;
+        g_fault_state = &st;
+        try {
+            vault_crypto::detail::write_secret_file_0600_posix(target, "NEW_DATA_PAYLOAD", make_fault_ops());
+            FAIL() << "Expected write failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("write"), std::string::npos);
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(ENOSPC)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(st.unlink_calls, 1);
+        EXPECT_EQ(read_target(), "ORIGINAL_CONTENT");
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 3. fsync(file) failure -> reports EIO (not clobbered), unlinks temp file, target untouched
+    {
+        SyscallFaultState st;
+        st.fail_fsync_after = 0;
+        st.fsync_errno = EIO;
+        g_fault_state = &st;
+        try {
+            vault_crypto::detail::write_secret_file_0600_posix(target, "NEW_DATA", make_fault_ops());
+            FAIL() << "Expected fsync(file) failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("fsync(file)"), std::string::npos);
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(EIO)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(st.unlink_calls, 1);
+        EXPECT_EQ(read_target(), "ORIGINAL_CONTENT");
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 4. close(file) failure -> reports EIO, unlinks temp file, target untouched
+    {
+        SyscallFaultState st;
+        st.fail_close_after = 0;
+        st.close_errno = EIO;
+        g_fault_state = &st;
+        try {
+            vault_crypto::detail::write_secret_file_0600_posix(target, "NEW_DATA", make_fault_ops());
+            FAIL() << "Expected close(file) failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("close(file)"), std::string::npos);
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(EIO)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(st.unlink_calls, 1);
+        EXPECT_EQ(read_target(), "ORIGINAL_CONTENT");
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 5. rename() failure -> reports EXDEV, unlinks temp file, target untouched
+    {
+        SyscallFaultState st;
+        st.fail_rename_after = 0;
+        st.rename_errno = EXDEV;
+        g_fault_state = &st;
+        try {
+            vault_crypto::detail::write_secret_file_0600_posix(target, "NEW_DATA", make_fault_ops());
+            FAIL() << "Expected rename failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("rename"), std::string::npos);
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(EXDEV)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(st.unlink_calls, 1);
+        EXPECT_EQ(read_target(), "ORIGINAL_CONTENT");
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 6. open(parent_dir) failure after rename -> reports EACCES
+    {
+        SyscallFaultState st;
+        st.fail_open_after = 1;
+        st.open_errno = EACCES;
+        g_fault_state = &st;
+        try {
+            vault_crypto::detail::write_secret_file_0600_posix(target, "UPDATED_V1", make_fault_ops());
+            FAIL() << "Expected open(parent_dir) failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("open(parent_dir)"), std::string::npos);
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(EACCES)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 7. fsync(parent_dir) failure -> reports EIO (not clobbered by close(dir_fd))
+    {
+        SyscallFaultState st;
+        st.fail_fsync_after = 1;
+        st.fsync_errno = EIO;
+        g_fault_state = &st;
+        try {
+            vault_crypto::detail::write_secret_file_0600_posix(target, "UPDATED_V2", make_fault_ops());
+            FAIL() << "Expected fsync(parent_dir) failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("fsync(parent_dir)"), std::string::npos);
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(EIO)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(st.close_calls, 2);
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 8. close(parent_dir) failure -> reports EIO
+    {
+        SyscallFaultState st;
+        st.fail_close_after = 1;
+        st.close_errno = EIO;
+        g_fault_state = &st;
+        try {
+            vault_crypto::detail::write_secret_file_0600_posix(target, "UPDATED_V3", make_fault_ops());
+            FAIL() << "Expected close(parent_dir) failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("close(parent_dir)"), std::string::npos);
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(EIO)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+}
+#endif
+
 

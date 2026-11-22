@@ -18,6 +18,10 @@
 #include <vector>
 #include <openssl/crypto.h>
 
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
+
 namespace vault_crypto {
 
 inline constexpr std::array<uint8_t, 4> MAGIC      = {'B', 'V', 'L', '2'};
@@ -111,6 +115,26 @@ SecretKey generate_key();
 std::string bytes_to_hex(const uint8_t* data, std::size_t len);
 std::vector<uint8_t> hex_to_bytes(const std::string& hex_str);
 void write_secret_file_0600(const std::filesystem::path& path, const std::string& content);
+
+#ifndef _WIN32
+namespace detail {
+
+struct PosixFileOps {
+    int (*open_fn)(const char* path, int flags, unsigned int mode) = nullptr;
+    ssize_t (*write_fn)(int fd, const void* buf, std::size_t count) = nullptr;
+    int (*fsync_fn)(int fd) = nullptr;
+    int (*close_fn)(int fd) = nullptr;
+    int (*rename_fn)(const char* oldpath, const char* newpath) = nullptr;
+    int (*unlink_fn)(const char* path) = nullptr;
+};
+
+PosixFileOps default_posix_file_ops() noexcept;
+void write_secret_file_0600_posix(const std::filesystem::path& path,
+                                  const std::string& content,
+                                  const PosixFileOps& ops);
+
+} // namespace detail
+#endif
 std::string hmac_sha256_hex(const uint8_t* key, std::size_t key_len, std::string_view message);
 SecretKey derive_subkey(const SecretKey& master_key, std::string_view context_label);
 bool constant_time_hex_equal(const std::string& hex_a, const std::string& hex_b);

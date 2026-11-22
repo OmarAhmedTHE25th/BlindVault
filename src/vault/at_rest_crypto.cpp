@@ -1,6 +1,8 @@
 #include "at_rest_crypto.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -11,8 +13,19 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace vault_crypto {
@@ -97,24 +110,277 @@ std::vector<uint8_t> hex_to_bytes(const std::string& hex_str) {
     return out;
 }
 
-void write_secret_file_0600(const std::filesystem::path& path, const std::string& content) {
-    std::filesystem::path tmp = path;
-    tmp += ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("vault_crypto: cannot open " + tmp.string());
-        out.write(content.data(), static_cast<std::streamsize>(content.size()));
-        out.flush();
-        if (!out) throw std::runtime_error("vault_crypto: failed writing " + tmp.string());
+#ifndef _WIN32
+namespace detail {
+
+namespace {
+
+int default_open_wrapper(const char* path, int flags, unsigned int mode) {
+    return ::open(path, flags, static_cast<mode_t>(mode));
+}
+
+ssize_t default_write_wrapper(int fd, const void* buf, std::size_t count) {
+    return ::write(fd, buf, count);
+}
+
+int default_fsync_wrapper(int fd) {
+    return ::fsync(fd);
+}
+
+int default_close_wrapper(int fd) {
+    return ::close(fd);
+}
+
+int default_rename_wrapper(const char* oldpath, const char* newpath) {
+    return ::rename(oldpath, newpath);
+}
+
+int default_unlink_wrapper(const char* path) {
+    return ::unlink(path);
+}
+
+std::string make_temp_secret_path(const std::filesystem::path& target_path) {
+    std::array<uint8_t, 8> rnd{};
+    if (RAND_bytes(rnd.data(), static_cast<int>(rnd.size())) != 1) {
+        throw std::runtime_error("vault_crypto: RAND_bytes failed while creating temp filename");
     }
-    std::error_code ec;
-    std::filesystem::permissions(
-        tmp,
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-        std::filesystem::perm_options::replace,
-        ec);
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) throw std::runtime_error("vault_crypto: atomic rename failed: " + ec.message());
+    const std::filesystem::path dir =
+        target_path.parent_path().empty() ? std::filesystem::path(".") : target_path.parent_path();
+    const std::string name =
+        "." + target_path.filename().string() + ".tmp." + bytes_to_hex(rnd.data(), rnd.size());
+    return (dir / name).string();
+}
+
+std::string format_errno_msg(const char* step, const std::string& path_str, int err_num) {
+    return std::string("vault_crypto: write_secret_file_0600 ") + step + " failed for '" +
+           path_str + "' (errno=" + std::to_string(err_num) + ": " + std::strerror(err_num) + ")";
+}
+
+} // namespace
+
+PosixFileOps default_posix_file_ops() noexcept {
+    return PosixFileOps{
+        &default_open_wrapper,
+        &default_write_wrapper,
+        &default_fsync_wrapper,
+        &default_close_wrapper,
+        &default_rename_wrapper,
+        &default_unlink_wrapper
+    };
+}
+
+void write_secret_file_0600_posix(const std::filesystem::path& path,
+                                  const std::string& content,
+                                  const PosixFileOps& ops) {
+    if (!ops.open_fn || !ops.write_fn || !ops.fsync_fn ||
+        !ops.close_fn || !ops.rename_fn || !ops.unlink_fn) {
+        throw std::invalid_argument("vault_crypto: PosixFileOps contains a null function pointer");
+    }
+
+    int create_flags = O_CREAT | O_EXCL | O_WRONLY;
+#ifdef O_NOFOLLOW
+    create_flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+    create_flags |= O_CLOEXEC;
+#endif
+
+    // 1. Atomically create an exclusive temporary file with 0600 permissions at creation time.
+    int fd = -1;
+    std::string tmp_str;
+    int open_err = 0;
+    constexpr int kMaxCreateAttempts = 16;
+    for (int attempt = 0; attempt < kMaxCreateAttempts; ++attempt) {
+        tmp_str = make_temp_secret_path(path);
+        fd = ops.open_fn(tmp_str.c_str(), create_flags, 0600u);
+        if (fd >= 0) {
+            open_err = 0;
+            break;
+        }
+        open_err = errno;
+        if (open_err == EEXIST || open_err == EINTR) {
+            continue;
+        }
+        throw std::runtime_error(format_errno_msg("open(O_CREAT|O_EXCL, 0600)", tmp_str, open_err));
+    }
+    if (fd < 0) {
+        throw std::runtime_error(format_errno_msg("open(O_CREAT|O_EXCL, 0600)", tmp_str, open_err));
+    }
+
+    auto cleanup_fd_and_tmp = [&](int& open_fd) noexcept {
+        if (open_fd >= 0) {
+            (void)ops.close_fn(open_fd);
+            open_fd = -1;
+        }
+        (void)ops.unlink_fn(tmp_str.c_str());
+    };
+
+    // 2. Write complete buffer, handling partial writes and EINTR without clobbering errors.
+    std::size_t total_written = 0;
+    while (total_written < content.size()) {
+        const ssize_t written = ops.write_fn(
+            fd, content.data() + total_written, content.size() - total_written);
+        if (written < 0) {
+            const int write_err = errno;
+            if (write_err == EINTR) {
+                continue;
+            }
+            cleanup_fd_and_tmp(fd);
+            throw std::runtime_error(format_errno_msg("write", tmp_str, write_err));
+        }
+        if (written == 0) {
+            const int write_zero_err = EIO;
+            cleanup_fd_and_tmp(fd);
+            throw std::runtime_error(format_errno_msg("write (zero-byte progress)", tmp_str, write_zero_err));
+        }
+        total_written += static_cast<std::size_t>(written);
+    }
+
+    // 3. Flush file data & metadata to stable storage prior to closing and renaming.
+    for (;;) {
+        if (ops.fsync_fn(fd) == 0) {
+            break;
+        }
+        const int fsync_err = errno;
+        if (fsync_err == EINTR) {
+            continue;
+        }
+        cleanup_fd_and_tmp(fd);
+        throw std::runtime_error(format_errno_msg("fsync(file)", tmp_str, fsync_err));
+    }
+
+    // 4. Explicitly check close() before rename so deferred I/O errors are never lost.
+    const int close_rc = ops.close_fn(fd);
+    fd = -1;
+    if (close_rc != 0) {
+        const int close_err = errno;
+        (void)ops.unlink_fn(tmp_str.c_str());
+        throw std::runtime_error(format_errno_msg("close(file)", tmp_str, close_err));
+    }
+
+    // 5. Atomically replace target path via rename().
+    const std::string target_str = path.string();
+    if (ops.rename_fn(tmp_str.c_str(), target_str.c_str()) != 0) {
+        const int rename_err = errno;
+        (void)ops.unlink_fn(tmp_str.c_str());
+        throw std::runtime_error(format_errno_msg("rename", target_str, rename_err));
+    }
+
+    // 6. fsync() the parent directory so the atomic directory entry update is durable.
+    const std::filesystem::path parent =
+        path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+    const std::string dir_str = parent.string();
+    int dir_flags = O_RDONLY;
+#ifdef O_DIRECTORY
+    dir_flags |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+    dir_flags |= O_CLOEXEC;
+#endif
+
+    int dir_fd = -1;
+    for (;;) {
+        dir_fd = ops.open_fn(dir_str.c_str(), dir_flags, 0u);
+        if (dir_fd >= 0) {
+            break;
+        }
+        const int dir_open_err = errno;
+        if (dir_open_err == EINTR) {
+            continue;
+        }
+        throw std::runtime_error(format_errno_msg("open(parent_dir)", dir_str, dir_open_err));
+    }
+
+    for (;;) {
+        if (ops.fsync_fn(dir_fd) == 0) {
+            break;
+        }
+        const int dir_fsync_err = errno;
+        if (dir_fsync_err == EINTR) {
+            continue;
+        }
+        (void)ops.close_fn(dir_fd);
+        throw std::runtime_error(format_errno_msg("fsync(parent_dir)", dir_str, dir_fsync_err));
+    }
+
+    if (ops.close_fn(dir_fd) != 0) {
+        const int dir_close_err = errno;
+        throw std::runtime_error(format_errno_msg("close(parent_dir)", dir_str, dir_close_err));
+    }
+}
+
+} // namespace detail
+#endif
+
+void write_secret_file_0600(const std::filesystem::path& path, const std::string& content) {
+#ifndef _WIN32
+    detail::write_secret_file_0600_posix(path, content, detail::default_posix_file_ops());
+#else
+    std::array<uint8_t, 8> rnd{};
+    if (RAND_bytes(rnd.data(), static_cast<int>(rnd.size())) != 1) {
+        throw std::runtime_error("vault_crypto: RAND_bytes failed while creating temp filename");
+    }
+    const std::filesystem::path dir =
+        path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+    const std::filesystem::path tmp =
+        dir / ("." + path.filename().string() + ".tmp." + bytes_to_hex(rnd.data(), rnd.size()));
+
+    HANDLE h = CreateFileW(
+        tmp.c_str(),
+        GENERIC_WRITE,
+        0, // Exclusive access (no sharing)
+        nullptr,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD create_err = GetLastError();
+        throw std::runtime_error(
+            "vault_crypto: CreateFileW(CREATE_NEW) failed for '" + tmp.string() +
+            "' (win32=" + std::to_string(create_err) + ")");
+    }
+
+    std::size_t total_written = 0;
+    while (total_written < content.size()) {
+        const DWORD chunk = static_cast<DWORD>(
+            std::min<std::size_t>(content.size() - total_written, 0x7FFFFFFFu));
+        DWORD written = 0;
+        if (!WriteFile(h, content.data() + total_written, chunk, &written, nullptr) || written == 0) {
+            const DWORD write_err = GetLastError();
+            CloseHandle(h);
+            DeleteFileW(tmp.c_str());
+            throw std::runtime_error(
+                "vault_crypto: WriteFile failed for '" + tmp.string() +
+                "' (win32=" + std::to_string(write_err) + ")");
+        }
+        total_written += static_cast<std::size_t>(written);
+    }
+
+    if (!FlushFileBuffers(h)) {
+        const DWORD flush_err = GetLastError();
+        CloseHandle(h);
+        DeleteFileW(tmp.c_str());
+        throw std::runtime_error(
+            "vault_crypto: FlushFileBuffers failed for '" + tmp.string() +
+            "' (win32=" + std::to_string(flush_err) + ")");
+    }
+
+    if (!CloseHandle(h)) {
+        const DWORD close_err = GetLastError();
+        DeleteFileW(tmp.c_str());
+        throw std::runtime_error(
+            "vault_crypto: CloseHandle failed for '" + tmp.string() +
+            "' (win32=" + std::to_string(close_err) + ")");
+    }
+
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD move_err = GetLastError();
+        DeleteFileW(tmp.c_str());
+        throw std::runtime_error(
+            "vault_crypto: MoveFileExW failed for '" + path.string() +
+            "' (win32=" + std::to_string(move_err) + ")");
+    }
+#endif
 }
 
 std::string hmac_sha256_hex(const uint8_t* key, std::size_t key_len, std::string_view message) {
