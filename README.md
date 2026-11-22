@@ -1,3 +1,7 @@
+<p align="left">
+  <img src="assets/logo.svg" alt="BlindVault — Zero-Knowledge Storage Gateway" width="376" />
+</p>
+
 # BlindVault — Hardened Zero-Knowledge RegTech Storage Gateway
 
 A high-throughput, zero-knowledge storage gateway and secure transfer engine written in C++20 with Boost.Asio, Boost.Beast, OpenSSL 3, and Qt 6. Designed for banking and RegTech compliance, **BlindVault** sits between a bank's core transaction perimeter and low-cost commodity cloud storage—streaming CSV batches through an `O(1)`-RAM HMAC tokenizer, encrypting payloads at rest with **chunked streaming AES-256-GCM (`BVL3`)** aligned to fixed 64 KiB buckets (with automatic legacy `BVL2` read compatibility), wrapping batch keys under a Master KEK via **RFC 3394** (backed by PKCS#11 HSM or local software KMS), splitting 2-of-3 erasure shards across local or multi-bucket S3 object stores, and streaming blobs over **mutual TLS 1.3** (direct or via the companion `blindvault-control` NAT-traversal / relay control plane).
