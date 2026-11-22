@@ -50,19 +50,6 @@ jobs:
           Terminal=false
           EOF
 
-          if [ ! -f blindvault_icon.png ]; then
-            python3 -c "
-          import struct, zlib
-          def make_png(w, h, r, g, b):
-              raw = b''.join([b'\x00' + bytes([r, g, b]) * w for _ in range(h)])
-              def chunk(tag, data):
-                  return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
-              return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b'')
-          with open('blindvault_icon.png', 'wb') as f:
-              f.write(make_png(256, 256, 37, 99, 235))
-          "
-          fi
-
       - name: Build Project (Release)
         run: |
           cmake -S . -B build -G Ninja \
@@ -84,7 +71,7 @@ jobs:
             --appdir AppDir \
             -e build/BlindVault_GUI \
             -d blindvault.desktop \
-            -i blindvault_icon.png \
+            -i assets/blindvault_icon.png \
             --plugin qt \
             --output appimage
 

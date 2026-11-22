@@ -11,6 +11,7 @@
 #include <QTimer>
 #include <QStandardPaths>
 #include <QDir>
+#include <QPixmap>
 #include <filesystem>
 #include "identity.hpp"
 #include "trust_store.hpp"
@@ -166,10 +167,20 @@ void MainWindow::setupUi() {
     idLayout->setSpacing(10);
 
     auto* idHeaderLayout = new QHBoxLayout();
+    auto* logoLabel = new QLabel(centralWidget);
+    logoLabel->setFixedSize(34, 34);
+    logoLabel->setAlignment(Qt::AlignCenter);
+    logoLabel->setStyleSheet("background: transparent;");
+    const QPixmap logoPix(":/icons/blindvault_icon_64.png");
+    if (!logoPix.isNull()) {
+        logoLabel->setPixmap(logoPix.scaled(32, 32, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    }
     auto* appTitle = new QLabel("BlindVault — Hardened Zero-Knowledge RegTech Gateway", centralWidget);
     appTitle->setObjectName("appTitle");
     auto* badge = new QLabel("RFC 3394 KEK + Ed25519 2-of-3 Quorum + AES-256-GCM + mTLS 1.3", centralWidget);
     badge->setObjectName("badge");
+    idHeaderLayout->setSpacing(10);
+    idHeaderLayout->addWidget(logoLabel);
     idHeaderLayout->addWidget(appTitle);
     idHeaderLayout->addStretch();
     idHeaderLayout->addWidget(badge);

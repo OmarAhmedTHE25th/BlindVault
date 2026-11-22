@@ -1,11 +1,18 @@
 #include <QApplication>
 #include "main_window.hpp"
+#include <QIcon>
 #include <QStyleFactory>
 
 int main(int argc, char* argv[]) {
     QCoreApplication::setOrganizationName("BlindVault");
     QCoreApplication::setApplicationName("BlindVault");
     QApplication app(argc, argv);
+
+    QIcon appIcon;
+    appIcon.addFile(":/icons/blindvault_icon_32.png", QSize(32, 32));
+    appIcon.addFile(":/icons/blindvault_icon_64.png", QSize(64, 64));
+    appIcon.addFile(":/icons/blindvault_icon_256.png", QSize(256, 256));
+    app.setWindowIcon(appIcon);
     if (auto* fusion = QStyleFactory::create("Fusion")) {
         QApplication::setStyle(fusion);
     }

@@ -1,0 +1,7 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="blindvault_icon_32.png">../assets/blindvault_icon_32.png</file>
+    <file alias="blindvault_icon_64.png">../assets/blindvault_icon_64.png</file>
+    <file alias="blindvault_icon_256.png">../assets/blindvault_icon.png</file>
+  </qresource>
+</RCC>

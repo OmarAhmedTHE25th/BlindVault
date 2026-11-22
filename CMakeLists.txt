@@ -94,7 +94,11 @@ if(P2P_BUILD_GUI)
             gui/network_bridge.hpp
             gui/network_bridge.cpp
             gui/log_redirect.hpp
+            gui/resources.qrc
     )
+    if(WIN32)
+        target_sources(BlindVault_GUI PRIVATE gui/blindvault.rc)
+    endif()
     target_include_directories(BlindVault_GUI PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/gui
     )
