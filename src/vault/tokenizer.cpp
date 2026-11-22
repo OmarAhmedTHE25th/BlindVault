@@ -1,8 +1,9 @@
-#include <algorithm>
 #include "tokenizer.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <openssl/crypto.h>
 #include <openssl/core_names.h>
@@ -11,56 +12,309 @@
 
 namespace vault_token {
 
-std::size_t split_csv_line_views(std::string_view line, std::array<std::string_view, 8>& out_views) noexcept {
-    if (line.find('"') != std::string_view::npos) {
-        return 0;
-    }
-    std::size_t start = 0;
-    std::size_t count = 0;
-    while (count < 8) {
-        const std::size_t comma = line.find(',', start);
-        if (comma == std::string_view::npos) {
-            out_views[count++] = line.substr(start);
-            break;
-        }
-        out_views[count++] = line.substr(start, comma - start);
-        start = comma + 1;
-    }
-    return count;
+namespace {
+
+constexpr std::uint64_t kMaxCollisionAttempts = 4096;
+
+[[noreturn]] void log_and_throw_csv_error(const std::string& msg) {
+    std::cerr << "[BlindVault CSV Error] " << msg << '\n';
+    throw std::runtime_error(msg);
 }
 
-std::vector<std::string> parse_csv_row(std::string_view line) {
-    std::vector<std::string> fields;
-    fields.reserve(8);
-    std::string cur;
-    bool in_quotes = false;
+void validate_column_count(const std::vector<std::string>& cols,
+                           std::size_t record_index,
+                           std::size_t start_line,
+                           const char* context) {
+    if (cols.size() != EXPECTED_CSV_COLUMNS) {
+        std::ostringstream oss;
+        oss << context << ": malformed CSV at record " << record_index
+            << " (line " << start_line << "): expected exactly "
+            << EXPECTED_CSV_COLUMNS << " columns, got " << cols.size();
+        log_and_throw_csv_error(oss.str());
+    }
+}
 
-    for (std::size_t i = 0; i < line.size(); ++i) {
-        const char c = line[i];
-        if (in_quotes) {
-            if (c == '"') {
-                if (i + 1 < line.size() && line[i + 1] == '"') {
-                    cur.push_back('"');
-                    ++i;
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                cur.push_back(c);
-            }
-        } else {
-            if (c == '"') {
-                in_quotes = true;
-            } else if (c == ',') {
-                fields.push_back(std::move(cur));
-                cur.clear();
-            } else {
-                cur.push_back(c);
-            }
+std::string escape_tsv_value(std::string_view raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        switch (c) {
+            case '\\': out.append("\\\\"); break;
+            case '\n': out.append("\\n"); break;
+            case '\r': out.append("\\r"); break;
+            case '\t': out.append("\\t"); break;
+            default:   out.push_back(c); break;
         }
     }
-    fields.push_back(std::move(cur));
-    return fields;
+    return out;
+}
+
+std::string unescape_tsv_value(std::string_view escaped) {
+    std::string out;
+    out.reserve(escaped.size());
+    for (std::size_t i = 0; i < escaped.size(); ++i) {
+        if (escaped[i] == '\\' && i + 1 < escaped.size()) {
+            const char next = escaped[++i];
+            switch (next) {
+                case '\\': out.push_back('\\'); break;
+                case 'n':  out.push_back('\n'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 't':  out.push_back('\t'); break;
+                default:
+                    out.push_back('\\');
+                    out.push_back(next);
+                    break;
+            }
+        } else {
+            out.push_back(escaped[i]);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+CsvStreamParser::~CsvStreamParser() {
+    cleanse_buffers();
+}
+
+void CsvStreamParser::cleanse_buffers() noexcept {
+    if (!current_field_.empty()) {
+        OPENSSL_cleanse(current_field_.data(), current_field_.size());
+        current_field_.clear();
+    }
+    for (auto& field : current_record_) {
+        if (!field.empty()) {
+            OPENSSL_cleanse(field.data(), field.size());
+        }
+    }
+    current_record_.clear();
+}
+
+void CsvStreamParser::reset() noexcept {
+    cleanse_buffers();
+    state_ = State::FieldStart;
+    in_record_ = false;
+    line_number_ = 1;
+    record_index_ = 0;
+    record_start_line_ = 1;
+}
+
+void CsvStreamParser::emit_current_record(const RecordCallback& on_record) {
+    ++record_index_;
+    try {
+        on_record(current_record_, record_index_, record_start_line_);
+    } catch (...) {
+        cleanse_buffers();
+        in_record_ = false;
+        throw;
+    }
+    for (auto& field : current_record_) {
+        if (!field.empty()) {
+            OPENSSL_cleanse(field.data(), field.size());
+        }
+    }
+    current_record_.clear();
+    in_record_ = false;
+}
+
+void CsvStreamParser::feed(std::string_view chunk, const RecordCallback& on_record) {
+    for (std::size_t i = 0; i < chunk.size(); ++i) {
+        const char c = chunk[i];
+
+        if (state_ == State::AfterCr) {
+            if (c == '\n') {
+                ++line_number_;
+                state_ = State::FieldStart;
+                continue;
+            }
+            // Bare CR line ending: transition to FieldStart and process current char.
+            ++line_number_;
+            state_ = State::FieldStart;
+        }
+
+        switch (state_) {
+            case State::FieldStart:
+                if (c == '"') {
+                    if (!in_record_) {
+                        record_start_line_ = line_number_;
+                        in_record_ = true;
+                    }
+                    state_ = State::QuotedField;
+                } else if (c == ',') {
+                    if (!in_record_) {
+                        record_start_line_ = line_number_;
+                        in_record_ = true;
+                    }
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                } else if (c == '\r') {
+                    if (!in_record_) {
+                        record_start_line_ = line_number_;
+                    }
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                    emit_current_record(on_record);
+                    state_ = State::AfterCr;
+                } else if (c == '\n') {
+                    if (!in_record_) {
+                        record_start_line_ = line_number_;
+                    }
+                    ++line_number_;
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                    emit_current_record(on_record);
+                    state_ = State::FieldStart;
+                } else {
+                    if (!in_record_) {
+                        record_start_line_ = line_number_;
+                        in_record_ = true;
+                    }
+                    current_field_.push_back(c);
+                    state_ = State::UnquotedField;
+                }
+                break;
+
+            case State::UnquotedField:
+                if (c == ',') {
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                    state_ = State::FieldStart;
+                } else if (c == '\r') {
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                    emit_current_record(on_record);
+                    state_ = State::AfterCr;
+                } else if (c == '\n') {
+                    ++line_number_;
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                    emit_current_record(on_record);
+                    state_ = State::FieldStart;
+                } else if (c == '"') {
+                    std::ostringstream oss;
+                    oss << "CsvStreamParser: unescaped quote inside unquoted field at record "
+                        << (record_index_ + 1) << " (line " << line_number_ << ")";
+                    cleanse_buffers();
+                    log_and_throw_csv_error(oss.str());
+                } else {
+                    current_field_.push_back(c);
+                }
+                break;
+
+            case State::QuotedField:
+                if (c == '"') {
+                    state_ = State::QuoteInQuotedField;
+                } else {
+                    if (c == '\n') {
+                        ++line_number_;
+                    }
+                    current_field_.push_back(c);
+                }
+                break;
+
+            case State::QuoteInQuotedField:
+                if (c == '"') {
+                    // RFC 4180 escaped quote ("")
+                    current_field_.push_back('"');
+                    state_ = State::QuotedField;
+                } else if (c == ',') {
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                    state_ = State::FieldStart;
+                } else if (c == '\r') {
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                    emit_current_record(on_record);
+                    state_ = State::AfterCr;
+                } else if (c == '\n') {
+                    ++line_number_;
+                    current_record_.push_back(std::move(current_field_));
+                    current_field_.clear();
+                    emit_current_record(on_record);
+                    state_ = State::FieldStart;
+                } else {
+                    std::ostringstream oss;
+                    oss << "CsvStreamParser: unexpected character '" << c
+                        << "' after closing quote at record " << (record_index_ + 1)
+                        << " (line " << line_number_ << ")";
+                    cleanse_buffers();
+                    log_and_throw_csv_error(oss.str());
+                }
+                break;
+
+            case State::AfterCr:
+                // Handled above before switch
+                break;
+        }
+    }
+}
+
+void CsvStreamParser::finish(const RecordCallback& on_record) {
+    if (state_ == State::QuotedField) {
+        std::ostringstream oss;
+        oss << "CsvStreamParser: unclosed quoted field at EOF for record "
+            << (record_index_ + 1) << " (started on line " << record_start_line_ << ")";
+        cleanse_buffers();
+        log_and_throw_csv_error(oss.str());
+    }
+
+    if (state_ == State::QuoteInQuotedField ||
+        state_ == State::UnquotedField ||
+        (state_ == State::FieldStart && in_record_)) {
+        current_record_.push_back(std::move(current_field_));
+        current_field_.clear();
+        emit_current_record(on_record);
+    }
+
+    state_ = State::FieldStart;
+    in_record_ = false;
+}
+
+void CsvStreamParser::parse_stream(std::istream& in,
+                                   const RecordCallback& on_record,
+                                   std::size_t chunk_size) {
+    if (chunk_size == 0) {
+        chunk_size = 16384;
+    }
+    std::vector<char> buf(chunk_size);
+    struct BufGuard {
+        std::vector<char>& b;
+        ~BufGuard() {
+            if (!b.empty()) {
+                OPENSSL_cleanse(b.data(), b.size());
+            }
+        }
+    } guard{buf};
+
+    while (in.good()) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        const std::streamsize got = in.gcount();
+        if (got > 0) {
+            feed(std::string_view(buf.data(), static_cast<std::size_t>(got)), on_record);
+        }
+    }
+    if (in.bad()) {
+        cleanse_buffers();
+        log_and_throw_csv_error("CsvStreamParser: I/O read failure on input stream");
+    }
+    finish(on_record);
+}
+
+std::vector<std::string> parse_csv_row(std::string_view record_text) {
+    std::vector<std::string> result;
+    std::size_t record_count = 0;
+    CsvStreamParser parser;
+    auto cb = [&](const std::vector<std::string>& fields, std::size_t, std::size_t) {
+        ++record_count;
+        if (record_count > 1) {
+            log_and_throw_csv_error("parse_csv_row: input contained multiple CSV records");
+        }
+        result = fields;
+    };
+    parser.feed(record_text, cb);
+    parser.finish(cb);
+    return result;
 }
 
 void append_escaped_csv_field(std::string& out, std::string_view field) {
@@ -127,24 +381,25 @@ std::unordered_map<std::string, std::string> TokenVault::rotate_kms_pepper() {
     pepper_ = kms_->derive_tokenizer_pepper();
     init_hmac_ctx();
 
-    auto old_reverse = std::move(reverse_map_);
-    forward_map_.clear();
-    reverse_map_.clear();
-    forward_map_.reserve(old_reverse.size());
-    reverse_map_.reserve(old_reverse.size());
-
+    // Sort by raw value so deterministic collision resolution order is stable across runs.
     std::vector<std::pair<std::string, std::string>> entries;
-    entries.reserve(old_reverse.size());
-    for (auto& [old_token, raw] : old_reverse) {
-        entries.emplace_back(old_token, raw);
+    entries.reserve(reverse_map_.size());
+    for (auto& [old_token, raw] : reverse_map_) {
+        entries.emplace_back(std::move(old_token), std::move(raw));
     }
     std::sort(entries.begin(), entries.end(),
               [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    forward_map_.clear();
+    reverse_map_.clear();
+    forward_map_.reserve(entries.size());
+    reverse_map_.reserve(entries.size());
+
     for (const auto& [old_token, raw] : entries) {
         const std::string_view new_token = tokenize_view_unlocked(raw);
         old_to_new[old_token] = std::string(new_token);
     }
-    dirty_ = !old_reverse.empty();
+    dirty_ = !entries.empty();
     return old_to_new;
 }
 
@@ -192,68 +447,79 @@ TransactionRecord TokenVault::rehydrate_record(const TransactionRecord& clean) c
     return restored;
 }
 
-void TokenVault::sanitize_single_line_unlocked(std::string_view line,
-                                               std::string& line_out,
-                                               std::array<std::string_view, 8>& views,
-                                               SanitizeStats* out_stats,
-                                               std::unordered_set<std::string>* out_tokens) {
-    if (split_csv_line_views(line, views) == 8) {
-        const std::string_view c_tok = tokenize_view_unlocked(views[2]);
-        const std::string_view n_tok = tokenize_view_unlocked(views[3]);
-        const std::string_view i_tok = tokenize_view_unlocked(views[4]);
+void TokenVault::sanitize_record_fields_unlocked(const std::vector<std::string>& cols,
+                                                 std::size_t record_index,
+                                                 std::size_t start_line,
+                                                 bool& first_record,
+                                                 std::string& row_out,
+                                                 SanitizeStats* out_stats,
+                                                 std::unordered_set<std::string>* out_tokens) {
+    validate_column_count(cols, record_index, start_line, "TokenVault::sanitize_csv");
 
-        line_out.append(views[0]); line_out.push_back(',');
-        line_out.append(views[1]); line_out.push_back(',');
-        line_out.append(c_tok);    line_out.push_back(',');
-        line_out.append(n_tok);    line_out.push_back(',');
-        line_out.append(i_tok);    line_out.push_back(',');
-        line_out.append("REDACTED_IP,");
-        line_out.append(views[6]); line_out.push_back(',');
-        line_out.append(views[7]); line_out.push_back('\n');
-
-        if (out_tokens) {
-            if (!c_tok.empty()) out_tokens->emplace(c_tok);
-            if (!n_tok.empty()) out_tokens->emplace(n_tok);
-            if (!i_tok.empty()) out_tokens->emplace(i_tok);
-        }
-        if (out_stats) {
-            out_stats->records_processed += 1;
-            out_stats->pii_fields_tokenized += 3;
-            if (!views[5].empty()) out_stats->ips_masked += 1;
-        }
-    } else {
-        const auto cols = parse_csv_row(line);
-        if (cols.size() < 8) return;
-
-        const std::string_view c_tok = tokenize_view_unlocked(cols[2]);
-        const std::string_view n_tok = tokenize_view_unlocked(cols[3]);
-        const std::string_view i_tok = tokenize_view_unlocked(cols[4]);
-
-        append_escaped_csv_field(line_out, cols[0]); line_out.push_back(',');
-        append_escaped_csv_field(line_out, cols[1]); line_out.push_back(',');
-        line_out.append(c_tok);                      line_out.push_back(',');
-        line_out.append(n_tok);                      line_out.push_back(',');
-        line_out.append(i_tok);                      line_out.push_back(',');
-        line_out.append("REDACTED_IP,");
-        append_escaped_csv_field(line_out, cols[6]); line_out.push_back(',');
-        append_escaped_csv_field(line_out, cols[7]); line_out.push_back('\n');
-
-        if (out_tokens) {
-            if (!c_tok.empty()) out_tokens->emplace(c_tok);
-            if (!n_tok.empty()) out_tokens->emplace(n_tok);
-            if (!i_tok.empty()) out_tokens->emplace(i_tok);
-        }
-        if (out_stats) {
-            out_stats->records_processed += 1;
-            out_stats->pii_fields_tokenized += 3;
-            if (!cols[5].empty()) out_stats->ips_masked += 1;
+    if (first_record) {
+        first_record = false;
+        if (cols[0] == "tx_id") {
+            return;
         }
     }
+
+    const std::string_view c_tok = tokenize_view_unlocked(cols[2]);
+    const std::string_view n_tok = tokenize_view_unlocked(cols[3]);
+    const std::string_view i_tok = tokenize_view_unlocked(cols[4]);
+
+    append_escaped_csv_field(row_out, cols[0]); row_out.push_back(',');
+    append_escaped_csv_field(row_out, cols[1]); row_out.push_back(',');
+    append_escaped_csv_field(row_out, c_tok);   row_out.push_back(',');
+    append_escaped_csv_field(row_out, n_tok);   row_out.push_back(',');
+    append_escaped_csv_field(row_out, i_tok);   row_out.push_back(',');
+    row_out.append("REDACTED_IP,");
+    append_escaped_csv_field(row_out, cols[6]); row_out.push_back(',');
+    append_escaped_csv_field(row_out, cols[7]); row_out.push_back('\n');
+
+    if (out_tokens) {
+        if (!c_tok.empty()) out_tokens->emplace(c_tok);
+        if (!n_tok.empty()) out_tokens->emplace(n_tok);
+        if (!i_tok.empty()) out_tokens->emplace(i_tok);
+    }
+    if (out_stats) {
+        out_stats->records_processed += 1;
+        out_stats->pii_fields_tokenized += 3;
+        if (!cols[5].empty()) out_stats->ips_masked += 1;
+    }
+}
+
+void TokenVault::rehydrate_record_fields_unlocked(const std::vector<std::string>& cols,
+                                                  std::size_t record_index,
+                                                  std::size_t start_line,
+                                                  bool& first_record,
+                                                  std::string& row_out) const {
+    validate_column_count(cols, record_index, start_line, "TokenVault::rehydrate_csv");
+
+    if (first_record) {
+        first_record = false;
+        if (cols[0] == "tx_id") {
+            return;
+        }
+    }
+
+    auto lookup = [this](std::string_view tok) -> std::string_view {
+        auto it = reverse_map_.find(tok);
+        return (it != reverse_map_.end()) ? std::string_view(it->second) : tok;
+    };
+
+    append_escaped_csv_field(row_out, cols[0]);         row_out.push_back(',');
+    append_escaped_csv_field(row_out, cols[1]);         row_out.push_back(',');
+    append_escaped_csv_field(row_out, lookup(cols[2])); row_out.push_back(',');
+    append_escaped_csv_field(row_out, lookup(cols[3])); row_out.push_back(',');
+    append_escaped_csv_field(row_out, lookup(cols[4])); row_out.push_back(',');
+    append_escaped_csv_field(row_out, cols[5]);         row_out.push_back(',');
+    append_escaped_csv_field(row_out, cols[6]);         row_out.push_back(',');
+    append_escaped_csv_field(row_out, cols[7]);         row_out.push_back('\n');
 }
 
 std::string TokenVault::sanitize_csv_batch(std::string_view csv_text, SanitizeStats* out_stats) {
     std::string out;
-    out.reserve(csv_text.size() + csv_text.size() / 8 + 128);
+    out.reserve(csv_text.size() + csv_text.size() / 4 + 128);
     out.append("tx_id,timestamp,customer_token,national_id_token,iban_token,ip_status,amount_egp,merchant\n");
 
     {
@@ -264,27 +530,16 @@ std::string TokenVault::sanitize_csv_batch(std::string_view csv_text, SanitizeSt
             reverse_map_.reserve(est_entries);
         }
 
-        std::size_t pos = 0;
-        bool first_line = true;
-        std::array<std::string_view, 8> views{};
-
-        while (pos < csv_text.size()) {
-            const std::size_t nl = csv_text.find('\n', pos);
-            std::string_view line = (nl == std::string_view::npos)
-                ? csv_text.substr(pos)
-                : csv_text.substr(pos, nl - pos);
-            pos = (nl == std::string_view::npos) ? csv_text.size() : (nl + 1);
-
-            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-            if (line.empty()) continue;
-            if (first_line && line.rfind("tx_id,", 0) == 0) {
-                first_line = false;
-                continue;
-            }
-            first_line = false;
-
-            sanitize_single_line_unlocked(line, out, views, out_stats, nullptr);
-        }
+        bool first_record = true;
+        CsvStreamParser parser;
+        auto on_record = [&](const std::vector<std::string>& cols,
+                             std::size_t record_index,
+                             std::size_t start_line) {
+            sanitize_record_fields_unlocked(
+                cols, record_index, start_line, first_record, out, out_stats, nullptr);
+        };
+        parser.feed(csv_text, on_record);
+        parser.finish(on_record);
     }
 
     flush();
@@ -301,31 +556,31 @@ void TokenVault::sanitize_csv_stream(std::istream& in,
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::string raw_line;
         std::string row_buf;
         row_buf.reserve(512);
-        std::array<std::string_view, 8> views{};
-        bool first_line = true;
-
-        while (std::getline(in, raw_line)) {
-            std::string_view line(raw_line);
-            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-            if (line.empty()) continue;
-            if (first_line && line.rfind("tx_id,", 0) == 0) {
-                first_line = false;
-                OPENSSL_cleanse(raw_line.data(), raw_line.size());
-                continue;
+        struct RowBufGuard {
+            std::string& s;
+            ~RowBufGuard() {
+                if (s.capacity() > 0) {
+                    OPENSSL_cleanse(s.data(), s.size());
+                }
             }
-            first_line = false;
+        } row_guard{row_buf};
 
+        bool first_record = true;
+        CsvStreamParser parser;
+        auto on_record = [&](const std::vector<std::string>& cols,
+                             std::size_t record_index,
+                             std::size_t start_line) {
             row_buf.clear();
-            sanitize_single_line_unlocked(line, row_buf, views, out_stats, out_tokens);
+            sanitize_record_fields_unlocked(
+                cols, record_index, start_line, first_record, row_buf, out_stats, out_tokens);
             if (!row_buf.empty()) {
                 out.write(row_buf.data(), static_cast<std::streamsize>(row_buf.size()));
+                OPENSSL_cleanse(row_buf.data(), row_buf.size());
             }
-            OPENSSL_cleanse(raw_line.data(), raw_line.size());
-        }
-        OPENSSL_cleanse(row_buf.data(), row_buf.capacity());
+        };
+        parser.parse_stream(in, on_record);
     }
 
     out.flush();
@@ -338,52 +593,15 @@ std::string TokenVault::rehydrate_csv_batch(std::string_view sanitized_csv) cons
     out.append("tx_id,timestamp,customer_name,national_id,iban,ip_status,amount_egp,merchant\n");
 
     std::lock_guard<std::mutex> lock(mutex_);
-    std::size_t pos = 0;
-    bool first_line = true;
-    std::array<std::string_view, 8> views{};
-
-    auto lookup = [this](std::string_view tok) -> std::string_view {
-        auto it = reverse_map_.find(tok);
-        return (it != reverse_map_.end()) ? std::string_view(it->second) : tok;
+    bool first_record = true;
+    CsvStreamParser parser;
+    auto on_record = [&](const std::vector<std::string>& cols,
+                         std::size_t record_index,
+                         std::size_t start_line) {
+        rehydrate_record_fields_unlocked(cols, record_index, start_line, first_record, out);
     };
-
-    while (pos < sanitized_csv.size()) {
-        const std::size_t nl = sanitized_csv.find('\n', pos);
-        std::string_view line = (nl == std::string_view::npos)
-            ? sanitized_csv.substr(pos)
-            : sanitized_csv.substr(pos, nl - pos);
-        pos = (nl == std::string_view::npos) ? sanitized_csv.size() : (nl + 1);
-
-        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-        if (line.empty()) continue;
-        if (first_line && line.rfind("tx_id,", 0) == 0) {
-            first_line = false;
-            continue;
-        }
-        first_line = false;
-
-        if (split_csv_line_views(line, views) == 8) {
-            append_escaped_csv_field(out, views[0]);         out.push_back(',');
-            append_escaped_csv_field(out, views[1]);         out.push_back(',');
-            append_escaped_csv_field(out, lookup(views[2])); out.push_back(',');
-            append_escaped_csv_field(out, lookup(views[3])); out.push_back(',');
-            append_escaped_csv_field(out, lookup(views[4])); out.push_back(',');
-            append_escaped_csv_field(out, views[5]);         out.push_back(',');
-            append_escaped_csv_field(out, views[6]);         out.push_back(',');
-            append_escaped_csv_field(out, views[7]);         out.push_back('\n');
-        } else {
-            const auto cols = parse_csv_row(line);
-            if (cols.size() < 8) continue;
-            append_escaped_csv_field(out, cols[0]);         out.push_back(',');
-            append_escaped_csv_field(out, cols[1]);         out.push_back(',');
-            append_escaped_csv_field(out, lookup(cols[2])); out.push_back(',');
-            append_escaped_csv_field(out, lookup(cols[3])); out.push_back(',');
-            append_escaped_csv_field(out, lookup(cols[4])); out.push_back(',');
-            append_escaped_csv_field(out, cols[5]);         out.push_back(',');
-            append_escaped_csv_field(out, cols[6]);         out.push_back(',');
-            append_escaped_csv_field(out, cols[7]);         out.push_back('\n');
-        }
-    }
+    parser.feed(sanitized_csv, on_record);
+    parser.finish(on_record);
     return out;
 }
 
@@ -393,52 +611,30 @@ void TokenVault::rehydrate_csv_stream(std::istream& in, std::ostream& out) const
     out.write(kHeader, sizeof(kHeader) - 1);
 
     std::lock_guard<std::mutex> lock(mutex_);
-    std::string raw_line;
     std::string row_buf;
     row_buf.reserve(512);
-    std::array<std::string_view, 8> views{};
-    bool first_line = true;
-
-    auto lookup = [this](std::string_view tok) -> std::string_view {
-        auto it = reverse_map_.find(tok);
-        return (it != reverse_map_.end()) ? std::string_view(it->second) : tok;
-    };
-
-    while (std::getline(in, raw_line)) {
-        std::string_view line(raw_line);
-        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
-        if (line.empty()) continue;
-        if (first_line && line.rfind("tx_id,", 0) == 0) {
-            first_line = false;
-            continue;
+    struct RowBufGuard {
+        std::string& s;
+        ~RowBufGuard() {
+            if (!s.empty()) {
+                OPENSSL_cleanse(s.data(), s.size());
+            }
         }
-        first_line = false;
+    } row_guard{row_buf};
 
+    bool first_record = true;
+    CsvStreamParser parser;
+    auto on_record = [&](const std::vector<std::string>& cols,
+                         std::size_t record_index,
+                         std::size_t start_line) {
         row_buf.clear();
-        if (split_csv_line_views(line, views) == 8) {
-            append_escaped_csv_field(row_buf, views[0]);         row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, views[1]);         row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, lookup(views[2])); row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, lookup(views[3])); row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, lookup(views[4])); row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, views[5]);         row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, views[6]);         row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, views[7]);         row_buf.push_back('\n');
-        } else {
-            const auto cols = parse_csv_row(line);
-            if (cols.size() < 8) continue;
-            append_escaped_csv_field(row_buf, cols[0]);         row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, cols[1]);         row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, lookup(cols[2])); row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, lookup(cols[3])); row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, lookup(cols[4])); row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, cols[5]);         row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, cols[6]);         row_buf.push_back(',');
-            append_escaped_csv_field(row_buf, cols[7]);         row_buf.push_back('\n');
+        rehydrate_record_fields_unlocked(cols, record_index, start_line, first_record, row_buf);
+        if (!row_buf.empty()) {
+            out.write(row_buf.data(), static_cast<std::streamsize>(row_buf.size()));
+            OPENSSL_cleanse(row_buf.data(), row_buf.size());
         }
-        out.write(row_buf.data(), static_cast<std::streamsize>(row_buf.size()));
-    }
-    OPENSSL_cleanse(row_buf.data(), row_buf.capacity());
+    };
+    parser.parse_stream(in, on_record);
     out.flush();
 }
 
@@ -447,11 +643,11 @@ void TokenVault::flush() {
     if (!dirty_) return;
 
     std::string plaintext;
-    plaintext.reserve(reverse_map_.size() * 48);
+    plaintext.reserve(reverse_map_.size() * 64);
     for (const auto& [token, raw] : reverse_map_) {
         plaintext.append(token);
         plaintext.push_back('\t');
-        plaintext.append(raw);
+        plaintext.append(escape_tsv_value(raw));
         plaintext.push_back('\n');
     }
 
@@ -511,26 +707,34 @@ std::string_view TokenVault::tokenize_view_unlocked(std::string_view raw_value) 
     }
 
     std::string key(raw_value);
-    for (std::uint64_t attempt = 0; attempt < 4096; ++attempt) {
+    for (std::uint64_t attempt = 0; attempt < kMaxCollisionAttempts; ++attempt) {
         std::string candidate = compute_token_unlocked(key, attempt);
         auto [rev_it, inserted] = reverse_map_.emplace(candidate, key);
         if (inserted || rev_it->second == key) {
             auto [fwd_it, fwd_inserted] = forward_map_.emplace(std::move(key), std::move(candidate));
-            if (!fwd_inserted) fwd_it->second = rev_it->first;
+            if (!fwd_inserted) {
+                fwd_it->second = rev_it->first;
+            }
             dirty_ = true;
             return fwd_it->second;
         }
+        // Collision detected: candidate is already assigned to a different raw value.
+        // Deterministically derive the next domain-separated candidate token.
     }
-    throw std::runtime_error("TokenVault: failed to resolve token collision");
+
+    throw std::runtime_error(
+        "TokenVault: failed to resolve token collision after maximum deterministic attempts");
 }
 
 std::string TokenVault::compute_token_unlocked(std::string_view input,
                                                std::uint64_t collision_attempt) const {
     unsigned char digest[EVP_MAX_MD_SIZE];
     std::size_t digest_len = 0;
+
     if (EVP_MAC_init(hmac_ctx_, nullptr, 0, nullptr) != 1) {
         throw std::runtime_error("TokenVault: HMAC-SHA256 re-init failed");
     }
+
     if (collision_attempt > 0) {
         static constexpr char kCollisionDomain[] = "BLINDVAULT_TOK_COLLISION_V1";
         std::array<unsigned char, 8> ctr_be{};
@@ -539,19 +743,29 @@ std::string TokenVault::compute_token_unlocked(std::string_view input,
                 static_cast<unsigned char>((collision_attempt >> (56 - i * 8)) & 0xFF);
         }
         const unsigned char sep = 0x00;
-        if (EVP_MAC_update(hmac_ctx_, reinterpret_cast<const unsigned char*>(kCollisionDomain), sizeof(kCollisionDomain)) != 1 ||
+        if (EVP_MAC_update(hmac_ctx_,
+                           reinterpret_cast<const unsigned char*>(kCollisionDomain),
+                           sizeof(kCollisionDomain)) != 1 || // includes trailing '\0'
             EVP_MAC_update(hmac_ctx_, ctr_be.data(), ctr_be.size()) != 1 ||
             EVP_MAC_update(hmac_ctx_, &sep, 1) != 1) {
             throw std::runtime_error("TokenVault: HMAC-SHA256 collision domain update failed");
         }
     }
-    if (EVP_MAC_update(hmac_ctx_, reinterpret_cast<const unsigned char*>(input.data()), input.size()) != 1 ||
-        EVP_MAC_final(hmac_ctx_, digest, &digest_len, sizeof(digest)) != 1 || digest_len < TOKEN_DIGEST_BYTES) {
+
+    if (EVP_MAC_update(hmac_ctx_,
+                       reinterpret_cast<const unsigned char*>(input.data()),
+                       input.size()) != 1 ||
+        EVP_MAC_final(hmac_ctx_, digest, &digest_len, sizeof(digest)) != 1 ||
+        digest_len < TOKEN_DIGEST_BYTES) {
         throw std::runtime_error("TokenVault: HMAC-SHA256 computation failed");
     }
+
     static constexpr char hex[] = "0123456789abcdef";
     std::string token(TOKEN_TOTAL_LEN, '\0');
-    token[0] = 'T'; token[1] = 'O'; token[2] = 'K'; token[3] = '_';
+    token[0] = 'T';
+    token[1] = 'O';
+    token[2] = 'K';
+    token[3] = '_';
     for (std::size_t i = 0; i < TOKEN_DIGEST_BYTES; ++i) {
         token[4 + i * 2]     = hex[digest[i] >> 4];
         token[4 + i * 2 + 1] = hex[digest[i] & 0x0F];
@@ -583,7 +797,7 @@ void TokenVault::load_unlocked() {
     decrypted.cleanse();
 
     std::string_view sv(plaintext);
-    const std::size_t approx_lines = sv.size() / 48 + 16;
+    const std::size_t approx_lines = sv.size() / 64 + 16;
     forward_map_.reserve(approx_lines);
     reverse_map_.reserve(approx_lines);
 
@@ -598,11 +812,13 @@ void TokenVault::load_unlocked() {
         if (tab == std::string_view::npos) continue;
 
         std::string token(line.substr(0, tab));
-        std::string raw(line.substr(tab + 1));
+        std::string raw = unescape_tsv_value(line.substr(tab + 1));
+
         auto [rev_it, inserted] = reverse_map_.emplace(token, raw);
         if (!inserted && rev_it->second != raw) {
             OPENSSL_cleanse(plaintext.data(), plaintext.size());
-            throw std::runtime_error("TokenVault: conflicting duplicate token in persisted store");
+            throw std::runtime_error(
+                "TokenVault: conflicting duplicate token detected while loading persisted token store");
         }
         forward_map_[std::move(raw)] = std::move(token);
     }

@@ -306,22 +306,29 @@ bool GatewayEngine::decrypt_and_filter_blob_stream(std::istream& in,
                                                    const std::string& target_token,
                                                    std::string& out_matched_rows,
                                                    std::size_t& out_match_count) const {
-    std::string pending;
-    CleanseGuard pending_guard{pending};
     bool header_seen = false;
     std::ostringstream blob_rows;
     std::size_t match_count = 0;
 
-    auto process_line = [&](std::string& line) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+    vault_token::CsvStreamParser parser;
+    auto process_record = [&](const std::vector<std::string>& cols,
+                              std::size_t record_index,
+                              std::size_t start_line) {
+        if (cols.size() != vault_token::EXPECTED_CSV_COLUMNS) {
+            throw std::runtime_error(
+                "GatewayEngine::decrypt_and_filter_blob_stream: malformed CSV in '" + blob_name +
+                "' at record " + std::to_string(record_index) + " (line " +
+                std::to_string(start_line) + "): expected " +
+                std::to_string(vault_token::EXPECTED_CSV_COLUMNS) + " columns, got " +
+                std::to_string(cols.size()));
+        }
         if (!header_seen) {
             header_seen = true;
-            return;
+            if (cols[0] == "tx_id") {
+                return;
+            }
         }
-        if (line.empty()) return;
 
-        const auto cols = vault_token::parse_csv_row(line);
-        if (cols.size() < 8) return;
         if (cols[2] == target_token || cols[3] == target_token || cols[4] == target_token) {
             vault_token::TransactionRecord clean{
                 cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7]
@@ -339,26 +346,9 @@ bool GatewayEngine::decrypt_and_filter_blob_stream(std::istream& in,
     vault_crypto::decrypt_stream_auto(
         in, total_len, dek, blob_name,
         [&](std::string_view chunk) {
-            std::size_t start = 0;
-            while (start < chunk.size()) {
-                const std::size_t nl = chunk.find('\n', start);
-                if (nl == std::string_view::npos) {
-                    pending.append(chunk.substr(start));
-                    break;
-                }
-                pending.append(chunk.substr(start, nl - start));
-                process_line(pending);
-                if (!pending.empty()) OPENSSL_cleanse(pending.data(), pending.size());
-                pending.clear();
-                start = nl + 1;
-            }
+            parser.feed(chunk, process_record);
         });
-
-    if (!pending.empty()) {
-        process_line(pending);
-        OPENSSL_cleanse(pending.data(), pending.size());
-        pending.clear();
-    }
+    parser.finish(process_record);
 
     out_matched_rows = blob_rows.str();
     out_match_count = match_count;
@@ -606,57 +596,43 @@ void GatewayEngine::rotate_master_kek(const vault_crypto::SecretKey& new_master_
                 std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
                 std::filesystem::perm_options::replace, ec);
 
-            std::string pending;
-            CleanseGuard pending_guard{pending};
             bool header_seen = false;
-            auto flush_line = [&](std::string& line) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
+            vault_token::CsvStreamParser parser;
+            auto flush_record = [&](const std::vector<std::string>& cols,
+                                    std::size_t record_index,
+                                    std::size_t start_line) {
+                if (cols.size() != vault_token::EXPECTED_CSV_COLUMNS) {
+                    throw std::runtime_error(
+                        "GatewayEngine::rotate_master_kek: malformed CSV in '" + entry.blob_name +
+                        "' at record " + std::to_string(record_index) + " (line " +
+                        std::to_string(start_line) + "): expected " +
+                        std::to_string(vault_token::EXPECTED_CSV_COLUMNS) + " columns, got " +
+                        std::to_string(cols.size()));
+                }
                 if (!header_seen) {
                     header_seen = true;
-                    plain_out << line << '\n';
-                    return;
+                    if (cols[0] == "tx_id") {
+                        plain_out << vault_token::format_csv_row(cols) << '\n';
+                        return;
+                    }
                 }
-                if (line.empty()) return;
-                std::istringstream ls(line);
-                // rehydrate line by line without keeping whole file in RAM
-                const auto cols = vault_token::parse_csv_row(line);
-                if (cols.size() >= 8) {
-                    vault_token::TransactionRecord rec{
-                        cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7]
-                    };
-                    const auto r = token_vault_.rehydrate_record(rec);
-                    plain_out << vault_token::format_csv_row({
-                        r.tx_id, r.timestamp, r.customer_name,
-                        r.national_id, r.iban, r.source_ip,
-                        r.amount_egp, r.merchant
-                    }) << '\n';
-                } else {
-                    plain_out << line << '\n';
-                }
+                vault_token::TransactionRecord rec{
+                    cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6], cols[7]
+                };
+                const auto r = token_vault_.rehydrate_record(rec);
+                plain_out << vault_token::format_csv_row({
+                    r.tx_id, r.timestamp, r.customer_name,
+                    r.national_id, r.iban, r.source_ip,
+                    r.amount_egp, r.merchant
+                }) << '\n';
             };
 
             vault_crypto::decrypt_stream_auto(
                 blob_in, fsize, dek, entry.blob_name,
                 [&](std::string_view chunk) {
-                    std::size_t start = 0;
-                    while (start < chunk.size()) {
-                        const std::size_t nl = chunk.find('\n', start);
-                        if (nl == std::string_view::npos) {
-                            pending.append(chunk.substr(start));
-                            break;
-                        }
-                        pending.append(chunk.substr(start, nl - start));
-                        flush_line(pending);
-                        if (!pending.empty()) OPENSSL_cleanse(pending.data(), pending.size());
-                        pending.clear();
-                        start = nl + 1;
-                    }
+                    parser.feed(chunk, flush_record);
                 });
-            if (!pending.empty()) {
-                flush_line(pending);
-                OPENSSL_cleanse(pending.data(), pending.size());
-                pending.clear();
-            }
+            parser.finish(flush_record);
             plain_out.flush();
             if (!plain_out) {
                 std::filesystem::remove_all(backup_dir, ec);

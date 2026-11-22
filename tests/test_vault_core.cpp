@@ -226,6 +226,10 @@ TEST(Tokenizer, DeterministicTokensAndIpMasking) {
     EXPECT_EQ(t1.rfind("TOK_", 0), 0u);
     EXPECT_EQ(t1.size(), vault_token::TOKEN_TOTAL_LEN);
     EXPECT_EQ(t1.size(), 36u);
+    for (std::size_t i = 4; i < t1.size(); ++i) {
+        const char ch = t1[i];
+        EXPECT_TRUE((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'));
+    }
     EXPECT_EQ(vault.detokenize(t1), "30108110101000");
 
     vault_token::TransactionRecord raw{
@@ -1190,6 +1194,224 @@ TEST(VaultHsm, Pkcs11HardwareRoundTripAndNonExtractableKek) {
     EXPECT_NE(res.restored_csv.find("TXN_HSM"), std::string::npos);
     EXPECT_TRUE(gw2.metadata_index().verify_audit_chain());
 #endif
+}
+
+// ---------------- RFC 4180 Streaming CSV Parser & Strict Schema Validation ----------------
+
+TEST(Tokenizer, Rfc4180MultilineQuotedFieldsAndEscapedQuotes) {
+    TempDir dir;
+    auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("rfc.kek"));
+    const auto tok_path = dir.file("rfc_tokens.enc");
+
+    const std::string raw_csv =
+        "tx_id,timestamp,customer_name,national_id,iban,source_ip,amount_egp,merchant\r\n"
+        "TX_ML1,2026-11-23T01:00:00Z,\"Ahmed\n\"\"The Boss\"\"\nHassan\",30108110101000,"
+        "EG380019000500000000263181000,41.10.20.30,1500.00,\"Carrefour\r\n\"\"Maadi\"\", Branch\"\r\n"
+        "TX_ML2,2026-11-23T01:05:00Z,\"Mona, \"\"VIP\"\" El-Sayed\",29901010102222,"
+        "EG380019000500000000263181001,10.0.0.5,250.00,\"LineA\nLineB\"";
+
+    // 1. Verify chunk-boundary invariance (1-byte chunks vs single buffer)
+    std::vector<std::vector<std::string>> whole_records;
+    {
+        vault_token::CsvStreamParser parser;
+        auto cb = [&](const std::vector<std::string>& fields, std::size_t, std::size_t) {
+            whole_records.push_back(fields);
+        };
+        parser.feed(raw_csv, cb);
+        parser.finish(cb);
+    }
+    std::vector<std::vector<std::string>> byte_records;
+    {
+        vault_token::CsvStreamParser parser;
+        auto cb = [&](const std::vector<std::string>& fields, std::size_t, std::size_t) {
+            byte_records.push_back(fields);
+        };
+        for (std::size_t i = 0; i < raw_csv.size(); ++i) {
+            parser.feed(std::string_view(&raw_csv[i], 1), cb);
+        }
+        parser.finish(cb);
+    }
+    ASSERT_EQ(whole_records, byte_records);
+    ASSERT_EQ(whole_records.size(), 3u);
+    EXPECT_EQ(whole_records[1][2], "Ahmed\n\"The Boss\"\nHassan");
+    EXPECT_EQ(whole_records[1][7], "Carrefour\r\n\"Maadi\", Branch");
+    EXPECT_EQ(whole_records[2][2], "Mona, \"VIP\" El-Sayed");
+    EXPECT_EQ(whole_records[2][7], "LineA\nLineB");
+
+    // 2. Streaming vs batch sanitization & rehydration parity
+    std::string sanitized_stream_str;
+    {
+        vault_token::TokenVault vault(tok_path, kms);
+        std::istringstream in(raw_csv);
+        std::ostringstream out;
+        vault_token::SanitizeStats stats{};
+        std::unordered_set<std::string> tokens;
+        vault.sanitize_csv_stream(in, out, &stats, &tokens);
+
+        EXPECT_EQ(stats.records_processed, 2u);
+        EXPECT_EQ(stats.pii_fields_tokenized, 6u);
+        EXPECT_EQ(stats.ips_masked, 2u);
+        EXPECT_EQ(tokens.size(), 6u);
+        for (const auto& t : tokens) {
+            EXPECT_EQ(t.size(), vault_token::TOKEN_TOTAL_LEN);
+        }
+
+        sanitized_stream_str = out.str();
+        const std::string sanitized_batch = vault.sanitize_csv_batch(raw_csv);
+        EXPECT_EQ(sanitized_stream_str, sanitized_batch);
+
+        // Raw PII must not leak into sanitized CSV
+        EXPECT_EQ(sanitized_stream_str.find("The Boss"), std::string::npos);
+        EXPECT_EQ(sanitized_stream_str.find("Mona"), std::string::npos);
+        EXPECT_NE(sanitized_stream_str.find("REDACTED_IP"), std::string::npos);
+    }
+
+    // 3. Reload persisted TokenVault from disk and verify multi-line PII rehydration
+    {
+        vault_token::TokenVault reloaded(tok_path, kms);
+        std::istringstream in(sanitized_stream_str);
+        std::ostringstream rehy_stream;
+        reloaded.rehydrate_csv_stream(in, rehy_stream);
+        const std::string rehy_batch = reloaded.rehydrate_csv_batch(sanitized_stream_str);
+        EXPECT_EQ(rehy_stream.str(), rehy_batch);
+
+        std::vector<std::vector<std::string>> restored_rows;
+        vault_token::CsvStreamParser check_parser;
+        auto cb = [&](const std::vector<std::string>& fields, std::size_t, std::size_t) {
+            restored_rows.push_back(fields);
+        };
+        check_parser.feed(rehy_stream.str(), cb);
+        check_parser.finish(cb);
+        ASSERT_EQ(restored_rows.size(), 3u);
+        EXPECT_EQ(restored_rows[1][2], "Ahmed\n\"The Boss\"\nHassan");
+        EXPECT_EQ(restored_rows[1][7], "Carrefour\r\n\"Maadi\", Branch");
+        EXPECT_EQ(restored_rows[2][2], "Mona, \"VIP\" El-Sayed");
+        EXPECT_EQ(restored_rows[2][7], "LineA\nLineB");
+    }
+
+    // 4. End-to-end GatewayEngine offload + 2-of-3 quorum audit + KEK rotation with multi-line CSV
+    {
+        ScopedSoftwareKmsMode sw_kms_guard;
+        const auto state_dir = dir.file("gw_state");
+        const auto cloud_dir = dir.file("gw_cloud");
+        const auto priv_dir = dir.file("gw_priv");
+        std::filesystem::create_directories(cloud_dir);
+        setup_offline_officers(priv_dir, state_dir / "officers");
+
+        const auto csv_file = dir.file("multiline.csv");
+        {
+            std::ofstream f(csv_file, std::ios::binary);
+            f.write(raw_csv.data(), static_cast<std::streamsize>(raw_csv.size()));
+        }
+
+        vault_gateway::GatewayEngine gw(state_dir, 2);
+        const auto art = gw.prepare_encrypted_offload(csv_file);
+        EXPECT_EQ(art.stats.records_processed, 2u);
+        std::filesystem::copy_file(art.encrypted_file_path, cloud_dir / art.blob_name);
+
+        const std::string target = "Ahmed\n\"The Boss\"\nHassan";
+        const auto chal = gw.prepare_release_challenge(target);
+        ASSERT_EQ(chal.candidate_blobs.size(), 1u);
+        const std::vector<vault_index::OfficerApproval> ap = {
+            sign_offline(priv_dir, "CBE-Officer-1", chal.target_token, chal.candidate_blobs[0],
+                         chal.challenge_nonce_hex, chal.expires_utc),
+            sign_offline(priv_dir, "CBE-Officer-2", chal.target_token, chal.candidate_blobs[0],
+                         chal.challenge_nonce_hex, chal.expires_utc)
+        };
+        const auto res = gw.auditor_query(
+            target, cloud_dir, ap, chal.challenge_nonce_hex, chal.expires_utc, "ML-Aud");
+        EXPECT_TRUE(res.authorized);
+        EXPECT_TRUE(res.found);
+        EXPECT_NE(res.restored_csv.find("TX_ML1"), std::string::npos);
+        EXPECT_EQ(res.restored_csv.find("TX_ML2"), std::string::npos);
+        EXPECT_NE(res.restored_csv.find("\"\"The Boss\"\""), std::string::npos);
+
+        // Rotate KEK on multi-line blob and verify re-query still works
+        gw.rotate_master_kek(vault_crypto::generate_key(), cloud_dir);
+        const auto chal2 = gw.prepare_release_challenge(target);
+        ASSERT_EQ(chal2.candidate_blobs.size(), 1u);
+        const std::vector<vault_index::OfficerApproval> ap2 = {
+            sign_offline(priv_dir, "CBE-Officer-1", chal2.target_token, chal2.candidate_blobs[0],
+                         chal2.challenge_nonce_hex, chal2.expires_utc),
+            sign_offline(priv_dir, "CBE-Officer-2", chal2.target_token, chal2.candidate_blobs[0],
+                         chal2.challenge_nonce_hex, chal2.expires_utc)
+        };
+        const auto res2 = gw.auditor_query(
+            target, cloud_dir, ap2, chal2.challenge_nonce_hex, chal2.expires_utc, "ML-Aud-2");
+        EXPECT_TRUE(res2.authorized);
+        EXPECT_TRUE(res2.found);
+        EXPECT_NE(res2.restored_csv.find("TX_ML1"), std::string::npos);
+    }
+}
+
+TEST(Tokenizer, StrictSchemaValidationRejectsMalformedCsv) {
+    TempDir dir;
+    auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("strict.kek"));
+    vault_token::TokenVault vault(dir.file("strict_tokens.enc"), kms);
+
+    auto expect_both_throw = [&](const std::string& bad_csv, const std::string& expected_substr) {
+        try {
+            (void)vault.sanitize_csv_batch(bad_csv);
+            FAIL() << "sanitize_csv_batch did not throw for malformed CSV: " << bad_csv;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(expected_substr), std::string::npos)
+                << "Unexpected error message: " << e.what();
+        }
+        try {
+            std::istringstream in(bad_csv);
+            std::ostringstream out;
+            vault.sanitize_csv_stream(in, out);
+            FAIL() << "sanitize_csv_stream did not throw for malformed CSV: " << bad_csv;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find(expected_substr), std::string::npos)
+                << "Unexpected error message: " << e.what();
+        }
+    };
+
+    const std::string hdr =
+        "tx_id,timestamp,customer_name,national_id,iban,source_ip,amount_egp,merchant\n";
+
+    // 1. Under-column row (< 8 columns)
+    expect_both_throw(
+        hdr + "TX1,2026-11-23T00:00:00Z,Ahmed,30108110101000,EG3800,41.1.2.3,100.00\n",
+        "expected exactly 8 columns, got 7");
+
+    // 2. Over-column row (> 8 columns — previously truncated silently)
+    expect_both_throw(
+        hdr + "TX1,2026-11-23T00:00:00Z,Ahmed,30108110101000,EG3800,41.1.2.3,100.00,Carrefour,EXTRA_COL\n",
+        "expected exactly 8 columns, got 9");
+
+    // 3. Unclosed quoted field at EOF (single-line)
+    expect_both_throw(
+        hdr + "TX1,2026-11-23T00:00:00Z,\"Ahmed Hassan,30108110101000,EG3800,41.1.2.3,100.00,Carrefour",
+        "unclosed quoted field at EOF");
+
+    // 4. Unclosed quoted field spanning multiple lines at EOF
+    expect_both_throw(
+        hdr + "TX1,2026-11-23T00:00:00Z,\"Ahmed\nHassan\n",
+        "unclosed quoted field at EOF");
+
+    // 5. Unescaped quote inside unquoted field
+    expect_both_throw(
+        hdr + "TX1,2026-11-23T00:00:00Z,Ah\"med,30108110101000,EG3800,41.1.2.3,100.00,Carrefour\n",
+        "unescaped quote inside unquoted field");
+
+    // 6. Trailing characters after closing quote
+    expect_both_throw(
+        hdr + "TX1,2026-11-23T00:00:00Z,\"Ahmed\"trailing,30108110101000,EG3800,41.1.2.3,100.00,Carrefour\n",
+        "unexpected character");
+
+    // 7. Blank line in the middle (must not be silently skipped)
+    expect_both_throw(
+        hdr + "\nTX1,2026-11-23T00:00:00Z,Ahmed,30108110101000,EG3800,41.1.2.3,100.00,Carrefour\n",
+        "expected exactly 8 columns, got 1");
+
+    // 8. Rehydrate must also reject malformed rows (< 8 and > 8)
+    EXPECT_THROW(
+        vault.rehydrate_csv_batch(
+            "tx_id,timestamp,customer_token,national_id_token,iban_token,ip_status,amount_egp,merchant\n"
+            "TX1,2026-11-23T00:00:00Z,TOK_1,TOK_2,TOK_3,REDACTED_IP,100.00,Shop,EXTRA\n"),
+        std::runtime_error);
 }
 
 // ---------------- 128-Bit Tokenization & Deterministic Collision Resolution ----------------
