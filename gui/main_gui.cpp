@@ -25,6 +25,23 @@ int main(int argc, char* argv[]) {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         font-size: 13px;
     }
+    QLabel {
+        background-color: transparent;
+    }
+    QScrollArea {
+        background-color: transparent;
+        border: none;
+    }
+    QScrollArea > QWidget > QWidget {
+        background-color: transparent;
+    }
+    QSplitter::handle {
+        background-color: transparent;
+    }
+    QSplitter::handle:hover {
+        background-color: #cbd5e1;
+        border-radius: 3px;
+    }
 
     /* Card Containers */
     QFrame#card {
@@ -86,9 +103,10 @@ int main(int argc, char* argv[]) {
         color: #64748b;
         font-weight: 600;
         font-size: 13px;
-        padding: 9px 22px;
+        padding: 10px 20px;
         border-radius: 8px;
         margin-right: 8px;
+        margin-bottom: 6px;
         border: 1px solid #e2e8f0;
     }
     QTabBar::tab:selected {
@@ -107,7 +125,7 @@ int main(int argc, char* argv[]) {
         background-color: #ffffff;
         border: 1px solid #cbd5e1;
         border-radius: 8px;
-        padding: 8px 14px;
+        padding: 7px 12px;
         color: #0f172a;
         font-size: 13px;
     }
@@ -128,7 +146,7 @@ int main(int argc, char* argv[]) {
         font-weight: 600;
         font-size: 13px;
         border-radius: 8px;
-        padding: 10px 20px;
+        padding: 8px 18px;
         border: none;
     }
     QPushButton#primaryBtn:hover {
@@ -149,7 +167,7 @@ int main(int argc, char* argv[]) {
         font-weight: 600;
         font-size: 13px;
         border-radius: 8px;
-        padding: 8px 16px;
+        padding: 7px 14px;
         border: 1px solid #cbd5e1;
     }
     QPushButton#secondaryBtn:hover, QPushButton:hover {
@@ -173,7 +191,7 @@ int main(int argc, char* argv[]) {
         font-weight: 600;
         font-size: 12px;
         border-radius: 8px;
-        padding: 8px 16px;
+        padding: 6px 14px;
         border: 1px solid #fecaca;
     }
     QPushButton#dangerBtn:hover {
@@ -239,11 +257,10 @@ int main(int argc, char* argv[]) {
         background-color: #ffffff;
         border: 1px solid #e2e8f0;
         border-radius: 8px;
-        padding: 10px;
+        padding: 12px;
         color: #334155;
         font-family: "SF Mono", "Fira Code", "Consolas", "Courier New", monospace;
-        font-size: 15px;
-        line-height: 1.4;
+        font-size: 13px;
     }
     QTextEdit:focus {
         border: 1px solid #94a3b8;

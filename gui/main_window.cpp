@@ -12,12 +12,25 @@
 #include <QStandardPaths>
 #include <QDir>
 #include <QPixmap>
+#include <QScrollArea>
+#include <QSplitter>
+#include <QScreen>
+#include <algorithm>
 #include <filesystem>
 #include "identity.hpp"
 #include "trust_store.hpp"
 #include "tokenizer.hpp"
 
 namespace {
+QScrollArea* wrapInScrollArea(QWidget* content) {
+    auto* scroll = new QScrollArea();
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    scroll->setWidget(content);
+    return scroll;
+}
+
 std::filesystem::path getIdentityDirectory() {
     QString qPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir dir(qPath);
@@ -34,8 +47,14 @@ std::filesystem::path getIdentityDirectory() {
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent), bridge_(new NetworkBridge(this)) {
-    setMinimumSize(1160, 820);
-    resize(1240, 860);
+    setMinimumSize(1040, 700);
+    QSize targetSize(1380, 900);
+    if (const auto* screen = QGuiApplication::primaryScreen()) {
+        const QRect avail = screen->availableGeometry();
+        targetSize.setWidth(std::min(targetSize.width(), std::max(1040, avail.width() - 40)));
+        targetSize.setHeight(std::min(targetSize.height(), std::max(700, avail.height() - 40)));
+    }
+    resize(targetSize);
     setupUi();
     if (!initializeIdentity()) {
         QTimer::singleShot(0, this, &QWidget::close);
@@ -84,11 +103,17 @@ bool MainWindow::initializeIdentity() {
         QDialog dialog(this);
         dialog.setWindowTitle("Create BlindVault Node Identity");
         dialog.setModal(true);
+        dialog.setMinimumWidth(440);
 
         auto* form = new QFormLayout(&dialog);
+        form->setContentsMargins(24, 20, 24, 20);
+        form->setSpacing(12);
         auto* aliasInput = new QLineEdit(&dialog);
         auto* passInput = new QLineEdit(&dialog);
         auto* confirmInput = new QLineEdit(&dialog);
+        aliasInput->setMinimumHeight(36);
+        passInput->setMinimumHeight(36);
+        confirmInput->setMinimumHeight(36);
         passInput->setEchoMode(QLineEdit::Password);
         confirmInput->setEchoMode(QLineEdit::Password);
         aliasInput->setPlaceholderText("e.g. CBE-Gateway-Cairo");
@@ -97,6 +122,8 @@ bool MainWindow::initializeIdentity() {
         form->addRow("Confirm Passphrase:", confirmInput);
 
         auto* generateButton = new QPushButton("Generate Identity", &dialog);
+        generateButton->setObjectName("primaryBtn");
+        generateButton->setMinimumHeight(38);
         form->addRow(generateButton);
         connect(generateButton, &QPushButton::clicked, &dialog, [&]() {
             const QString alias = aliasInput->text().trimmed();
@@ -123,11 +150,17 @@ bool MainWindow::initializeIdentity() {
         QDialog dialog(this);
         dialog.setWindowTitle("Unlock BlindVault Identity");
         dialog.setModal(true);
+        dialog.setMinimumWidth(440);
         auto* form = new QFormLayout(&dialog);
+        form->setContentsMargins(24, 20, 24, 20);
+        form->setSpacing(12);
         auto* passInput = new QLineEdit(&dialog);
+        passInput->setMinimumHeight(36);
         passInput->setEchoMode(QLineEdit::Password);
         form->addRow("Passphrase:", passInput);
         auto* unlockButton = new QPushButton("Unlock", &dialog);
+        unlockButton->setObjectName("primaryBtn");
+        unlockButton->setMinimumHeight(38);
         form->addRow(unlockButton);
         connect(unlockButton, &QPushButton::clicked, &dialog, [&]() {
             if (!readPrivateKey(passInput->text())) {
@@ -156,15 +189,15 @@ void MainWindow::setupUi() {
 
     auto* centralWidget = new QWidget(this);
     auto* mainLayout = new QVBoxLayout(centralWidget);
-    mainLayout->setContentsMargins(16, 16, 16, 16);
-    mainLayout->setSpacing(12);
+    mainLayout->setContentsMargins(20, 18, 20, 18);
+    mainLayout->setSpacing(16);
 
     // Header Identity Card
     auto* idCard = new QFrame(centralWidget);
     idCard->setObjectName("card");
     auto* idLayout = new QVBoxLayout(idCard);
-    idLayout->setContentsMargins(20, 14, 20, 14);
-    idLayout->setSpacing(10);
+    idLayout->setContentsMargins(22, 16, 22, 16);
+    idLayout->setSpacing(12);
 
     auto* idHeaderLayout = new QHBoxLayout();
     auto* logoLabel = new QLabel(centralWidget);
@@ -187,6 +220,7 @@ void MainWindow::setupUi() {
     idLayout->addLayout(idHeaderLayout);
 
     auto* fpRowLayout = new QHBoxLayout();
+    fpRowLayout->setSpacing(10);
     auto* fpTitle = new QLabel("Node Fingerprint:", centralWidget);
     fpTitle->setObjectName("subheading");
     fp_label_ = new QLabel("Loading...", centralWidget);
@@ -195,7 +229,8 @@ void MainWindow::setupUi() {
 
     copy_fp_btn_ = new QPushButton("Copy", centralWidget);
     copy_fp_btn_->setObjectName("secondaryBtn");
-    copy_fp_btn_->setFixedWidth(72);
+    copy_fp_btn_->setMinimumWidth(84);
+    copy_fp_btn_->setMinimumHeight(36);
     connect(copy_fp_btn_, &QPushButton::clicked, this, &MainWindow::onCopyFingerprint);
 
     fpRowLayout->addWidget(fpTitle);
@@ -204,28 +239,30 @@ void MainWindow::setupUi() {
     idLayout->addLayout(fpRowLayout);
     mainLayout->addWidget(idCard);
 
-    auto* columnsLayout = new QHBoxLayout();
-    columnsLayout->setSpacing(12);
+    auto* splitter = new QSplitter(Qt::Horizontal, centralWidget);
+    splitter->setChildrenCollapsible(false);
+    splitter->setHandleWidth(12);
 
-    auto* tabs = new QTabWidget(centralWidget);
+    auto* tabs = new QTabWidget(splitter);
     tabs->addTab(createEgressGatewayTab(), "1. Bank Egress Gateway");
-    tabs->addTab(createAuditorTab(), "2. Quorum Auditor & Cloud Proof");
-    tabs->addTab(createCloudAndTrustTab(), "3. Cloud Vault & Node Trust");
-    columnsLayout->addWidget(tabs, 62);
+    tabs->addTab(createAuditorTab(), "2. Quorum Auditor && Cloud Proof");
+    tabs->addTab(createCloudAndTrustTab(), "3. Cloud Vault && Node Trust");
+    splitter->addWidget(tabs);
 
     // Right Column: Live Compliance & Telemetry Log
-    auto* logCard = new QFrame(centralWidget);
+    auto* logCard = new QFrame(splitter);
     logCard->setObjectName("card");
+    logCard->setMinimumWidth(300);
     auto* logLayout = new QVBoxLayout(logCard);
-    logLayout->setContentsMargins(18, 16, 18, 16);
-    logLayout->setSpacing(10);
+    logLayout->setContentsMargins(20, 18, 20, 18);
+    logLayout->setSpacing(12);
 
     auto* logHeaderLayout = new QHBoxLayout();
-    auto* logTitle = new QLabel("RegTech Telemetry & Security Audit Log", centralWidget);
+    auto* logTitle = new QLabel("RegTech Telemetry & Security Audit Log", logCard);
     logTitle->setObjectName("cardTitle");
-    auto* clearLogBtn = new QPushButton("Clear", centralWidget);
+    auto* clearLogBtn = new QPushButton("Clear", logCard);
     clearLogBtn->setObjectName("secondaryBtn");
-    clearLogBtn->setFixedHeight(32);
+    clearLogBtn->setMinimumHeight(34);
     connect(clearLogBtn, &QPushButton::clicked, this, &MainWindow::onClearLog);
     logHeaderLayout->addWidget(logTitle);
     logHeaderLayout->addStretch();
@@ -234,11 +271,14 @@ void MainWindow::setupUi() {
 
     log_pane_ = new QTextEdit(this);
     log_pane_->setReadOnly(true);
-    log_pane_->setStyleSheet("font-size: 14px; line-height: 1.45;");
+    log_pane_->setStyleSheet("font-size: 13px;");
     logLayout->addWidget(log_pane_, 1);
 
-    columnsLayout->addWidget(logCard, 38);
-    mainLayout->addLayout(columnsLayout, 1);
+    splitter->addWidget(logCard);
+    splitter->setStretchFactor(0, 68);
+    splitter->setStretchFactor(1, 32);
+    splitter->setSizes({920, 420});
+    mainLayout->addWidget(splitter, 1);
 
     setCentralWidget(centralWidget);
 }
@@ -246,32 +286,34 @@ void MainWindow::setupUi() {
 QWidget* MainWindow::createEgressGatewayTab() {
     auto* tab = new QWidget();
     auto* layout = new QVBoxLayout(tab);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(10);
+    layout->setContentsMargins(2, 8, 10, 14);
+    layout->setSpacing(16);
 
     // Target Cloud Storage Card
     auto* targetCard = new QFrame(tab);
     targetCard->setObjectName("card");
     auto* targetLayout = new QVBoxLayout(targetCard);
-    targetLayout->setContentsMargins(20, 14, 20, 14);
-    targetLayout->setSpacing(10);
+    targetLayout->setContentsMargins(22, 18, 22, 18);
+    targetLayout->setSpacing(12);
 
     auto* targetTitle = new QLabel("Untrusted Cloud Vault Endpoint", targetCard);
     targetTitle->setObjectName("cardTitle");
     targetLayout->addWidget(targetTitle);
 
     auto* grid = new QGridLayout();
+    grid->setHorizontalSpacing(12);
+    grid->setVerticalSpacing(8);
     grid->setColumnStretch(0, 1);
     auto* hostLbl = new QLabel("Cloud Endpoint Host:", targetCard);
     hostLbl->setObjectName("inputLabel");
     host_input_ = new QLineEdit("127.0.0.1", targetCard);
-    host_input_->setFixedHeight(36);
+    host_input_->setMinimumHeight(38);
 
     auto* portLbl = new QLabel("Port:", targetCard);
     portLbl->setObjectName("inputLabel");
     port_input_ = new QLineEdit("8080", targetCard);
     port_input_->setFixedWidth(96);
-    port_input_->setFixedHeight(36);
+    port_input_->setMinimumHeight(38);
 
     grid->addWidget(hostLbl, 0, 0);
     grid->addWidget(portLbl, 0, 1);
@@ -284,8 +326,8 @@ QWidget* MainWindow::createEgressGatewayTab() {
     auto* batchCard = new QFrame(tab);
     batchCard->setObjectName("card");
     auto* batchLayout = new QVBoxLayout(batchCard);
-    batchLayout->setContentsMargins(20, 14, 20, 14);
-    batchLayout->setSpacing(10);
+    batchLayout->setContentsMargins(22, 18, 22, 18);
+    batchLayout->setSpacing(12);
 
     auto* batchHeader = new QHBoxLayout();
     auto* batchTitle = new QLabel("Core Banking Transaction Batch (CSV)", batchCard);
@@ -293,7 +335,7 @@ QWidget* MainWindow::createEgressGatewayTab() {
 
     gen_synth_btn_ = new QPushButton("Generate 10,000 CBE Records", batchCard);
     gen_synth_btn_->setObjectName("secondaryBtn");
-    gen_synth_btn_->setFixedHeight(34);
+    gen_synth_btn_->setMinimumHeight(36);
     connect(gen_synth_btn_, &QPushButton::clicked, this, &MainWindow::onGenerateSynthetic);
 
     batchHeader->addWidget(batchTitle);
@@ -302,13 +344,14 @@ QWidget* MainWindow::createEgressGatewayTab() {
     batchLayout->addLayout(batchHeader);
 
     auto* fileRow = new QHBoxLayout();
+    fileRow->setSpacing(10);
     file_path_input_ = new QLineEdit(batchCard);
     file_path_input_->setPlaceholderText("Select raw banking transaction CSV or click Generate...");
-    file_path_input_->setFixedHeight(36);
+    file_path_input_->setMinimumHeight(38);
 
     auto* browseBtn = new QPushButton("Browse...", batchCard);
     browseBtn->setObjectName("secondaryBtn");
-    browseBtn->setFixedHeight(36);
+    browseBtn->setMinimumHeight(38);
     connect(browseBtn, &QPushButton::clicked, this, &MainWindow::onBrowseFile);
 
     fileRow->addWidget(file_path_input_, 1);
@@ -320,12 +363,12 @@ QWidget* MainWindow::createEgressGatewayTab() {
     auto* actionCard = new QFrame(tab);
     actionCard->setObjectName("card");
     auto* actionLayout = new QVBoxLayout(actionCard);
-    actionLayout->setContentsMargins(20, 14, 20, 14);
-    actionLayout->setSpacing(10);
+    actionLayout->setContentsMargins(22, 18, 22, 18);
+    actionLayout->setSpacing(12);
 
-    send_btn_ = new QPushButton("Sanitize PII, Pad 64KiB, Wrap DEK & Offload", actionCard);
+    send_btn_ = new QPushButton("Sanitize PII, Pad 64 KiB, Wrap DEK && Offload", actionCard);
     send_btn_->setObjectName("primaryBtn");
-    send_btn_->setFixedHeight(42);
+    send_btn_->setMinimumHeight(42);
     connect(send_btn_, &QPushButton::clicked, this, &MainWindow::onOffloadCsv);
     actionLayout->addWidget(send_btn_);
 
@@ -337,11 +380,13 @@ QWidget* MainWindow::createEgressGatewayTab() {
     telemetry_lbl_ = new QLabel("Throughput: Ready | Zero PII & Zero Internal IPs Leave Bank Perimeter", actionCard);
     telemetry_lbl_->setObjectName("monoBox");
     telemetry_lbl_->setAlignment(Qt::AlignCenter);
+    telemetry_lbl_->setWordWrap(true);
     actionLayout->addWidget(telemetry_lbl_);
 
     hardening_lbl_ = new QLabel("Hardening: RFC 3394 KEK Wrap | 64 KiB Traffic Padding | 2-of-3 Erasure Shards | RLIMIT_CORE=0", actionCard);
     hardening_lbl_->setObjectName("monoBox");
     hardening_lbl_->setAlignment(Qt::AlignCenter);
+    hardening_lbl_->setWordWrap(true);
     actionLayout->addWidget(hardening_lbl_);
 
     transfer_status_lbl_ = new QLabel("Awaiting batch offload", actionCard);
@@ -351,28 +396,29 @@ QWidget* MainWindow::createEgressGatewayTab() {
 
     layout->addWidget(actionCard);
     layout->addStretch();
-    return tab;
+    return wrapInScrollArea(tab);
 }
 
 QWidget* MainWindow::createAuditorTab() {
     auto* tab = new QWidget();
     auto* layout = new QVBoxLayout(tab);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(8);
+    layout->setContentsMargins(2, 8, 10, 14);
+    layout->setSpacing(16);
 
     // Asymmetric Ed25519 M-of-N Compliance Quorum & Challenge Card
     auto* searchCard = new QFrame(tab);
     searchCard->setObjectName("card");
     auto* searchLayout = new QVBoxLayout(searchCard);
-    searchLayout->setContentsMargins(18, 12, 18, 12);
-    searchLayout->setSpacing(8);
+    searchLayout->setContentsMargins(22, 18, 22, 18);
+    searchLayout->setSpacing(12);
 
     auto* headerRow = new QHBoxLayout();
+    headerRow->setSpacing(12);
     auto* searchTitle = new QLabel("Asymmetric Ed25519 Quorum Gate (Public-Key-Only Gateway)", searchCard);
     searchTitle->setObjectName("cardTitle");
     import_officer_pub_btn_ = new QPushButton("Import Officer .pub Key...", searchCard);
     import_officer_pub_btn_->setObjectName("secondaryBtn");
-    import_officer_pub_btn_->setFixedHeight(32);
+    import_officer_pub_btn_->setMinimumHeight(36);
     connect(import_officer_pub_btn_, &QPushButton::clicked, this, &MainWindow::onImportOfficerPubKey);
     headerRow->addWidget(searchTitle);
     headerRow->addStretch();
@@ -380,13 +426,14 @@ QWidget* MainWindow::createAuditorTab() {
     searchLayout->addLayout(headerRow);
 
     auto* queryRow = new QHBoxLayout();
+    queryRow->setSpacing(10);
     auditor_query_input_ = new QLineEdit(searchCard);
     auditor_query_input_->setPlaceholderText("Customer Name (e.g. Ahmed Hassan), National ID, IBAN, or TOK_...");
-    auditor_query_input_->setFixedHeight(34);
+    auditor_query_input_->setMinimumHeight(38);
 
     prep_challenge_btn_ = new QPushButton("1. Prepare Signing Challenge", searchCard);
     prep_challenge_btn_->setObjectName("secondaryBtn");
-    prep_challenge_btn_->setFixedHeight(34);
+    prep_challenge_btn_->setMinimumHeight(38);
     connect(prep_challenge_btn_, &QPushButton::clicked, this, &MainWindow::onPrepareChallenge);
 
     queryRow->addWidget(auditor_query_input_, 1);
@@ -395,42 +442,45 @@ QWidget* MainWindow::createAuditorTab() {
 
     challenge_view_ = new QTextEdit(searchCard);
     challenge_view_->setReadOnly(true);
-    challenge_view_->setMaximumHeight(74);
+    challenge_view_->setMinimumHeight(92);
+    challenge_view_->setMaximumHeight(120);
     challenge_view_->setStyleSheet("font-size: 12px;");
     challenge_view_->setPlaceholderText("Click '1. Prepare Signing Challenge' to get the blob challenge tuple for offline Ed25519 officer signing...");
     searchLayout->addWidget(challenge_view_);
 
     auto* sig1Row = new QHBoxLayout();
+    sig1Row->setSpacing(10);
     officer1_id_input_ = new QLineEdit("CBE-Officer-1", searchCard);
-    officer1_id_input_->setFixedWidth(135);
-    officer1_id_input_->setFixedHeight(32);
+    officer1_id_input_->setFixedWidth(150);
+    officer1_id_input_->setMinimumHeight(38);
     officer1_sig_input_ = new QLineEdit(searchCard);
     officer1_sig_input_->setPlaceholderText("Officer 1 detached 128-hex Ed25519 signature...");
-    officer1_sig_input_->setFixedHeight(32);
+    officer1_sig_input_->setMinimumHeight(38);
     sig1Row->addWidget(officer1_id_input_);
     sig1Row->addWidget(officer1_sig_input_, 1);
     searchLayout->addLayout(sig1Row);
 
     auto* sig2Row = new QHBoxLayout();
+    sig2Row->setSpacing(10);
     officer2_id_input_ = new QLineEdit("CBE-Officer-2", searchCard);
-    officer2_id_input_->setFixedWidth(135);
-    officer2_id_input_->setFixedHeight(32);
+    officer2_id_input_->setFixedWidth(150);
+    officer2_id_input_->setMinimumHeight(38);
     officer2_sig_input_ = new QLineEdit(searchCard);
     officer2_sig_input_->setPlaceholderText("Officer 2 detached 128-hex Ed25519 signature...");
-    officer2_sig_input_->setFixedHeight(32);
-
-    auditor_search_btn_ = new QPushButton("2. Verify & Re-Hydrate", searchCard);
-    auditor_search_btn_->setObjectName("primaryBtn");
-    auditor_search_btn_->setFixedHeight(32);
-    connect(auditor_search_btn_, &QPushButton::clicked, this, &MainWindow::onAuditorSearch);
-
+    officer2_sig_input_->setMinimumHeight(38);
     sig2Row->addWidget(officer2_id_input_);
     sig2Row->addWidget(officer2_sig_input_, 1);
-    sig2Row->addWidget(auditor_search_btn_);
     searchLayout->addLayout(sig2Row);
+
+    auditor_search_btn_ = new QPushButton("2. Verify && Re-Hydrate", searchCard);
+    auditor_search_btn_->setObjectName("primaryBtn");
+    auditor_search_btn_->setMinimumHeight(42);
+    connect(auditor_search_btn_, &QPushButton::clicked, this, &MainWindow::onAuditorSearch);
+    searchLayout->addWidget(auditor_search_btn_);
 
     auditor_token_lbl_ = new QLabel("Quorum Status: Gateway holds ONLY officer public keys (*.pub)", searchCard);
     auditor_token_lbl_->setObjectName("subheading");
+    auditor_token_lbl_->setWordWrap(true);
     searchLayout->addWidget(auditor_token_lbl_);
     layout->addWidget(searchCard);
 
@@ -438,8 +488,8 @@ QWidget* MainWindow::createAuditorTab() {
     auto* restoredCard = new QFrame(tab);
     restoredCard->setObjectName("card");
     auto* restoredLayout = new QVBoxLayout(restoredCard);
-    restoredLayout->setContentsMargins(18, 10, 18, 10);
-    restoredLayout->setSpacing(6);
+    restoredLayout->setContentsMargins(22, 18, 22, 18);
+    restoredLayout->setSpacing(10);
 
     auto* restoredTitle = new QLabel("Bank Perimeter View (Unwrapped DEK -> Decrypted -> RAM Cleansed After Render)", restoredCard);
     restoredTitle->setObjectName("cardTitle");
@@ -448,8 +498,10 @@ QWidget* MainWindow::createAuditorTab() {
     auditor_table_ = new QTableWidget(0, 6, restoredCard);
     auditor_table_->setHorizontalHeaderLabels({"Tx ID", "Timestamp", "Customer", "National ID", "Amount (EGP)", "Merchant"});
     auditor_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    auditor_table_->verticalHeader()->setVisible(false);
+    auditor_table_->verticalHeader()->setDefaultSectionSize(34);
     auditor_table_->setAlternatingRowColors(true);
-    auditor_table_->setMinimumHeight(110);
+    auditor_table_->setMinimumHeight(190);
     restoredLayout->addWidget(auditor_table_);
     layout->addWidget(restoredCard);
 
@@ -457,59 +509,64 @@ QWidget* MainWindow::createAuditorTab() {
     auto* cloudCard = new QFrame(tab);
     cloudCard->setObjectName("card");
     auto* cloudLayout = new QVBoxLayout(cloudCard);
-    cloudLayout->setContentsMargins(18, 10, 18, 10);
-    cloudLayout->setSpacing(6);
+    cloudLayout->setContentsMargins(22, 18, 22, 18);
+    cloudLayout->setSpacing(10);
 
-    auto* cloudTitle = new QLabel("Untrusted Cloud Storage View (64 KiB-Padded BVL2 AES-256-GCM Ciphertext)", cloudCard);
+    auto* cloudTitle = new QLabel("Untrusted Cloud Storage View (64 KiB-Padded BVL3/BVL2 AES-256-GCM Ciphertext)", cloudCard);
     cloudTitle->setObjectName("cardTitle");
     cloudLayout->addWidget(cloudTitle);
 
     cloud_hex_view_ = new QTextEdit(cloudCard);
     cloud_hex_view_->setReadOnly(true);
-    cloud_hex_view_->setMaximumHeight(90);
+    cloud_hex_view_->setMinimumHeight(120);
+    cloud_hex_view_->setMaximumHeight(170);
     cloud_hex_view_->setStyleSheet("font-size: 12px;");
     cloud_hex_view_->setPlaceholderText("Run an authorized Ed25519 quorum query to inspect the raw padded ciphertext stored on the cloud node...");
     cloudLayout->addWidget(cloud_hex_view_);
     layout->addWidget(cloudCard);
 
-    return tab;
+    layout->addStretch();
+    return wrapInScrollArea(tab);
 }
 
 QWidget* MainWindow::createCloudAndTrustTab() {
     auto* tab = new QWidget();
     auto* layout = new QVBoxLayout(tab);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(10);
+    layout->setContentsMargins(2, 8, 10, 14);
+    layout->setSpacing(16);
 
     // Cloud Storage Listener Card
     auto* srvCard = new QFrame(tab);
     srvCard->setObjectName("card");
     auto* srvLayout = new QVBoxLayout(srvCard);
-    srvLayout->setContentsMargins(20, 16, 20, 16);
-    srvLayout->setSpacing(10);
+    srvLayout->setContentsMargins(22, 18, 22, 18);
+    srvLayout->setSpacing(12);
 
     auto* srvTitle = new QLabel("Local Untrusted Cloud Storage Simulator (Vault Receiver)", srvCard);
     srvTitle->setObjectName("cardTitle");
     srvLayout->addWidget(srvTitle);
 
     auto* srvGrid = new QGridLayout();
+    srvGrid->setHorizontalSpacing(12);
+    srvGrid->setVerticalSpacing(8);
     srvGrid->setColumnStretch(1, 1);
 
     auto* pLbl = new QLabel("Listen Port:", srvCard);
     pLbl->setObjectName("inputLabel");
     server_port_input_ = new QLineEdit("8080", srvCard);
     server_port_input_->setFixedWidth(96);
-    server_port_input_->setFixedHeight(36);
+    server_port_input_->setMinimumHeight(38);
 
     auto* dLbl = new QLabel("Cloud Object Bucket Folder:", srvCard);
     dLbl->setObjectName("inputLabel");
     auto* dirRow = new QHBoxLayout();
+    dirRow->setSpacing(10);
     save_dir_input_ = new QLineEdit(
         QStandardPaths::writableLocation(QStandardPaths::DownloadLocation) + "/BlindVault_CloudBucket", srvCard);
-    save_dir_input_->setFixedHeight(36);
+    save_dir_input_->setMinimumHeight(38);
     auto* browseDirBtn = new QPushButton("Browse...", srvCard);
     browseDirBtn->setObjectName("secondaryBtn");
-    browseDirBtn->setFixedHeight(36);
+    browseDirBtn->setMinimumHeight(38);
     connect(browseDirBtn, &QPushButton::clicked, this, &MainWindow::onBrowseSaveDir);
     dirRow->addWidget(save_dir_input_, 1);
     dirRow->addWidget(browseDirBtn);
@@ -522,7 +579,7 @@ QWidget* MainWindow::createCloudAndTrustTab() {
 
     server_toggle_btn_ = new QPushButton("Start Cloud Storage Node", srvCard);
     server_toggle_btn_->setObjectName("primaryBtn");
-    server_toggle_btn_->setFixedHeight(38);
+    server_toggle_btn_->setMinimumHeight(42);
     connect(server_toggle_btn_, &QPushButton::clicked, this, &MainWindow::onStartServer);
     srvLayout->addWidget(server_toggle_btn_);
 
@@ -541,15 +598,16 @@ QWidget* MainWindow::createCloudAndTrustTab() {
     auto* trustCard = new QFrame(tab);
     trustCard->setObjectName("card");
     auto* trustLayout = new QVBoxLayout(trustCard);
-    trustLayout->setContentsMargins(20, 16, 20, 16);
-    trustLayout->setSpacing(10);
+    trustLayout->setContentsMargins(22, 18, 22, 18);
+    trustLayout->setSpacing(12);
 
     auto* tHeader = new QHBoxLayout();
+    tHeader->setSpacing(12);
     auto* tTitle = new QLabel("Zero-Trust Node Allowlist (Mutual TLS 1.3 Fingerprints)", trustCard);
     tTitle->setObjectName("cardTitle");
     auto* remBtn = new QPushButton("Revoke Selected", trustCard);
     remBtn->setObjectName("dangerBtn");
-    remBtn->setFixedHeight(30);
+    remBtn->setMinimumHeight(34);
     connect(remBtn, &QPushButton::clicked, this, &MainWindow::onRemovePeer);
     tHeader->addWidget(tTitle);
     tHeader->addStretch();
@@ -560,21 +618,24 @@ QWidget* MainWindow::createCloudAndTrustTab() {
     peer_table_->setHorizontalHeaderLabels({"Node Alias", "Pinned SHA-256 Fingerprint"});
     peer_table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     peer_table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    peer_table_->verticalHeader()->setVisible(false);
+    peer_table_->verticalHeader()->setDefaultSectionSize(34);
     peer_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     peer_table_->setSelectionMode(QAbstractItemView::SingleSelection);
-    peer_table_->setFixedHeight(120);
+    peer_table_->setMinimumHeight(185);
     trustLayout->addWidget(peer_table_);
 
     auto* addRow = new QHBoxLayout();
+    addRow->setSpacing(10);
     peer_name_input_ = new QLineEdit(trustCard);
     peer_name_input_->setPlaceholderText("Alias (e.g. CloudVault-EG)");
-    peer_name_input_->setFixedHeight(34);
+    peer_name_input_->setMinimumHeight(38);
     peer_fp_input_ = new QLineEdit(trustCard);
     peer_fp_input_->setPlaceholderText("64-hex SHA-256 Certificate Fingerprint");
-    peer_fp_input_->setFixedHeight(34);
+    peer_fp_input_->setMinimumHeight(38);
     auto* addBtn = new QPushButton("Pin Node", trustCard);
     addBtn->setObjectName("primaryBtn");
-    addBtn->setFixedHeight(34);
+    addBtn->setMinimumHeight(38);
     connect(addBtn, &QPushButton::clicked, this, &MainWindow::onAddPeer);
     addRow->addWidget(peer_name_input_, 1);
     addRow->addWidget(peer_fp_input_, 2);
@@ -583,7 +644,7 @@ QWidget* MainWindow::createCloudAndTrustTab() {
 
     layout->addWidget(trustCard);
     layout->addStretch();
-    return tab;
+    return wrapInScrollArea(tab);
 }
 
 void MainWindow::onBrowseFile() {
