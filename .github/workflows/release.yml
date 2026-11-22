@@ -147,11 +147,46 @@ jobs:
 
           Compress-Archive -Path dist\* -DestinationPath BlindVault-Windows-x64.zip
 
-      - name: Upload Windows Asset
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.x'
+
+      - name: Install WiX Toolset v5
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $env:Path = "$env:USERPROFILE\.dotnet\tools;$env:Path"
+          wix extension add --global WixToolset.UI.wixext/5.0.2
+
+      - name: Build Windows MSI Installer
+        run: |
+          $env:Path = "$env:USERPROFILE\.dotnet\tools;$env:Path"
+          $ref = "$env:GITHUB_REF_NAME"
+          if ($ref -match '^v?(\d+)\.(\d+)\.(\d+)') {
+            $msiVersion = "$($matches[1]).$($matches[2]).$($matches[3])"
+          } elseif ($ref -match '^v?(\d+)\.(\d+)$') {
+            $msiVersion = "$($matches[1]).$($matches[2]).0"
+          } else {
+            $msiVersion = "2.2.0"
+          }
+          wix build installer/BlindVault.wxs `
+            -arch x64 `
+            -ext WixToolset.UI.wixext `
+            -d "ProductVersion=$msiVersion" `
+            -d "DistDir=dist" `
+            -d "IconPath=assets/blindvault.ico" `
+            -d "LicenseRtf=installer/License.rtf" `
+            -d "BannerBmp=installer/banner.bmp" `
+            -d "DialogBmp=installer/dialog.bmp" `
+            -o BlindVault-Windows-x64.msi
+
+      - name: Upload Windows Assets
         uses: actions/upload-artifact@v4
         with:
-          name: windows-zip
-          path: BlindVault-Windows-x64.zip
+          name: windows-assets
+          path: |
+            BlindVault-Windows-x64.msi
+            BlindVault-Windows-x64.zip
 
   # ==========================================
   # JOB 3: Publish GitHub Release
@@ -171,7 +206,7 @@ jobs:
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
         with:
-          name: windows-zip
+          name: windows-assets
 
       - name: Publish Release with Assets
         uses: softprops/action-gh-release@v2
@@ -182,6 +217,7 @@ jobs:
           prerelease: false
           files: |
             BlindVault-Linux-x86_64.AppImage
+            BlindVault-Windows-x64.msi
             BlindVault-Windows-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
