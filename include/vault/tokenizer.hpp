@@ -24,6 +24,9 @@ namespace vault_token {
 
 inline constexpr std::array<uint8_t, 4> TOKEN_FILE_MAGIC = {'B', 'V', 'T', 'K'};
 inline constexpr std::size_t WRAPPED_HEX_LEN = vault_crypto::WRAPPED_KEY_LEN * 2; // 80 chars
+inline constexpr std::size_t TOKEN_DIGEST_BYTES = 16;
+inline constexpr std::size_t TOKEN_HEX_LEN = TOKEN_DIGEST_BYTES * 2;
+inline constexpr std::size_t TOKEN_TOTAL_LEN = 4 + TOKEN_HEX_LEN;
 
 struct TransactionRecord {
     std::string tx_id;
@@ -65,6 +68,8 @@ void append_escaped_csv_field(std::string& out, std::string_view field);
 std::string escape_csv_field(std::string_view field);
 std::string format_csv_row(const std::vector<std::string>& cols);
 
+struct TokenVaultTestAccessor;
+
 class TokenVault {
 public:
     TokenVault(std::filesystem::path storage_path,
@@ -100,9 +105,10 @@ public:
     [[nodiscard]] std::size_t size() const;
 
 private:
+    friend struct TokenVaultTestAccessor;
     void init_hmac_ctx();
     std::string_view tokenize_view_unlocked(std::string_view raw_value);
-    std::string compute_token_unlocked(std::string_view input) const;
+    std::string compute_token_unlocked(std::string_view input, std::uint64_t collision_attempt = 0) const;
     void sanitize_single_line_unlocked(std::string_view line,
                                        std::string& line_out,
                                        std::array<std::string_view, 8>& views,

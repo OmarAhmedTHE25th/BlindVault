@@ -224,7 +224,8 @@ TEST(Tokenizer, DeterministicTokensAndIpMasking) {
     EXPECT_EQ(t1, t2);
     EXPECT_NE(t1, t3);
     EXPECT_EQ(t1.rfind("TOK_", 0), 0u);
-    EXPECT_EQ(t1.size(), 20u);
+    EXPECT_EQ(t1.size(), vault_token::TOKEN_TOTAL_LEN);
+    EXPECT_EQ(t1.size(), 36u);
     EXPECT_EQ(vault.detokenize(t1), "30108110101000");
 
     vault_token::TransactionRecord raw{
@@ -1189,6 +1190,93 @@ TEST(VaultHsm, Pkcs11HardwareRoundTripAndNonExtractableKek) {
     EXPECT_NE(res.restored_csv.find("TXN_HSM"), std::string::npos);
     EXPECT_TRUE(gw2.metadata_index().verify_audit_chain());
 #endif
+}
+
+// ---------------- 128-Bit Tokenization & Deterministic Collision Resolution ----------------
+
+namespace vault_token {
+struct TokenVaultTestAccessor {
+    static std::string compute_candidate(const TokenVault& v,
+                                         std::string_view input,
+                                         std::uint64_t attempt) {
+        std::lock_guard<std::mutex> lock(v.mutex_);
+        return v.compute_token_unlocked(input, attempt);
+    }
+
+    static void inject_reverse_mapping(TokenVault& v,
+                                       const std::string& token,
+                                       const std::string& raw) {
+        std::lock_guard<std::mutex> lock(v.mutex_);
+        v.reverse_map_[token] = raw;
+        v.forward_map_[raw] = token;
+        v.dirty_ = true;
+    }
+};
+} // namespace vault_token
+
+TEST(Tokenizer, Token128BitAndDeterministicCollisionResolution) {
+    TempDir dir;
+    auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("col.kek"));
+    std::array<uint8_t, 32> fixed_pepper{};
+    fixed_pepper.fill(0x5A);
+
+    const auto store_path = dir.file("col_tokens.enc");
+    std::string expected_attempt0;
+    std::string expected_attempt1;
+    std::string expected_attempt2;
+    std::string resolved_double_collision;
+
+    {
+        vault_token::TokenVault vault(store_path, kms, fixed_pepper);
+
+        // Compute the base (attempt=0) and collision-rehashed (attempt=1, attempt=2) 128-bit tokens
+        expected_attempt0 = vault_token::TokenVaultTestAccessor::compute_candidate(vault, "Customer-B", 0);
+        expected_attempt1 = vault_token::TokenVaultTestAccessor::compute_candidate(vault, "Customer-B", 1);
+        expected_attempt2 = vault_token::TokenVaultTestAccessor::compute_candidate(vault, "Customer-B", 2);
+
+        ASSERT_EQ(expected_attempt0.size(), 36u);
+        ASSERT_EQ(expected_attempt1.size(), 36u);
+        ASSERT_EQ(expected_attempt2.size(), 36u);
+        EXPECT_NE(expected_attempt0, expected_attempt1);
+        EXPECT_NE(expected_attempt1, expected_attempt2);
+        EXPECT_NE(expected_attempt0, expected_attempt2);
+
+        // Force a collision on attempt=0 by pre-assigning expected_attempt0 to a DIFFERENT raw value
+        vault_token::TokenVaultTestAccessor::inject_reverse_mapping(vault, expected_attempt0, "Customer-A");
+
+        // Also force a chained collision on attempt=1 -> must deterministically resolve to attempt=2
+        vault_token::TokenVaultTestAccessor::inject_reverse_mapping(vault, expected_attempt1, "Customer-C");
+
+        resolved_double_collision = vault.tokenize("Customer-B");
+        EXPECT_EQ(resolved_double_collision, expected_attempt2);
+        EXPECT_NE(resolved_double_collision, expected_attempt0);
+        EXPECT_NE(resolved_double_collision, expected_attempt1);
+
+        // Existing entries must NEVER be overwritten or aliased
+        EXPECT_EQ(vault.detokenize(expected_attempt0), "Customer-A");
+        EXPECT_EQ(vault.detokenize(expected_attempt1), "Customer-C");
+        EXPECT_EQ(vault.detokenize(resolved_double_collision), "Customer-B");
+
+        // Subsequent calls return the exact same resolved token
+        EXPECT_EQ(vault.tokenize("Customer-B"), resolved_double_collision);
+        vault.flush();
+    }
+
+    // Verify determinism across an independent vault with the same collision state
+    {
+        vault_token::TokenVault fresh_vault(dir.file("col_tokens_2.enc"), kms, fixed_pepper);
+        vault_token::TokenVaultTestAccessor::inject_reverse_mapping(fresh_vault, expected_attempt0, "Customer-A");
+        vault_token::TokenVaultTestAccessor::inject_reverse_mapping(fresh_vault, expected_attempt1, "Customer-C");
+        EXPECT_EQ(fresh_vault.tokenize("Customer-B"), resolved_double_collision);
+    }
+
+    // Verify persisted collision-resolved mappings reload cleanly from disk
+    {
+        vault_token::TokenVault reloaded(store_path, kms, fixed_pepper);
+        EXPECT_EQ(reloaded.detokenize(expected_attempt0), "Customer-A");
+        EXPECT_EQ(reloaded.detokenize(expected_attempt1), "Customer-C");
+        EXPECT_EQ(reloaded.detokenize(resolved_double_collision), "Customer-B");
+    }
 }
 
 // ---------------- Atomic, Durable, 0600 Secret File Writer ----------------

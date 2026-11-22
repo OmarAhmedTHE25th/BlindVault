@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "tokenizer.hpp"
 
 #include <cstring>
@@ -132,11 +133,16 @@ std::unordered_map<std::string, std::string> TokenVault::rotate_kms_pepper() {
     forward_map_.reserve(old_reverse.size());
     reverse_map_.reserve(old_reverse.size());
 
-    for (const auto& [old_token, raw] : old_reverse) {
-        const std::string token = compute_token_unlocked(raw);
-        old_to_new[old_token] = token;
-        forward_map_[raw] = token;
-        reverse_map_[token] = raw;
+    std::vector<std::pair<std::string, std::string>> entries;
+    entries.reserve(old_reverse.size());
+    for (auto& [old_token, raw] : old_reverse) {
+        entries.emplace_back(old_token, raw);
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+    for (const auto& [old_token, raw] : entries) {
+        const std::string_view new_token = tokenize_view_unlocked(raw);
+        old_to_new[old_token] = std::string(new_token);
     }
     dirty_ = !old_reverse.empty();
     return old_to_new;
@@ -505,28 +511,52 @@ std::string_view TokenVault::tokenize_view_unlocked(std::string_view raw_value) 
     }
 
     std::string key(raw_value);
-    std::string token = compute_token_unlocked(key);
-    reverse_map_.emplace(token, key);
-    auto [inserted_it, _] = forward_map_.emplace(std::move(key), std::move(token));
-    dirty_ = true;
-    return inserted_it->second;
+    for (std::uint64_t attempt = 0; attempt < 4096; ++attempt) {
+        std::string candidate = compute_token_unlocked(key, attempt);
+        auto [rev_it, inserted] = reverse_map_.emplace(candidate, key);
+        if (inserted || rev_it->second == key) {
+            auto [fwd_it, fwd_inserted] = forward_map_.emplace(std::move(key), std::move(candidate));
+            if (!fwd_inserted) fwd_it->second = rev_it->first;
+            dirty_ = true;
+            return fwd_it->second;
+        }
+    }
+    throw std::runtime_error("TokenVault: failed to resolve token collision");
 }
 
-std::string TokenVault::compute_token_unlocked(std::string_view input) const {
+std::string TokenVault::compute_token_unlocked(std::string_view input,
+                                               std::uint64_t collision_attempt) const {
     unsigned char digest[EVP_MAX_MD_SIZE];
     std::size_t digest_len = 0;
-    if (EVP_MAC_init(hmac_ctx_, nullptr, 0, nullptr) != 1 ||
-        EVP_MAC_update(hmac_ctx_, reinterpret_cast<const unsigned char*>(input.data()), input.size()) != 1 ||
-        EVP_MAC_final(hmac_ctx_, digest, &digest_len, sizeof(digest)) != 1 || digest_len < 8) {
+    if (EVP_MAC_init(hmac_ctx_, nullptr, 0, nullptr) != 1) {
+        throw std::runtime_error("TokenVault: HMAC-SHA256 re-init failed");
+    }
+    if (collision_attempt > 0) {
+        static constexpr char kCollisionDomain[] = "BLINDVAULT_TOK_COLLISION_V1";
+        std::array<unsigned char, 8> ctr_be{};
+        for (int i = 0; i < 8; ++i) {
+            ctr_be[static_cast<std::size_t>(i)] =
+                static_cast<unsigned char>((collision_attempt >> (56 - i * 8)) & 0xFF);
+        }
+        const unsigned char sep = 0x00;
+        if (EVP_MAC_update(hmac_ctx_, reinterpret_cast<const unsigned char*>(kCollisionDomain), sizeof(kCollisionDomain)) != 1 ||
+            EVP_MAC_update(hmac_ctx_, ctr_be.data(), ctr_be.size()) != 1 ||
+            EVP_MAC_update(hmac_ctx_, &sep, 1) != 1) {
+            throw std::runtime_error("TokenVault: HMAC-SHA256 collision domain update failed");
+        }
+    }
+    if (EVP_MAC_update(hmac_ctx_, reinterpret_cast<const unsigned char*>(input.data()), input.size()) != 1 ||
+        EVP_MAC_final(hmac_ctx_, digest, &digest_len, sizeof(digest)) != 1 || digest_len < TOKEN_DIGEST_BYTES) {
         throw std::runtime_error("TokenVault: HMAC-SHA256 computation failed");
     }
     static constexpr char hex[] = "0123456789abcdef";
-    std::string token(20, '\0');
+    std::string token(TOKEN_TOTAL_LEN, '\0');
     token[0] = 'T'; token[1] = 'O'; token[2] = 'K'; token[3] = '_';
-    for (int i = 0; i < 8; ++i) {
+    for (std::size_t i = 0; i < TOKEN_DIGEST_BYTES; ++i) {
         token[4 + i * 2]     = hex[digest[i] >> 4];
         token[4 + i * 2 + 1] = hex[digest[i] & 0x0F];
     }
+    OPENSSL_cleanse(digest, sizeof(digest));
     return token;
 }
 
@@ -569,7 +599,11 @@ void TokenVault::load_unlocked() {
 
         std::string token(line.substr(0, tab));
         std::string raw(line.substr(tab + 1));
-        reverse_map_[token] = raw;
+        auto [rev_it, inserted] = reverse_map_.emplace(token, raw);
+        if (!inserted && rev_it->second != raw) {
+            OPENSSL_cleanse(plaintext.data(), plaintext.size());
+            throw std::runtime_error("TokenVault: conflicting duplicate token in persisted store");
+        }
         forward_map_[std::move(raw)] = std::move(token);
     }
     OPENSSL_cleanse(plaintext.data(), plaintext.size());
