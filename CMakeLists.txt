@@ -196,7 +196,10 @@ if(WIN32)
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "bin")
     include(InstallRequiredSystemLibraries)
 
-    set(WINDEPLOYQT_EXECUTABLE "")
+    # NOTE: do not set a normal variable named WINDEPLOYQT_EXECUTABLE here; a normal
+    # variable shadows the cache entry written by find_program() (CMP0125), which
+    # previously left the configured staging script with an empty windeployqt path.
+    unset(WINDEPLOYQT_EXECUTABLE)
     if(P2P_BUILD_GUI)
         set(_qt_bin_hints "")
         foreach(_qt_target IN ITEMS Qt6::windeployqt Qt6::qmake Qt6::Core)
@@ -227,6 +230,10 @@ if(WIN32)
             REQUIRED
         )
         file(TO_CMAKE_PATH "${WINDEPLOYQT_EXECUTABLE}" WINDEPLOYQT_EXECUTABLE)
+        if(NOT WINDEPLOYQT_EXECUTABLE OR NOT EXISTS "${WINDEPLOYQT_EXECUTABLE}")
+            message(FATAL_ERROR "Failed to locate windeployqt executable (hints: ${_qt_bin_hints})")
+        endif()
+        message(STATUS "BlindVault windeployqt: ${WINDEPLOYQT_EXECUTABLE}")
         get_filename_component(_qt_bin_dir "${WINDEPLOYQT_EXECUTABLE}" DIRECTORY)
     endif()
 
