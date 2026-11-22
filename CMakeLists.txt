@@ -192,9 +192,9 @@ if(WIN32)
     endif()
 
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP FALSE)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_NO_WARNINGS TRUE)
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "bin")
-    set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
-    include(InstallRequiredSystemRuntimeLibraries)
+    include(InstallRequiredSystemLibraries)
 
     set(WINDEPLOYQT_EXECUTABLE "")
     if(P2P_BUILD_GUI AND TARGET Qt6::qmake)
