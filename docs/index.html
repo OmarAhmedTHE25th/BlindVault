@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="BlindVault — Zero-knowledge C++20 banking storage gateway, streaming BVL3 AEAD encryption, offline 2-of-3 Ed25519 quorum control, and mutual TLS 1.3 transport." />
+  <title>BlindVault — Zero-Knowledge Banking Storage</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="ambient-mesh" aria-hidden="true"></div>
+
+  <!-- Sticky Glassmorphic Header -->
+  <header class="site-header" id="site-header">
+    <div class="container header-inner">
+      <div class="brand-group">
+        <a href="#top" class="brand-logo" aria-label="BlindVault Home">
+          <span class="logo-mark" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+              <rect x="3.5" y="10" width="17" height="10.5" rx="3" stroke="currentColor" stroke-width="2" />
+              <path d="M7.5 10V7a4.5 4.5 0 0 1 9 0v3" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              <circle cx="12" cy="15.25" r="1.6" fill="#10B981" />
+            </svg>
+          </span>
+          <span class="brand-name">BlindVault</span>
+        </a>
+
+        <div class="product-switcher" role="tablist" aria-label="Ecosystem component switcher">
+          <button type="button" class="switch-pill is-active" data-product="vault" role="tab" aria-selected="true">
+            BlindVault
+          </button>
+          <button type="button" class="switch-pill" data-product="control" role="tab" aria-selected="false">
+            BlindVault-Control
+          </button>
+        </div>
+      </div>
+
+      <nav class="main-nav" aria-label="Primary navigation">
+        <a href="#how-it-works">How It Works</a>
+        <a href="#xray">Live X-Ray</a>
+        <a href="#security">Security</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="#quickstart">Quickstart</a>
+      </nav>
+
+      <div class="header-actions">
+        <a
+          href="https://github.com/OmarAhmedTHE25th/BlindVault"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="btn btn-github"
+        >
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" />
+          </svg>
+          <span>GitHub</span>
+        </a>
+
+        <button
+          type="button"
+          class="mobile-menu-btn"
+          id="mobile-menu-btn"
+          aria-expanded="false"
+          aria-controls="mobile-drawer"
+          aria-label="Toggle menu"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+            <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="mobile-drawer" id="mobile-drawer" hidden>
+      <a href="#how-it-works">How It Works</a>
+      <a href="#xray">Live X-Ray</a>
+      <a href="#security">Security</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="#control-plane">BlindVault-Control</a>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- 1. Hero Section -->
+    <section class="hero-section" id="how-it-works">
+      <div class="container hero-grid">
+        <div class="hero-copy">
+          <div class="hero-badge">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            <span>C++20 • OpenSSL 3 • PKCS#11 HSM • mTLS 1.3</span>
+          </div>
+
+          <h1 class="hero-title">
+            Zero-Knowledge Banking Storage.
+            <span class="title-accent">Mathematically Blind to the Cloud.</span>
+          </h1>
+
+          <p class="hero-subtitle">
+            Scrub customer identities inside your bank perimeter, seal records into standardized 64 KiB encrypted buckets, and enforce offline 2-of-3 officer approval before anything can be read again. Even a compromised cloud host sees zero PII, zero sizes, and zero keys.
+          </p>
+
+          <div class="hero-cta">
+            <a href="#quickstart" class="btn btn-primary">
+              <span>Get Started</span>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </a>
+            <a href="#xray" class="btn btn-secondary">
+              <span>Explore Interactive X-Ray</span>
+            </a>
+          </div>
+        </div>
+
+        <!-- Hero Interactive Transformation Pipeline Card -->
+        <div class="hero-visual">
+          <div class="pipeline-card">
+            <div class="pipeline-header">
+              <div class="window-dots" aria-hidden="true">
+                <span></span><span></span><span></span>
+              </div>
+              <span class="pipeline-caption">Egress Transformation Preview</span>
+              <span class="pipeline-cycle-pill" id="hero-cycle-status">Auto-cycling</span>
+            </div>
+
+            <div class="stage-pills" role="tablist" aria-label="Pipeline stage selector">
+              <button type="button" class="stage-pill is-active" data-stage="0" role="tab" aria-selected="true">
+                <span class="pill-step">1</span>
+                <span>Raw CSV</span>
+              </button>
+              <span class="stage-arrow" aria-hidden="true">→</span>
+              <button type="button" class="stage-pill" data-stage="1" role="tab" aria-selected="false">
+                <span class="pill-step">2</span>
+                <span>HMAC Tokenized</span>
+              </button>
+              <span class="stage-arrow" aria-hidden="true">→</span>
+              <button type="button" class="stage-pill" data-stage="2" role="tab" aria-selected="false">
+                <span class="pill-step">3</span>
+                <span>64 KiB AES-GCM</span>
+              </button>
+            </div>
+
+            <div class="stage-viewport" id="hero-stage-viewport">
+              <!-- Stage 0: Raw CSV -->
+              <div class="stage-panel is-active" data-stage-panel="0">
+                <div class="panel-status-row">
+                  <span class="status-badge badge-amber">Trusted On-Premise Input</span>
+                  <span class="meta-mono">124 B raw row</span>
+                </div>
+                <div class="record-fields">
+                  <div class="field-item">
+                    <span class="field-label">Customer</span>
+                    <span class="field-value val-sensitive">Ahmed Hassan</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">National ID</span>
+                    <span class="field-value val-sensitive mono">30108110101000</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">IBAN</span>
+                    <span class="field-value val-sensitive mono">EG38...263181000</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">Source IP</span>
+                    <span class="field-value val-sensitive mono">41.48.192.14</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">Amount</span>
+                    <span class="field-value mono">14,250.00 EGP</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">Merchant</span>
+                    <span class="field-value">Carrefour-Maadi</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Stage 1: HMAC Tokenized -->
+              <div class="stage-panel" data-stage-panel="1" hidden>
+                <div class="panel-status-row">
+                  <span class="status-badge badge-blue">O(1)-RAM Stream Scrub</span>
+                  <span class="meta-mono">OpenSSL 3 EVP_MAC</span>
+                </div>
+                <div class="record-fields">
+                  <div class="field-item">
+                    <span class="field-label">Customer Token</span>
+                    <span class="field-value val-token mono">TOK_bd4089be7415073d</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">National ID</span>
+                    <span class="field-value val-token mono">TOK_9f12c401ab3e7710</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">IBAN Token</span>
+                    <span class="field-value val-token mono">TOK_4a87e29c0198ff22</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">IP Status</span>
+                    <span class="field-value val-redacted mono">REDACTED_IP</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">Amount</span>
+                    <span class="field-value mono">14,250.00 EGP</span>
+                  </div>
+                  <div class="field-item">
+                    <span class="field-label">Lookup Table</span>
+                    <span class="field-value val-token mono">vault_tokens.enc (BVTK)</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Stage 2: 64 KiB AES-256-GCM Blob -->
+              <div class="stage-panel" data-stage-panel="2" hidden>
+                <div class="panel-status-row">
+                  <span class="status-badge badge-emerald">Zero-Knowledge Cloud Object</span>
+                  <span class="meta-mono">65,568 B aligned BVL3</span>
+                </div>
+                <div class="blob-hex-card">
+                  <div class="hex-line">
+                    <span class="hex-tag">HDR</span>
+                    <span class="mono">42 56 4C 33  a8 19 c4 02 77 f1 09 e3  00 00 00 00</span>
+                    <span class="hex-ascii">BVL3............</span>
+                  </div>
+                  <div class="hex-line">
+                    <span class="hex-tag">CT0</span>
+                    <span class="mono">d9 41 7b e2  9c 04 51 8a 3f 11 90 b6  2e 63 c8 44</span>
+                    <span class="hex-ascii">.A{...Q.?...c.D</span>
+                  </div>
+                  <div class="hex-line">
+                    <span class="hex-tag">TAG</span>
+                    <span class="mono">7a 0c f3 91  b2 48 6e 19 88 d4 a1 55  03 e7 29 c0</span>
+                    <span class="hex-ascii">z....Hn....U..).</span>
+                  </div>
+                </div>
+                <div class="blob-footer-chips">
+                  <span class="mini-chip">RFC 3394 Wrapped DEK</span>
+                  <span class="mini-chip">2-of-3 XOR Shards</span>
+                  <span class="mini-chip">mTLS 1.3 Stream</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2. Interactive "Bank vs. Cloud" X-Ray Section -->
+    <section class="xray-section reveal-on-scroll" id="xray">
+      <div class="container">
+        <div class="section-intro">
+          <span class="eyebrow">Interactive X-Ray Demo</span>
+          <h2>See What the Cloud Sees vs. What Officers Unlock</h2>
+          <p>
+            Flip between the untrusted remote storage server and the bank's 2-of-3 quorum console. Notice how missing cloud nodes recover automatically, and how 1 officer alone stays locked out.
+          </p>
+
+          <div class="xray-toggle-wrap">
+            <div class="xray-toggle" role="tablist" aria-label="X-Ray perspective switch">
+              <button type="button" class="xray-btn is-active" data-xray-mode="cloud" role="tab" aria-selected="true">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M17.5 19H7a4 4 0 0 1-.4-7.98A5.5 5.5 0 0 1 17.3 9.2 3.5 3.5 0 0 1 17.5 19Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round" />
+                </svg>
+                <span>Untrusted Cloud View</span>
+              </button>
+              <button type="button" class="xray-btn" data-xray-mode="bank" role="tab" aria-selected="false">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round" />
+                  <path d="m9 12 2 2 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <span>Bank Perimeter View (2-of-3 Quorum)</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="xray-card">
+          <!-- Mode A: Untrusted Cloud View -->
+          <div class="xray-pane is-active" id="xray-cloud-pane">
+            <div class="xray-topbar">
+              <div class="xray-metrics">
+                <span class="trust-chip chip-emerald">
+                  <span class="chip-dot"></span>
+                  0 Bytes PII Exposed
+                </span>
+                <span class="trust-chip chip-blue">REDACTED_IP</span>
+                <span class="trust-chip chip-amber">No Keys Present</span>
+                <span class="trust-chip chip-slate mono">65,568 B Fixed Bucket</span>
+              </div>
+
+              <button type="button" class="btn btn-subtle-action" id="simulate-loss-btn">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M12 9v4m0 4h.01M10.3 3.9 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <span id="simulate-loss-label">Simulate Cloud Node Failure</span>
+              </button>
+            </div>
+
+            <div class="cloud-grid">
+              <div class="hex-console" aria-label="Encrypted cloud blob preview">
+                <div class="console-head">
+                  <span class="mono">vault_batch_1795202723940_0.enc</span>
+                  <span class="console-tag">AAD Bound: filename || chunk_id || is_final</span>
+                </div>
+                <pre class="hex-dump"><code>00000000: 42 56 4c 33  a8 19 c4 02  77 f1 09 e3  00 00 00 00  |BVL3....w.......|
+00000010: 00 00 00 00  00 00 00 00  00 00 00 00  00 00 00 00  |................|
+00000020: ff e4 91 c2  4b 88 10 3d  e9 2a 74 c5  60 1b 55 f9  |....K..=.*t.`.U.|
+00000030: 8c 37 a0 1d  94 6f 28 e1  07 c3 b5 42  9a 61 d8 12  |.7...o(....B.a..|
+00000040: 53 7e 04 b1  c9 82 6d 30  f4 15 9b a6  42 0e 77 83  |S~....m0....B.w.|
+...
+0000fff0: 7a 0c f3 91  b2 48 6e 19  88 d4 a1 55  03 e7 29 c0  |z....Hn....U..).|
+[65,536 bytes opaque AES-256-GCM frame + CSPRNG noise padding]</code></pre>
+              </div>
+
+              <div class="shard-panel">
+                <h3 class="shard-title">2-of-3 Distributed Erasure Shards</h3>
+                <p class="shard-desc">
+                  Ciphertext is XOR-split across 3 independent nodes. No single shard reveals data, and any 2 reconstruct the exact blob.
+                </p>
+
+                <div class="shard-list" id="shard-list">
+                  <div class="shard-item is-healthy" id="shard-0">
+                    <div>
+                      <strong class="mono">Shard 0 · s3://shard0</strong>
+                      <span class="shard-sub">Data Slice A (32.02 KiB)</span>
+                    </div>
+                    <span class="shard-state badge-emerald" id="shard-0-state">Online</span>
+                  </div>
+                  <div class="shard-item is-healthy" id="shard-1">
+                    <div>
+                      <strong class="mono">Shard 1 · s3://shard1</strong>
+                      <span class="shard-sub">Data Slice B (32.02 KiB)</span>
+                    </div>
+                    <span class="shard-state badge-emerald">Online</span>
+                  </div>
+                  <div class="shard-item is-healthy" id="shard-2">
+                    <div>
+                      <strong class="mono">Shard 2 · s3://shard2</strong>
+                      <span class="shard-sub">XOR Parity A⊕B (32.02 KiB)</span>
+                    </div>
+                    <span class="shard-state badge-emerald">Online</span>
+                  </div>
+                </div>
+
+                <div class="recovery-banner" id="recovery-banner">
+                  <strong>Normal Mirroring Active:</strong> Primary `.enc` blob verified intact alongside 3 healthy shards.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mode B: Bank Perimeter View -->
+          <div class="xray-pane" id="xray-bank-pane" hidden>
+            <div class="quorum-header-bar">
+              <div class="quorum-meta">
+                <div class="quorum-status" id="quorum-status-badge">
+                  <span class="status-dot"></span>
+                  <span id="quorum-status-text">Ed25519 Quorum Verified (2-of-3)</span>
+                </div>
+                <span class="mono nonce-pill">
+                  nonce: 1f47224e5f0041e9 • exp: 5m TTL
+                </span>
+              </div>
+
+              <div class="officer-switches" aria-label="Toggle compliance officer offline signatures">
+                <button type="button" class="officer-chip is-signed" data-officer="CBE-Officer-1" aria-pressed="true">
+                  <span class="officer-check">✓</span>
+                  <span class="mono">CBE-Officer-1</span>
+                </button>
+                <button type="button" class="officer-chip is-signed" data-officer="CBE-Officer-2" aria-pressed="true">
+                  <span class="officer-check">✓</span>
+                  <span class="mono">CBE-Officer-2</span>
+                </button>
+                <button type="button" class="officer-chip" data-officer="CBE-Officer-3" aria-pressed="false">
+                  <span class="officer-check">+</span>
+                  <span class="mono">CBE-Officer-3</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="quorum-denial-banner" id="quorum-denial-banner" hidden>
+              <strong>QUORUM DENIED:</strong> Gateway requires at least <strong>2 of 3</strong> distinct detached Ed25519 officer signatures bound to this single-use challenge nonce. Click another officer above to authorize re-hydration.
+            </div>
+
+            <div class="table-scroll" id="rehydrated-table-wrap">
+              <table class="tx-table">
+                <thead>
+                  <tr>
+                    <th>Tx ID</th>
+                    <th>Customer</th>
+                    <th>National ID</th>
+                    <th>IP Status</th>
+                    <th class="num-col">Amount EGP</th>
+                    <th>Merchant</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="mono">TXN100042</td>
+                    <td><strong>Ahmed Hassan</strong></td>
+                    <td class="mono">30108110101000</td>
+                    <td><span class="redacted-pill mono">REDACTED_IP</span></td>
+                    <td class="num-col mono">14,250.00</td>
+                    <td>Carrefour-Maadi</td>
+                  </tr>
+                  <tr>
+                    <td class="mono">TXN100043</td>
+                    <td><strong>Mona El-Sayed</strong></td>
+                    <td class="mono">29901010102222</td>
+                    <td><span class="redacted-pill mono">REDACTED_IP</span></td>
+                    <td class="num-col mono">3,840.00</td>
+                    <td>InstaPay-P2P</td>
+                  </tr>
+                  <tr>
+                    <td class="mono">TXN100044</td>
+                    <td><strong>Youssef Mahmoud</strong></td>
+                    <td class="mono">29504120103318</td>
+                    <td><span class="redacted-pill mono">REDACTED_IP</span></td>
+                    <td class="num-col mono">27,900.00</td>
+                    <td>Amazon-EG</td>
+                  </tr>
+                  <tr>
+                    <td class="mono">TXN100045</td>
+                    <td><strong>Nourhan Tarek</strong></td>
+                    <td class="mono">30206190104491</td>
+                    <td><span class="redacted-pill mono">REDACTED_IP</span></td>
+                    <td class="num-col mono">1,490.00</td>
+                    <td>Fawry-BillPay</td>
+                  </tr>
+                  <tr>
+                    <td class="mono">TXN100046</td>
+                    <td><strong>Salma Ibrahim</strong></td>
+                    <td class="mono">29811230105574</td>
+                    <td><span class="redacted-pill mono">REDACTED_IP</span></td>
+                    <td class="num-col mono">8,620.00</td>
+                    <td>WE-Telecom</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. Bento Grid — Core Architecture at a Glance -->
+    <section class="bento-section reveal-on-scroll" id="security">
+      <div class="container">
+        <div class="section-intro">
+          <span class="eyebrow">Core Architecture at a Glance</span>
+          <h2>Six Layers of Defense Between Your Records and the Cloud</h2>
+          <p>
+            Every security boundary works independently—so even if one layer is stressed or offline, customer identities and keys remain mathematically out of reach.
+          </p>
+        </div>
+
+        <div class="bento-grid">
+          <!-- Card 1 -->
+          <article class="bento-card">
+            <div class="bento-icon icon-blue">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <path d="M4 7h16M4 12h10M4 17h7" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                <circle cx="17.5" cy="15.5" r="3.5" stroke="currentColor" stroke-width="2" />
+              </svg>
+            </div>
+            <h3>O(1)-RAM Streaming Tokenizer</h3>
+            <p>Scrubs names, National IDs, IBANs, and IPs line-by-line into <code class="mono-inline">TOK_&lt;16-hex&gt;</code> without loading whole batches into RAM.</p>
+            <div class="bento-micro">
+              <span class="mono">line stream</span>
+              <span class="micro-arrow">→</span>
+              <span class="micro-pill">~64 KiB buffer</span>
+              <span class="micro-arrow">→</span>
+              <span class="mono">TOK_bd40...</span>
+            </div>
+          </article>
+
+          <!-- Card 2 -->
+          <article class="bento-card">
+            <div class="bento-icon icon-emerald">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <rect x="4" y="4" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="2" />
+                <rect x="13" y="4" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="2" />
+                <rect x="4" y="13" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="2" />
+                <rect x="13" y="13" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="2" stroke-dasharray="2 2" />
+              </svg>
+            </div>
+            <h3>Chunked BVL3 AEAD &amp; 64 KiB Padding</h3>
+            <p>Fixed 65,536-byte AES-256-GCM frames with per-chunk nonces and CSPRNG noise padding prevent file-size traffic inference.</p>
+            <div class="bento-micro micro-frames">
+              <span class="frame-box">Frame 0</span>
+              <span class="frame-box">Frame 1</span>
+              <span class="frame-box is-pad">64 KiB Pad</span>
+            </div>
+          </article>
+
+          <!-- Card 3 -->
+          <article class="bento-card">
+            <div class="bento-icon icon-amber">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <circle cx="9" cy="8" r="3" stroke="currentColor" stroke-width="2" />
+                <circle cx="16" cy="9" r="2.5" stroke="currentColor" stroke-width="2" />
+                <path d="M3 19c0-2.8 2.7-5 6-5s6 2.2 6 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                <path d="m16 15 2 2 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </div>
+            <h3>Offline 2-of-3 Ed25519 Quorum</h3>
+            <p>Gateway stores only officer <code class="mono-inline">*.pub</code> keys; unmasking requires 2 offline signatures bound to a single-use nonce and UTC expiry.</p>
+            <div class="bento-micro">
+              <span class="micro-pill pill-amber">Officer 1 ✓</span>
+              <span class="micro-pill pill-amber">Officer 2 ✓</span>
+              <span class="micro-pill">No .priv on host</span>
+            </div>
+          </article>
+
+          <!-- Card 4 -->
+          <article class="bento-card">
+            <div class="bento-icon icon-blue">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <rect x="6" y="6" width="12" height="12" rx="2" stroke="currentColor" stroke-width="2" />
+                <path d="M9 2v4m6-4v4M9 18v4m6-4v4M2 9h4m-4 6h4m12-6h4m-4 6h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              </svg>
+            </div>
+            <h3>PKCS#11 HSM &amp; RFC 3394 Wrapping</h3>
+            <p>Non-extractable Master KEK (<code class="mono-inline">CKA_EXTRACTABLE=FALSE</code>) wraps per-batch DEKs with crash-safe KEK rotation and RAM zeroization.</p>
+            <div class="bento-micro">
+              <span class="mono">DEK</span>
+              <span class="micro-arrow">──RFC 3394──▶</span>
+              <span class="micro-pill pill-emerald">HSM Chip</span>
+            </div>
+          </article>
+
+          <!-- Card 5 -->
+          <article class="bento-card">
+            <div class="bento-icon icon-emerald">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <ellipse cx="12" cy="5" rx="7" ry="2.5" stroke="currentColor" stroke-width="2" />
+                <path d="M5 5v6c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V5M5 11v6c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-6" stroke="currentColor" stroke-width="2" />
+              </svg>
+            </div>
+            <h3>2-of-3 XOR Erasure Shards</h3>
+            <p>Splits ciphertext across local disk or 3 S3/MinIO buckets (AWS SigV4) with automatic <code class="mono-inline">SHARD_RECOVERY</code> if a cloud node fails.</p>
+            <div class="bento-micro">
+              <span class="micro-pill">s0</span>
+              <span class="micro-pill">s1</span>
+              <span class="micro-pill">s2</span>
+              <span class="mono muted">Any 2 = 100%</span>
+            </div>
+          </article>
+
+          <!-- Card 6 -->
+          <article class="bento-card">
+            <div class="bento-icon icon-blue">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                <rect x="3" y="4" width="18" height="13" rx="2.5" stroke="currentColor" stroke-width="2" />
+                <path d="M8 21h8m-4-4v4" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              </svg>
+            </div>
+            <h3>Mutual TLS 1.3 &amp; Qt 6 Console</h3>
+            <p>Strict SHA-256 certificate fingerprint allowlisting plus a 3-tab desktop operations console (<code class="mono-inline">BlindVault_GUI</code>).</p>
+            <div class="bento-micro">
+              <span class="micro-pill pill-emerald">TLS 1.3 Pinned</span>
+              <a href="#gui-preview" class="micro-link">Preview GUI →</a>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- Companion Architecture Strip: BlindVault-Control -->
+    <section class="control-strip reveal-on-scroll" id="control-plane">
+      <div class="container">
+        <div class="control-card">
+          <div class="control-main">
+            <span class="eyebrow">Companion Network Switchboard</span>
+            <h2>BlindVault-Control: Reach Peers Anywhere Without Surrendering Privacy</h2>
+            <p>
+              Pair sending and receiving BlindVault nodes behind home or office firewalls using an 8-character invite code. <code class="mono-inline">blindvault-control</code> discovers your external address, introduces peers via ephemeral Redis state, and relays locked TLS 1.3 streams if direct TCP is blocked—without ever logging files, histories, or keys.
+            </p>
+            <div class="control-cmd mono">
+              <span>BlindVault receive 8443 ./received --control http://control.local:8000 --invite</span>
+            </div>
+          </div>
+
+          <div class="control-pillars">
+            <div class="pillar-item">
+              <span class="pillar-badge mono">BVST</span>
+              <div>
+                <strong>Ed25519 UDP Reflector</strong>
+                <span>Signed external IP:port discovery resistant to NAT spoofing.</span>
+              </div>
+            </div>
+            <div class="pillar-item">
+              <span class="pillar-badge mono">ECDSA</span>
+              <div>
+                <strong>Zero-Graph Matchmaking</strong>
+                <span>EC P-256 challenge auth + 8-char Crockford invite codes stored in TTL Redis.</span>
+              </div>
+            </div>
+            <div class="pillar-item">
+              <span class="pillar-badge mono">WSS</span>
+              <div>
+                <strong>Blind Binary Relay + Pub/Sub</strong>
+                <span>Forwards end-to-end mTLS 1.3 chunks via Bearer headers across replicas.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. Big Typographic Benchmark Strip -->
+    <section class="benchmarks-section reveal-on-scroll" id="benchmarks">
+      <div class="container">
+        <div class="section-intro">
+          <span class="eyebrow">Measured C++20 Performance</span>
+          <h2>Wire-Speed Privacy With Minimal Latency Overhead</h2>
+          <p>
+            Benchmarked via Google Benchmark (<code class="mono-inline">bench_vault</code>) on 8 cores @ 2,419 MHz. Zero-copy field parsing and hardware AES keep compliance virtually invisible.
+          </p>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-value">4.90M <span class="stat-unit">rec/s</span></div>
+            <div class="stat-label">HMAC PII &amp; IP Tokenization</div>
+            <div class="stat-detail mono">595.96 MiB/s • 2.15 ms / 10k rows</div>
+          </div>
+
+          <div class="stat-card">
+            <div class="stat-value">3.02 <span class="stat-unit">GiB/s</span></div>
+            <div class="stat-label">AES-256-GCM + 64 KiB Pad</div>
+            <div class="stat-detail mono">171 µs for 512 KiB payload</div>
+          </div>
+
+          <div class="stat-card">
+            <div class="stat-value">1.92 <span class="stat-unit">GiB/s</span></div>
+            <div class="stat-label">2-of-3 XOR Erasure Split</div>
+            <div class="stat-detail mono">134 µs for 256 KiB blob</div>
+          </div>
+
+          <div class="stat-card">
+            <div class="stat-value">561k <span class="stat-unit">rec/s</span></div>
+            <div class="stat-label">End-to-End Egress Pipeline</div>
+            <div class="stat-detail mono">18.8 ms for 10,000 rows • 68.25 MiB/s</div>
+          </div>
+        </div>
+
+        <div class="drawer-wrap">
+          <button
+            type="button"
+            class="btn btn-drawer"
+            id="bench-drawer-toggle"
+            aria-expanded="false"
+            aria-controls="bench-drawer"
+          >
+            <span>Inspect Raw Google Benchmark Results (11 Runs)</span>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" class="drawer-chevron" aria-hidden="true">
+              <path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+
+          <div class="bench-drawer" id="bench-drawer" hidden>
+            <div class="drawer-meta mono">
+              Run on (8 X 2419 MHz CPUs) · Caches: L1d 48 KiB (x4), L1i 32 KiB (x4), L2 1280 KiB (x4), L3 8 MiB · Source: benchmark_results.json
+            </div>
+            <div class="table-scroll">
+              <table class="bench-table mono">
+                <thead>
+                  <tr>
+                    <th>Benchmark</th>
+                    <th>Real Time</th>
+                    <th>CPU Time</th>
+                    <th>Iterations</th>
+                    <th>Throughput</th>
+                    <th>Item Rate</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>BM_TokenizeCsvBatch/1000</td>
+                    <td>0.315 ms</td>
+                    <td>0.298 ms</td>
+                    <td>2,352</td>
+                    <td>408.32 MiB/s</td>
+                    <td>3.36 M/s</td>
+                  </tr>
+                  <tr>
+                    <td>BM_TokenizeCsvBatch/10000</td>
+                    <td>2.147 ms</td>
+                    <td>2.041 ms</td>
+                    <td>336</td>
+                    <td>595.96 MiB/s</td>
+                    <td>4.90 M/s</td>
+                  </tr>
+                  <tr>
+                    <td>BM_TokenizeCsvBatch/50000</td>
+                    <td>11.339 ms</td>
+                    <td>10.740 ms</td>
+                    <td>65</td>
+                    <td>566.15 MiB/s</td>
+                    <td>4.66 M/s</td>
+                  </tr>
+                  <tr>
+                    <td>BM_EncryptEnvelope64KiB/65536</td>
+                    <td>44.99 µs</td>
+                    <td>42.59 µs</td>
+                    <td>16,962</td>
+                    <td>1.43 GiB/s</td>
+                    <td>—</td>
+                  </tr>
+                  <tr>
+                    <td>BM_EncryptEnvelope64KiB/524288</td>
+                    <td>170.99 µs</td>
+                    <td>161.88 µs</td>
+                    <td>4,547</td>
+                    <td>3.02 GiB/s</td>
+                    <td>—</td>
+                  </tr>
+                  <tr>
+                    <td>BM_EncryptEnvelope64KiB/2097152</td>
+                    <td>1,119.74 µs</td>
+                    <td>1,060.09 µs</td>
+                    <td>625</td>
+                    <td>1.84 GiB/s</td>
+                    <td>—</td>
+                  </tr>
+                  <tr>
+                    <td>BM_ErasureSplit2of3/262144</td>
+                    <td>134.02 µs</td>
+                    <td>126.88 µs</td>
+                    <td>5,495</td>
+                    <td>1.92 GiB/s</td>
+                    <td>—</td>
+                  </tr>
+                  <tr>
+                    <td>BM_ErasureSplit2of3/1048576</td>
+                    <td>626.71 µs</td>
+                    <td>593.32 µs</td>
+                    <td>1,085</td>
+                    <td>1.65 GiB/s</td>
+                    <td>—</td>
+                  </tr>
+                  <tr>
+                    <td>BM_ErasureSplit2of3/4194304</td>
+                    <td>3,425.65 µs</td>
+                    <td>3,243.23 µs</td>
+                    <td>208</td>
+                    <td>1.20 GiB/s</td>
+                    <td>—</td>
+                  </tr>
+                  <tr>
+                    <td>BM_EndToEndOffloadPipeline/1000</td>
+                    <td>2.667 ms</td>
+                    <td>2.517 ms</td>
+                    <td>288</td>
+                    <td>48.35 MiB/s</td>
+                    <td>397.37 k/s</td>
+                  </tr>
+                  <tr>
+                    <td>BM_EndToEndOffloadPipeline/10000</td>
+                    <td>18.817 ms</td>
+                    <td>17.818 ms</td>
+                    <td>44</td>
+                    <td>68.25 MiB/s</td>
+                    <td>561.22 k/s</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. Clean Tabbed Quickstart & Qt 6 Console Preview -->
+    <section class="quickstart-section reveal-on-scroll" id="quickstart">
+      <div class="container">
+        <div class="section-intro">
+          <span class="eyebrow">Developer &amp; Operator Quickstart</span>
+          <h2>Up and Running in Minutes</h2>
+          <p>
+            Choose your workflow below—from core mTLS transfers and offline compliance quorum ceremonies to HSM hardware keys and the Qt 6 desktop app.
+          </p>
+        </div>
+
+        <div class="code-workbench">
+          <div class="code-tabs-bar">
+            <div class="code-tabs" role="tablist" aria-label="Quickstart workflow tabs">
+              <button type="button" class="code-tab is-active" data-code-tab="build" role="tab" aria-selected="true">Build &amp; Run</button>
+              <button type="button" class="code-tab" data-code-tab="vault" role="tab" aria-selected="false">RegTech Vault &amp; Quorum</button>
+              <button type="button" class="code-tab" data-code-tab="hsm" role="tab" aria-selected="false">HSM &amp; S3 MinIO</button>
+              <button type="button" class="code-tab" data-code-tab="gui" role="tab" aria-selected="false">Qt 6 Desktop GUI</button>
+            </div>
+
+            <button type="button" class="btn-copy" id="copy-code-btn" aria-label="Copy active commands">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" stroke="currentColor" stroke-width="2" />
+              </svg>
+              <span id="copy-code-label">Copy</span>
+            </button>
+          </div>
+
+          <div class="code-panes">
+            <pre class="code-block is-active" data-code-panel="build"><code># 1. Build BlindVault CLI &amp; test suite (Ubuntu 24.04 / WSL2)
+git clone https://github.com/OmarAhmedTHE25th/BlindVault.git
+cd BlindVault
+cmake -S . -B build -G Ninja
+cmake --build build
+
+# 2. Initialize EC P-256 identities &amp; pin peer fingerprints
+./build/BlindVault init gateway_node
+./build/BlindVault fingerprint
+./build/BlindVault trust add &lt;PEER_SHA256_FINGERPRINT&gt; cloud_vault
+
+# 3. Transfer over mutual TLS 1.3 (direct or via blindvault-control)
+./build/BlindVault receive 8080 ./cloud_received
+./build/BlindVault send 127.0.0.1 8080 ./payload.enc</code></pre>
+
+            <pre class="code-block" data-code-panel="vault" hidden><code># 1. Generate offline Ed25519 keypairs for 2-of-3 Compliance Officers
+./build/BlindVault officer-keygen CBE-Officer-1 ./offline_officers
+./build/BlindVault officer-keygen CBE-Officer-2 ./offline_officers
+cp ./offline_officers/*.pub ./bank_state/officers/
+
+# 2. Stream CSV through Tokenizer + 64 KiB BVL3 AEAD + 2-of-3 Shards
+./build/BlindVault vault offload batch.csv --state-dir ./bank_state --cloud-dir ./cloud_bucket
+
+# 3. Issue a replay-proof challenge (16B nonce + 5m expiry), sign offline, and query
+./build/BlindVault vault challenge "Ahmed Hassan" --state-dir ./bank_state
+SIG1=$(./build/BlindVault officer-sign ./offline_officers/CBE-Officer-1.priv CBE-Officer-1 &lt;TOKEN&gt; &lt;BLOB&gt; &lt;WDEK&gt; &lt;NONCE&gt; &lt;EXPIRES&gt;)
+SIG2=$(./build/BlindVault officer-sign ./offline_officers/CBE-Officer-2.priv CBE-Officer-2 &lt;TOKEN&gt; &lt;BLOB&gt; &lt;WDEK&gt; &lt;NONCE&gt; &lt;EXPIRES&gt;)
+./build/BlindVault vault query "Ahmed Hassan" ./cloud_bucket --nonce &lt;NONCE&gt; --expires &lt;EXPIRES&gt; \
+  --approval "CBE-Officer-1:$SIG1" --approval "CBE-Officer-2:$SIG2" --state-dir ./bank_state</code></pre>
+
+            <pre class="code-block" data-code-panel="hsm" hidden><code># Attach a PKCS#11 Hardware Security Module or SoftHSMv2 token (non-extractable KEK)
+export BLINDVAULT_PKCS11_MODULE=/usr/lib/softhsm/libsofthsm2.so
+export BLINDVAULT_PKCS11_PIN=1234
+
+# Launch 3 independent MinIO buckets for AWS SigV4 2-of-3 erasure sharding
+docker compose -f docker-compose.vault.yml up -d
+export BLINDVAULT_SHARD0_URL=http://127.0.0.1:9000/blindvault-shard0
+export BLINDVAULT_SHARD1_URL=http://127.0.0.1:9002/blindvault-shard1
+export BLINDVAULT_SHARD2_URL=http://127.0.0.1:9004/blindvault-shard2
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=minioadmin
+
+./build/BlindVault vault offload batch.csv --state-dir ./bank_state --cloud-dir ./cloud_bucket</code></pre>
+
+            <pre class="code-block" data-code-panel="gui" hidden><code># Install Qt 6 development packages &amp; compile the 3-tab desktop console
+sudo apt install -y qt6-base-dev libgl1-mesa-dev
+cmake -S . -B build-gui -G Ninja -DP2P_BUILD_GUI=ON -DP2P_BUILD_TESTS=OFF
+cmake --build build-gui --target BlindVault_GUI
+
+# Launch BlindVault Qt 6 RegTech Operations Console
+./build-gui/BlindVault_GUI</code></pre>
+          </div>
+        </div>
+
+        <!-- Qt 6 GUI Screenshot Showcase -->
+        <div class="gui-showcase" id="gui-preview">
+          <div class="gui-showcase-head">
+            <div>
+              <h3>Qt 6 Operations Console</h3>
+              <p>Inspect live throughput, prepare quorum challenges, and monitor pinned transfers.</p>
+            </div>
+            <div class="gui-shot-pills" role="tablist" aria-label="Desktop console screenshots">
+              <button type="button" class="gui-pill is-active" data-shot="./images/gui-send-file.png" data-caption="Bank Egress Gateway — Tokenization &amp; mTLS 1.3 Offload" role="tab" aria-selected="true">Send &amp; Offload</button>
+              <button type="button" class="gui-pill" data-shot="./images/gui-receive-files.png" data-caption="Cloud Vault Receiver — Encrypted Blob Staging &amp; Budgets" role="tab" aria-selected="false">Receive &amp; Verify</button>
+              <button type="button" class="gui-pill" data-shot="./images/gui-trusted-peers.png" data-caption="Node Identity &amp; Pinned SHA-256 Peer Trust Store" role="tab" aria-selected="false">Trusted Peers</button>
+            </div>
+          </div>
+
+          <figure class="gui-frame">
+            <img
+              id="gui-shot-img"
+              src="./images/gui-send-file.png"
+              alt="BlindVault Qt 6 Desktop Application screenshot"
+              loading="lazy"
+            />
+            <figcaption id="gui-shot-caption" class="mono">Bank Egress Gateway — Tokenization &amp; mTLS 1.3 Offload</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Minimal Clean Footer -->
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <strong>BlindVault</strong>
+        <span>C++20 Zero-Knowledge Storage &amp; RegTech Transfer Engine • MIT License</span>
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/OmarAhmedTHE25th/BlindVault" target="_blank" rel="noopener noreferrer">BlindVault Repository</a>
+        <a href="#control-plane">BlindVault-Control</a>
+        <a href="../README.md">Technical README</a>
+        <a href="../PROJECT_GUIDE.md">Plain-English Guide</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>
