@@ -222,23 +222,7 @@
     });
   }
 
-  // 6. Qt 6 GUI Screenshot Switcher
-  const guiPills = document.querySelectorAll(".gui-pill");
-  const guiImg = document.getElementById("gui-shot-img");
-  const guiCaption = document.getElementById("gui-shot-caption");
-  guiPills.forEach((pill) => {
-    pill.addEventListener("click", () => {
-      guiPills.forEach((p) => {
-        const active = p === pill;
-        p.classList.toggle("is-active", active);
-        p.setAttribute("aria-selected", String(active));
-      });
-      if (guiImg && pill.dataset.shot) guiImg.src = pill.dataset.shot;
-      if (guiCaption && pill.dataset.caption) guiCaption.textContent = pill.dataset.caption;
-    });
-  });
-
-  // 7. Smooth Scroll Reveal via IntersectionObserver
+  // 6. Smooth Scroll Reveal via IntersectionObserver
   const reveals = document.querySelectorAll(".reveal-on-scroll");
   if ("IntersectionObserver" in window) {
     const observer = new IntersectionObserver(
