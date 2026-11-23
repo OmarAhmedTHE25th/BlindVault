@@ -1849,6 +1849,60 @@ TEST(VaultCrypto, WriteSecretFile0600SimulatedSyscallFailures) {
 }
 #endif
 
+TEST(Tokenizer, RejectsSpoofedAndUnknownTokPrefixBypass) {
+    TempDir dir;
+    auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("tok_guard.kek"));
+    vault_token::TokenVault vault(dir.file("tok_guard_tokens.enc"), kms);
+
+    // 1. Spoofed non-token strings starting with "TOK_" must NOT pass through
+    const std::string spoof1 = "TOK_CompanyName";
+    const std::string spoof2 = "TOK_1234";
+    const std::string spoof_upper = "TOK_0123456789ABCDEF0123456789ABCDEF";
+    // Valid 36-char format ("TOK_" + 32 lowercase hex), but NEVER issued by this vault
+    const std::string spoof_unissued = "TOK_deadbeefcafebabe0123456789abcdef";
+
+    EXPECT_FALSE(vault_token::is_valid_token_format(spoof1));
+    EXPECT_FALSE(vault_token::is_valid_token_format(spoof2));
+    EXPECT_FALSE(vault_token::is_valid_token_format(spoof_upper));
+    EXPECT_TRUE(vault_token::is_valid_token_format(spoof_unissued));
+
+    const std::string out1 = vault.tokenize(spoof1);
+    const std::string out2 = vault.tokenize(spoof2);
+    const std::string out_upper = vault.tokenize(spoof_upper);
+    const std::string out_unissued = vault.tokenize(spoof_unissued);
+
+    EXPECT_NE(out1, spoof1);
+    EXPECT_NE(out2, spoof2);
+    EXPECT_NE(out_upper, spoof_upper);
+    EXPECT_NE(out_unissued, spoof_unissued);
+
+    EXPECT_TRUE(vault_token::is_valid_token_format(out1));
+    EXPECT_TRUE(vault_token::is_valid_token_format(out2));
+    EXPECT_TRUE(vault_token::is_valid_token_format(out_upper));
+    EXPECT_TRUE(vault_token::is_valid_token_format(out_unissued));
+
+    // Original spoofed inputs must be recoverable via detokenize()
+    EXPECT_EQ(vault.detokenize(out1), spoof1);
+    EXPECT_EQ(vault.detokenize(out_unissued), spoof_unissued);
+
+    // Legitimately issued token MUST pass through idempotently
+    EXPECT_EQ(vault.tokenize(out1), out1);
+    EXPECT_EQ(vault.tokenize(out_unissued), out_unissued);
+
+    // CSV streaming path must likewise tokenize spoofed "TOK_..." fields
+    const std::string csv_in =
+        "tx_id,timestamp,customer_name,national_id,iban,source_ip,amount_egp,merchant\n"
+        "TX_SPOOF,2026-11-23T02:00:00Z,TOK_CompanyName,TOK_deadbeefcafebabe0123456789abcdef," +
+        out1 + ",41.10.20.30,500.00,Carrefour\n";
+    std::istringstream in(csv_in);
+    std::ostringstream out;
+    vault.sanitize_csv_stream(in, out);
+    const std::string csv_out = out.str();
+    EXPECT_EQ(csv_out.find("TOK_CompanyName"), std::string::npos);
+    EXPECT_EQ(csv_out.find(spoof_unissued), std::string::npos);
+    EXPECT_NE(csv_out.find(out1), std::string::npos);
+}
+
 namespace {
 
 class FailingWrapKmsProvider final : public vault_kms::KeyManagementProvider {

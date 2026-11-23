@@ -32,6 +32,9 @@ inline constexpr std::size_t TOKEN_DIGEST_BYTES = 16;                 // 128-bit
 inline constexpr std::size_t TOKEN_HEX_LEN = TOKEN_DIGEST_BYTES * 2;  // 32 lowercase hex chars
 inline constexpr std::size_t TOKEN_TOTAL_LEN = 4 + TOKEN_HEX_LEN;     // "TOK_" + 32 hex = 36 chars
 
+// Validates exact BlindVault token syntax: "TOK_" followed by exactly 32 lowercase hex digits.
+[[nodiscard]] bool is_valid_token_format(std::string_view sv) noexcept;
+
 struct TransactionRecord {
     std::string tx_id;
     std::string timestamp;

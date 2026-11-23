@@ -68,6 +68,19 @@ void unescape_tsv_value_into(vault_crypto::SecureString& out, std::string_view e
     }
 }
 
+bool is_valid_token_format(std::string_view sv) noexcept {
+    if (sv.size() != TOKEN_TOTAL_LEN || sv.rfind("TOK_", 0) != 0) {
+        return false;
+    }
+    for (std::size_t i = 4; i < sv.size(); ++i) {
+        const char c = sv[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 CsvStreamParser::~CsvStreamParser() {
@@ -401,7 +414,6 @@ std::unordered_map<std::string, std::string> TokenVault::rotate_kms_pepper() {
 
 std::string TokenVault::tokenize(std::string_view raw_value) {
     if (raw_value.empty()) return "";
-    if (raw_value.rfind("TOK_", 0) == 0) return std::string(raw_value);
 
     std::lock_guard<std::mutex> lock(mutex_);
     return std::string(tokenize_view_unlocked(raw_value));
@@ -699,7 +711,14 @@ void TokenVault::init_hmac_ctx() {
 
 std::string_view TokenVault::tokenize_view_unlocked(std::string_view raw_value) {
     if (raw_value.empty()) return {};
-    if (raw_value.rfind("TOK_", 0) == 0) return raw_value;
+
+    // Strict two-step pass-through guard: only preserve an already-issued token if it
+    // both matches the exact "TOK_<32-hex>" 128-bit format AND exists in reverse_map_.
+    if (is_valid_token_format(raw_value)) {
+        if (auto rev_it = reverse_map_.find(raw_value); rev_it != reverse_map_.end()) {
+            return rev_it->first;
+        }
+    }
 
     if (auto it = forward_map_.find(raw_value); it != forward_map_.end()) {
         return it->second;
