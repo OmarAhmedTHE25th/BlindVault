@@ -63,6 +63,7 @@ target_link_libraries(blindvault_core PUBLIC
         OpenSSL::Crypto
         Boost::system
         ${CMAKE_DL_LIBS}
+        $<$<PLATFORM_ID:Windows>:advapi32>
 )
 
 # ---------------- CLI Application ----------------

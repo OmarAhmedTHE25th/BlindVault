@@ -17,7 +17,17 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <openssl/evp.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
+#else
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -1838,5 +1848,75 @@ TEST(VaultCrypto, WriteSecretFile0600SimulatedSyscallFailures) {
     }
 }
 #endif
+
+#ifdef _WIN32
+TEST(VaultCrypto, WriteSecretFile0600EnforcesWindowsOwnerOnlyDacl) {
+    TempDir dir;
+    const auto target = dir.file("win_owner_only.secret");
+    const std::string payload = "WINDOWS_DACL_PROTECTED_SECRET";
+    vault_crypto::write_secret_file_0600(target, payload);
+
+    HANDLE raw_token = nullptr;
+    ASSERT_TRUE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token));
+    DWORD len = 0;
+    GetTokenInformation(raw_token, TokenUser, nullptr, 0, &len);
+    std::vector<uint8_t> tu_buf(len);
+    ASSERT_TRUE(GetTokenInformation(raw_token, TokenUser, tu_buf.data(), len, &len));
+    CloseHandle(raw_token);
+    const PSID user_sid = reinterpret_cast<const TOKEN_USER*>(tu_buf.data())->User.Sid;
+
+    std::array<uint8_t, SECURITY_MAX_SID_SIZE> sys_sid_buf{};
+    DWORD sys_len = static_cast<DWORD>(sys_sid_buf.size());
+    const PSID sys_sid = reinterpret_cast<PSID>(sys_sid_buf.data());
+    ASSERT_TRUE(CreateWellKnownSid(WinLocalSystemSid, nullptr, sys_sid, &sys_len));
+
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    const DWORD rc = GetNamedSecurityInfoW(
+        target.c_str(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        &dacl,
+        nullptr,
+        &sd);
+    ASSERT_EQ(rc, ERROR_SUCCESS);
+    ASSERT_NE(sd, nullptr);
+    ASSERT_NE(dacl, nullptr);
+
+    SECURITY_DESCRIPTOR_CONTROL ctrl = 0;
+    DWORD rev = 0;
+    ASSERT_TRUE(GetSecurityDescriptorControl(sd, &ctrl, &rev));
+    EXPECT_NE(ctrl & SE_DACL_PROTECTED, 0u);
+
+    ACL_SIZE_INFORMATION acl_info{};
+    ASSERT_TRUE(GetAclInformation(dacl, &acl_info, sizeof(acl_info), AclSizeInformation));
+    EXPECT_EQ(acl_info.AceCount, 2u);
+
+    bool saw_user = false;
+    bool saw_system = false;
+    for (DWORD i = 0; i < acl_info.AceCount; ++i) {
+        LPVOID raw_ace = nullptr;
+        ASSERT_TRUE(GetAce(dacl, i, &raw_ace));
+        auto* hdr = reinterpret_cast<ACE_HEADER*>(raw_ace);
+        EXPECT_EQ(hdr->AceType, ACCESS_ALLOWED_ACE_TYPE);
+        auto* allow_ace = reinterpret_cast<ACCESS_ALLOWED_ACE*>(raw_ace);
+        PSID ace_sid = reinterpret_cast<PSID>(&allow_ace->SidStart);
+        if (EqualSid(ace_sid, user_sid)) {
+            saw_user = true;
+        } else if (EqualSid(ace_sid, sys_sid)) {
+            saw_system = true;
+        } else {
+            ADD_FAILURE() << "Unexpected SID present in protected secret file DACL";
+        }
+    }
+    EXPECT_TRUE(saw_user);
+    EXPECT_TRUE(saw_system);
+
+    LocalFree(sd);
+}
+#endif
+
 
 

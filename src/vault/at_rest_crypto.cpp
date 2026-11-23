@@ -21,6 +21,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 #else
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -316,6 +318,100 @@ void write_secret_file_0600(const std::filesystem::path& path, const std::string
 #ifndef _WIN32
     detail::write_secret_file_0600_posix(path, content, detail::default_posix_file_ops());
 #else
+    struct HandleCloser {
+        HANDLE h = INVALID_HANDLE_VALUE;
+        ~HandleCloser() {
+            if (h != INVALID_HANDLE_VALUE && h != nullptr) {
+                CloseHandle(h);
+            }
+        }
+    };
+    struct LocalMemGuard {
+        HLOCAL ptr = nullptr;
+        ~LocalMemGuard() {
+            if (ptr) LocalFree(ptr);
+        }
+    };
+
+    HANDLE raw_token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token)) {
+        const DWORD err = GetLastError();
+        throw std::runtime_error(
+            "vault_crypto: OpenProcessToken failed (win32=" + std::to_string(err) + ")");
+    }
+    HandleCloser token_guard{raw_token};
+
+    DWORD token_info_len = 0;
+    GetTokenInformation(raw_token, TokenUser, nullptr, 0, &token_info_len);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || token_info_len == 0) {
+        const DWORD err = GetLastError();
+        throw std::runtime_error(
+            "vault_crypto: GetTokenInformation(TokenUser size) failed (win32=" + std::to_string(err) + ")");
+    }
+
+    std::vector<uint8_t> token_user_buf(token_info_len);
+    if (!GetTokenInformation(raw_token, TokenUser, token_user_buf.data(), token_info_len, &token_info_len)) {
+        const DWORD err = GetLastError();
+        throw std::runtime_error(
+            "vault_crypto: GetTokenInformation(TokenUser) failed (win32=" + std::to_string(err) + ")");
+    }
+    const auto* token_user = reinterpret_cast<const TOKEN_USER*>(token_user_buf.data());
+
+    std::array<uint8_t, SECURITY_MAX_SID_SIZE> system_sid_buf{};
+    DWORD system_sid_len = static_cast<DWORD>(system_sid_buf.size());
+    PSID system_sid = reinterpret_cast<PSID>(system_sid_buf.data());
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, system_sid, &system_sid_len)) {
+        const DWORD err = GetLastError();
+        throw std::runtime_error(
+            "vault_crypto: CreateWellKnownSid(WinLocalSystemSid) failed (win32=" + std::to_string(err) + ")");
+    }
+
+    std::array<EXPLICIT_ACCESS_W, 2> ea{};
+    ea[0].grfAccessPermissions = GENERIC_READ | GENERIC_WRITE;
+    ea[0].grfAccessMode = SET_ACCESS;
+    ea[0].grfInheritance = NO_INHERITANCE;
+    ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea[0].Trustee.ptstrName = reinterpret_cast<LPWSTR>(token_user->User.Sid);
+
+    ea[1].grfAccessPermissions = GENERIC_READ | GENERIC_WRITE;
+    ea[1].grfAccessMode = SET_ACCESS;
+    ea[1].grfInheritance = NO_INHERITANCE;
+    ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[1].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(system_sid);
+
+    PACL raw_dacl = nullptr;
+    const DWORD acl_rc = SetEntriesInAclW(static_cast<ULONG>(ea.size()), ea.data(), nullptr, &raw_dacl);
+    if (acl_rc != ERROR_SUCCESS || !raw_dacl) {
+        throw std::runtime_error(
+            "vault_crypto: SetEntriesInAclW failed (win32=" + std::to_string(acl_rc) + ")");
+    }
+    LocalMemGuard dacl_guard{raw_dacl};
+
+    SECURITY_DESCRIPTOR sd{};
+    if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
+        const DWORD err = GetLastError();
+        throw std::runtime_error(
+            "vault_crypto: InitializeSecurityDescriptor failed (win32=" + std::to_string(err) + ")");
+    }
+    if (!SetSecurityDescriptorDacl(&sd, TRUE, raw_dacl, FALSE)) {
+        const DWORD err = GetLastError();
+        throw std::runtime_error(
+            "vault_crypto: SetSecurityDescriptorDacl failed (win32=" + std::to_string(err) + ")");
+    }
+    if (!SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+        const DWORD err = GetLastError();
+        throw std::runtime_error(
+            "vault_crypto: SetSecurityDescriptorControl(SE_DACL_PROTECTED) failed (win32=" +
+            std::to_string(err) + ")");
+    }
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = &sd;
+    sa.bInheritHandle = FALSE;
+
     std::array<uint8_t, 8> rnd{};
     if (RAND_bytes(rnd.data(), static_cast<int>(rnd.size())) != 1) {
         throw std::runtime_error("vault_crypto: RAND_bytes failed while creating temp filename");
@@ -329,7 +425,7 @@ void write_secret_file_0600(const std::filesystem::path& path, const std::string
         tmp.c_str(),
         GENERIC_WRITE,
         0, // Exclusive access (no sharing)
-        nullptr,
+        &sa,
         CREATE_NEW,
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
