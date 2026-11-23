@@ -1,6 +1,7 @@
 #include "at_rest_crypto.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -33,6 +34,14 @@
 namespace vault_crypto {
 
 namespace {
+
+std::atomic<detail::SecureStringWipeObserver> g_secure_string_wipe_observer{nullptr};
+
+void notify_secure_string_wipe(const char* buf, std::size_t len) noexcept {
+    if (auto* obs = g_secure_string_wipe_observer.load(std::memory_order_acquire)) {
+        obs(buf, len);
+    }
+}
 
 std::array<uint8_t, IV_LEN> derive_chunk_iv(const std::array<uint8_t, IV_LEN>& base_iv, uint64_t idx) {
     std::array<uint8_t, IV_LEN> iv = base_iv;
@@ -112,6 +121,110 @@ std::vector<uint8_t> hex_to_bytes(const std::string& hex_str) {
     return out;
 }
 
+SecureString::SecureString(std::size_t initial_cap) {
+    if (initial_cap > 0) {
+        buf_ = new char[initial_cap];
+        std::memset(buf_, 0, initial_cap);
+        cap_ = initial_cap;
+    }
+}
+
+SecureString::~SecureString() {
+    wipe_and_release();
+}
+
+SecureString::SecureString(SecureString&& other) noexcept
+    : buf_(other.buf_), size_(other.size_), cap_(other.cap_) {
+    other.buf_ = nullptr;
+    other.size_ = 0;
+    other.cap_ = 0;
+}
+
+SecureString& SecureString::operator=(SecureString&& other) noexcept {
+    if (this != &other) {
+        wipe_and_release();
+        buf_ = other.buf_;
+        size_ = other.size_;
+        cap_ = other.cap_;
+        other.buf_ = nullptr;
+        other.size_ = 0;
+        other.cap_ = 0;
+    }
+    return *this;
+}
+
+void SecureString::wipe_and_release() noexcept {
+    if (buf_) {
+        if (cap_ > 0) {
+            OPENSSL_cleanse(buf_, cap_);
+            notify_secure_string_wipe(buf_, cap_);
+        }
+        delete[] buf_;
+        buf_ = nullptr;
+    }
+    size_ = 0;
+    cap_ = 0;
+}
+
+void SecureString::cleanse() noexcept {
+    if (buf_ && cap_ > 0) {
+        OPENSSL_cleanse(buf_, cap_);
+        notify_secure_string_wipe(buf_, cap_);
+    }
+    size_ = 0;
+}
+
+void SecureString::clear() noexcept {
+    if (buf_ && size_ > 0) {
+        OPENSSL_cleanse(buf_, size_);
+    }
+    size_ = 0;
+}
+
+void SecureString::reserve(std::size_t new_cap) {
+    if (new_cap <= cap_) return;
+    char* new_buf = new char[new_cap];
+    std::memset(new_buf, 0, new_cap);
+    if (buf_) {
+        if (size_ > 0) {
+            std::memcpy(new_buf, buf_, size_);
+        }
+        OPENSSL_cleanse(buf_, cap_);
+        notify_secure_string_wipe(buf_, cap_);
+        delete[] buf_;
+    }
+    buf_ = new_buf;
+    cap_ = new_cap;
+}
+
+void SecureString::append(const char* data, std::size_t len) {
+    if (len == 0) return;
+    const std::size_t needed = size_ + len;
+    if (needed > cap_) {
+        std::size_t next_cap = std::max<std::size_t>(cap_ * 2, 64);
+        if (next_cap < needed) next_cap = needed;
+        reserve(next_cap);
+    }
+    std::memcpy(buf_ + size_, data, len);
+    size_ += len;
+}
+
+void SecureString::append(std::string_view sv) {
+    append(sv.data(), sv.size());
+}
+
+void SecureString::push_back(char c) {
+    append(&c, 1);
+}
+
+namespace detail {
+
+void set_secure_string_wipe_observer_for_test(SecureStringWipeObserver obs) noexcept {
+    g_secure_string_wipe_observer.store(obs, std::memory_order_release);
+}
+
+} // namespace detail
+
 #ifndef _WIN32
 namespace detail {
 
@@ -172,7 +285,7 @@ PosixFileOps default_posix_file_ops() noexcept {
 }
 
 void write_secret_file_0600_posix(const std::filesystem::path& path,
-                                  const std::string& content,
+                                  std::string_view content,
                                   const PosixFileOps& ops) {
     if (!ops.open_fn || !ops.write_fn || !ops.fsync_fn ||
         !ops.close_fn || !ops.rename_fn || !ops.unlink_fn) {
@@ -314,7 +427,7 @@ void write_secret_file_0600_posix(const std::filesystem::path& path,
 } // namespace detail
 #endif
 
-void write_secret_file_0600(const std::filesystem::path& path, const std::string& content) {
+void write_secret_file_0600(const std::filesystem::path& path, std::string_view content) {
 #ifndef _WIN32
     detail::write_secret_file_0600_posix(path, content, detail::default_posix_file_ops());
 #else
@@ -1051,7 +1164,6 @@ void decrypt_stream_to_file_atomic(std::istream& in, std::size_t total_len,
         throw;
     }
 }
-
 
 std::array<std::vector<uint8_t>, 3> erasure_split_2of3(const std::vector<uint8_t>& blob) {
     const std::size_t half = (blob.size() + 1) / 2;

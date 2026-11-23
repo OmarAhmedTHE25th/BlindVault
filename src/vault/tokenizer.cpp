@@ -34,9 +34,7 @@ void validate_column_count(const std::vector<std::string>& cols,
     }
 }
 
-std::string escape_tsv_value(std::string_view raw) {
-    std::string out;
-    out.reserve(raw.size());
+void escape_tsv_value_into(vault_crypto::SecureString& out, std::string_view raw) {
     for (char c : raw) {
         switch (c) {
             case '\\': out.append("\\\\"); break;
@@ -46,11 +44,10 @@ std::string escape_tsv_value(std::string_view raw) {
             default:   out.push_back(c); break;
         }
     }
-    return out;
 }
 
-std::string unescape_tsv_value(std::string_view escaped) {
-    std::string out;
+void unescape_tsv_value_into(vault_crypto::SecureString& out, std::string_view escaped) {
+    out.clear();
     out.reserve(escaped.size());
     for (std::size_t i = 0; i < escaped.size(); ++i) {
         if (escaped[i] == '\\' && i + 1 < escaped.size()) {
@@ -69,7 +66,6 @@ std::string unescape_tsv_value(std::string_view escaped) {
             out.push_back(escaped[i]);
         }
     }
-    return out;
 }
 
 } // namespace
@@ -642,12 +638,11 @@ void TokenVault::flush() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!dirty_) return;
 
-    std::string plaintext;
-    plaintext.reserve(reverse_map_.size() * 64);
+    vault_crypto::SecureString plaintext(reverse_map_.size() * 64 + 64);
     for (const auto& [token, raw] : reverse_map_) {
         plaintext.append(token);
         plaintext.push_back('\t');
-        plaintext.append(escape_tsv_value(raw));
+        escape_tsv_value_into(plaintext, raw);
         plaintext.push_back('\n');
     }
 
@@ -655,18 +650,22 @@ void TokenVault::flush() {
     const std::string wrapped_dek_hex = kms_->wrap_dek_hex(vault_dek);
     const std::vector<uint8_t> ciphertext =
         vault_crypto::encrypt_envelope(
-            plaintext, vault_dek, /*pad_traffic=*/false, "BVTK:v1");
+            reinterpret_cast<const uint8_t*>(plaintext.data()),
+            plaintext.size(),
+            vault_dek,
+            /*pad_traffic=*/false,
+            "BVTK:v1");
     vault_dek.cleanse();
-    OPENSSL_cleanse(plaintext.data(), plaintext.size());
+    plaintext.cleanse();
 
-    std::string file_blob;
-    file_blob.reserve(TOKEN_FILE_MAGIC.size() + WRAPPED_HEX_LEN + ciphertext.size());
+    vault_crypto::SecureString file_blob(
+        TOKEN_FILE_MAGIC.size() + WRAPPED_HEX_LEN + ciphertext.size());
     file_blob.append(reinterpret_cast<const char*>(TOKEN_FILE_MAGIC.data()), TOKEN_FILE_MAGIC.size());
     file_blob.append(wrapped_dek_hex);
     file_blob.append(reinterpret_cast<const char*>(ciphertext.data()), ciphertext.size());
 
-    vault_crypto::write_secret_file_0600(storage_path_, file_blob);
-    OPENSSL_cleanse(file_blob.data(), file_blob.size());
+    vault_crypto::write_secret_file_0600(storage_path_, file_blob.view());
+    file_blob.cleanse();
     dirty_ = false;
 }
 
@@ -793,14 +792,16 @@ void TokenVault::load_unlocked() {
         /*unpad_traffic=*/false, "BVTK:v1");
     vault_dek.cleanse();
 
-    std::string plaintext = decrypted.as_string();
+    vault_crypto::SecureString plaintext(decrypted.vec().size());
+    plaintext.append(reinterpret_cast<const char*>(decrypted.vec().data()), decrypted.vec().size());
     decrypted.cleanse();
 
-    std::string_view sv(plaintext);
+    std::string_view sv = plaintext.view();
     const std::size_t approx_lines = sv.size() / 64 + 16;
     forward_map_.reserve(approx_lines);
     reverse_map_.reserve(approx_lines);
 
+    vault_crypto::SecureString raw_buf(128);
     std::size_t pos = 0;
     while (pos < sv.size()) {
         const std::size_t nl = sv.find('\n', pos);
@@ -812,17 +813,19 @@ void TokenVault::load_unlocked() {
         if (tab == std::string_view::npos) continue;
 
         std::string token(line.substr(0, tab));
-        std::string raw = unescape_tsv_value(line.substr(tab + 1));
+        unescape_tsv_value_into(raw_buf, line.substr(tab + 1));
+        std::string raw(raw_buf.view());
+        raw_buf.clear();
 
         auto [rev_it, inserted] = reverse_map_.emplace(token, raw);
         if (!inserted && rev_it->second != raw) {
-            OPENSSL_cleanse(plaintext.data(), plaintext.size());
             throw std::runtime_error(
                 "TokenVault: conflicting duplicate token detected while loading persisted token store");
         }
         forward_map_[std::move(raw)] = std::move(token);
     }
-    OPENSSL_cleanse(plaintext.data(), plaintext.size());
+    raw_buf.cleanse();
+    plaintext.cleanse();
 }
 
 } // namespace vault_token

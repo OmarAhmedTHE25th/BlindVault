@@ -111,14 +111,55 @@ private:
     std::vector<uint8_t> data_;
 };
 
+// Move-only RAII character buffer with explicit heap ownership (no SSO) that
+// unconditionally wipes capacity via OPENSSL_cleanse() on reallocation, clear, and destruction.
+class SecureString {
+public:
+    SecureString() = default;
+    explicit SecureString(std::size_t initial_cap);
+    ~SecureString();
+
+    SecureString(const SecureString&) = delete;
+    SecureString& operator=(const SecureString&) = delete;
+
+    SecureString(SecureString&& other) noexcept;
+    SecureString& operator=(SecureString&& other) noexcept;
+
+    void reserve(std::size_t new_cap);
+    void append(std::string_view sv);
+    void append(const char* data, std::size_t len);
+    void push_back(char c);
+    void clear() noexcept;
+    void cleanse() noexcept;
+
+    [[nodiscard]] char* data() noexcept { return buf_; }
+    [[nodiscard]] const char* data() const noexcept { return buf_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return cap_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] std::string_view view() const noexcept {
+        return buf_ ? std::string_view(buf_, size_) : std::string_view{};
+    }
+
+private:
+    void wipe_and_release() noexcept;
+
+    char* buf_ = nullptr;
+    std::size_t size_ = 0;
+    std::size_t cap_ = 0;
+};
+
 SecretKey generate_key();
 std::string bytes_to_hex(const uint8_t* data, std::size_t len);
 std::vector<uint8_t> hex_to_bytes(const std::string& hex_str);
-void write_secret_file_0600(const std::filesystem::path& path, const std::string& content);
+void write_secret_file_0600(const std::filesystem::path& path, std::string_view content);
 
-#ifndef _WIN32
 namespace detail {
 
+using SecureStringWipeObserver = void(*)(const char* data, std::size_t len);
+void set_secure_string_wipe_observer_for_test(SecureStringWipeObserver obs) noexcept;
+
+#ifndef _WIN32
 struct PosixFileOps {
     int (*open_fn)(const char* path, int flags, unsigned int mode) = nullptr;
     ssize_t (*write_fn)(int fd, const void* buf, std::size_t count) = nullptr;
@@ -130,11 +171,11 @@ struct PosixFileOps {
 
 PosixFileOps default_posix_file_ops() noexcept;
 void write_secret_file_0600_posix(const std::filesystem::path& path,
-                                  const std::string& content,
+                                  std::string_view content,
                                   const PosixFileOps& ops);
+#endif
 
 } // namespace detail
-#endif
 std::string hmac_sha256_hex(const uint8_t* key, std::size_t key_len, std::string_view message);
 SecretKey derive_subkey(const SecretKey& master_key, std::string_view context_label);
 bool constant_time_hex_equal(const std::string& hex_a, const std::string& hex_b);

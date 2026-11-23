@@ -1849,6 +1849,71 @@ TEST(VaultCrypto, WriteSecretFile0600SimulatedSyscallFailures) {
 }
 #endif
 
+namespace {
+
+class FailingWrapKmsProvider final : public vault_kms::KeyManagementProvider {
+public:
+    FailingWrapKmsProvider() : master_(vault_crypto::generate_key()) {}
+
+    [[nodiscard]] std::string wrap_dek_hex(const vault_crypto::SecretKey&) const override {
+        throw std::runtime_error("simulated KMS wrap failure");
+    }
+
+    [[nodiscard]] vault_crypto::SecretKey unwrap_dek_hex(const std::string&) const override {
+        throw std::runtime_error("unexpected unwrap call");
+    }
+
+    [[nodiscard]] std::string hmac_index_hex(std::string_view) const override { return ""; }
+    [[nodiscard]] std::string hmac_audit_hex(std::string_view) const override { return ""; }
+
+    [[nodiscard]] std::array<uint8_t, 32> derive_tokenizer_pepper() const override {
+        return vault_crypto::derive_subkey(master_, "test:fail_wrap:v1").bytes;
+    }
+
+    [[nodiscard]] bool can_rotate_master_kek_in_app() const override { return false; }
+    void rotate_master_kek(const vault_crypto::SecretKey&) override {}
+    [[nodiscard]] std::string backend_description() const override { return "Test-FailingWrap"; }
+
+private:
+    vault_crypto::SecretKey master_;
+};
+
+std::atomic<std::size_t> g_wipe_events{0};
+std::atomic<bool> g_all_bytes_zeroed{true};
+
+void secure_string_wipe_hook(const char* data, std::size_t len) {
+    if (!data || len == 0) return;
+    g_wipe_events.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < len; ++i) {
+        if (data[i] != '\0') {
+            g_all_bytes_zeroed.store(false, std::memory_order_relaxed);
+            break;
+        }
+    }
+}
+
+} // namespace
+
+TEST(Tokenizer, SecureStringCleansesPlaintextOnFlushException) {
+    TempDir dir;
+    auto kms = std::make_shared<FailingWrapKmsProvider>();
+    vault_token::TokenVault vault(dir.file("fail_flush_tokens.enc"), kms);
+
+    (void)vault.tokenize("Highly Sensitive Customer PII");
+    ASSERT_EQ(vault.size(), 1u);
+
+    g_wipe_events.store(0, std::memory_order_relaxed);
+    g_all_bytes_zeroed.store(true, std::memory_order_relaxed);
+    vault_crypto::detail::set_secure_string_wipe_observer_for_test(&secure_string_wipe_hook);
+    struct ObserverReset {
+        ~ObserverReset() { vault_crypto::detail::set_secure_string_wipe_observer_for_test(nullptr); }
+    } reset_guard;
+
+    EXPECT_THROW(vault.flush(), std::runtime_error);
+    EXPECT_GT(g_wipe_events.load(std::memory_order_relaxed), 0u);
+    EXPECT_TRUE(g_all_bytes_zeroed.load(std::memory_order_relaxed));
+}
+
 TEST(VaultCrypto, Bvl3AtomicFileDecryptionDeletesTempOnMidStreamFailure) {
     TempDir dir;
     const auto dek = vault_crypto::generate_key();
