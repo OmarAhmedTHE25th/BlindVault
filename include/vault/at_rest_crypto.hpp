@@ -200,14 +200,30 @@ private:
 std::size_t encrypt_stream_bvl3(std::istream& in, std::ostream& out,
                                 const SecretKey& dek, std::string_view blob_name);
 
+// TRANSACTIONAL STREAMING SEMANTICS (IMPORTANT):
+// decrypt_stream_bvl3() authenticates each 64 KiB frame individually (with per-frame nonce and
+// chunk index + is_final AAD binding) and invokes on_chunk(...) BEFORE the terminal frame
+// (is_final == 1) and full stream EOF have been verified. Therefore, a corrupted, truncated,
+// or tampered later frame can abort the stream AFTER earlier frames were delivered to on_chunk.
+// Callers persisting decrypted output to disk MUST NOT expose unverified partial output at the
+// final path: write chunks to a temporary file and atomically rename only after decrypt_stream_*
+// returns without throwing, deleting the temp file on failure (see decrypt_stream_to_file_atomic()).
 void decrypt_stream_bvl3(std::istream& in, std::size_t total_len,
                          const SecretKey& dek, std::string_view blob_name,
                          const std::function<void(std::string_view)>& on_chunk);
 
-// Auto-detects BVL3 (streaming chunked) vs BVL2 (legacy monolithic)
+// Auto-detects BVL3 (streaming chunked) vs BVL2 (legacy monolithic).
+// Inherits the same per-frame streaming transactional semantics as decrypt_stream_bvl3().
 void decrypt_stream_auto(std::istream& in, std::size_t total_len,
                          const SecretKey& dek, std::string_view blob_name,
                          const std::function<void(std::string_view)>& on_chunk);
+
+// Reference staging helper: streams decrypt_stream_auto() into a unique temporary file in
+// output_path's parent directory, atomically renames to output_path only after final EOF
+// authentication succeeds, and deletes the temporary file on any mid-stream authentication failure.
+void decrypt_stream_to_file_atomic(std::istream& in, std::size_t total_len,
+                                   const SecretKey& dek, std::string_view blob_name,
+                                   const std::filesystem::path& output_path);
 
 std::array<std::vector<uint8_t>, 3> erasure_split_2of3(const std::vector<uint8_t>& blob);
 std::vector<uint8_t> erasure_reconstruct_2of3(const std::vector<uint8_t>& s0,

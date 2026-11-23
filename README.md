@@ -283,6 +283,7 @@ Every newly offloaded `.enc` object uses the streaming chunked **BVL3** format (
 
 * **`BVL3` Streaming Header (32 bytes):** `[0:4]` = `"BVL3"`, `[4:16]` = 96-bit `base_iv`, `[16:32]` = reserved flags/version (`0`).
 * **Fixed 64 KiB Frames (`65,536` bytes each):** `[0:2]` = uint16 big-endian `plain_len` (`<= 65,516`), `[2:65,518]` = AES-256-GCM ciphertext (`[plain | CSPRNG pad]`), `[65,518:65,534]` = 16-byte GCM auth tag (`nonce = base_iv XOR uint64_be(chunk_index)`, `AAD = blob_name || uint64_be(chunk_index) || is_final_byte`), trailing 2 reserved bytes (`0`).
+* **BVL3 Streaming Transactional Semantics:** `decrypt_stream_bvl3()` / `decrypt_stream_auto()` deliver each per-frame authenticated chunk to `on_chunk(...)` before the terminal (`is_final = 1`) frame is verified. If a later frame is truncated or fails GCM authentication, an exception is thrown mid-stream after earlier chunks were emitted; callers writing to disk should stage decrypted output in a temporary file and atomically rename only on full EOF completion (or call `decrypt_stream_to_file_atomic()`).
 * **Legacy `BVL2` Format (32B header + `64 KiB × k`):** `[0:4]` = `"BVL2"`, `[4:16]` = 96-bit IV, `[16:32]` = 128-bit GCM tag, followed by padded ciphertext (`blob_name` AAD).
 
 ### Encrypted Token Vault Envelope (`tokenizer.hpp` — `BVTK`)

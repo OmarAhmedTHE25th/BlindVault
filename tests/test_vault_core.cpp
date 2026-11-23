@@ -1849,6 +1849,54 @@ TEST(VaultCrypto, WriteSecretFile0600SimulatedSyscallFailures) {
 }
 #endif
 
+TEST(VaultCrypto, Bvl3AtomicFileDecryptionDeletesTempOnMidStreamFailure) {
+    TempDir dir;
+    const auto dek = vault_crypto::generate_key();
+    std::string multi_frame_plain;
+    multi_frame_plain.reserve(150 * 1024);
+    for (int i = 0; i < 3000; ++i) {
+        multi_frame_plain += "TXN_" + std::to_string(i) + ",TOK_00112233445566778899aabbccddeeff,250.00\n";
+    }
+
+    std::stringstream enc_ss(std::ios::in | std::ios::out | std::ios::binary);
+    std::istringstream src_ss(multi_frame_plain, std::ios::binary);
+    const std::size_t total_len =
+        vault_crypto::encrypt_stream_bvl3(src_ss, enc_ss, dek, "atomic_test.enc");
+    const std::string valid_ct = enc_ss.str();
+    ASSERT_EQ(valid_ct.size(), total_len);
+    ASSERT_GE(total_len, vault_crypto::BVL3_HEADER_LEN + 3 * vault_crypto::BVL3_FRAME_BYTES);
+
+    // 1. Valid multi-frame stream produces exact output at final path with no lingering temp files
+    const auto out_ok = dir.file("valid_out.csv");
+    {
+        std::istringstream in_ok(valid_ct, std::ios::binary);
+        vault_crypto::decrypt_stream_to_file_atomic(in_ok, total_len, dek, "atomic_test.enc", out_ok);
+    }
+    ASSERT_TRUE(std::filesystem::exists(out_ok));
+    const auto disk_ok = vault_crypto::read_bytes_from_file(out_ok.string());
+    EXPECT_EQ(std::string(disk_ok.begin(), disk_ok.end()), multi_frame_plain);
+
+    // 2. Corrupt the LAST frame so frame 0 succeeds and emits data, then final frame fails auth
+    std::string tampered = valid_ct;
+    tampered[tampered.size() - 25] ^= 0x55;
+    const auto out_bad = dir.file("tampered_out.csv");
+    {
+        std::istringstream in_bad(tampered, std::ios::binary);
+        EXPECT_THROW(
+            vault_crypto::decrypt_stream_to_file_atomic(in_bad, tampered.size(), dek, "atomic_test.enc", out_bad),
+            std::runtime_error);
+    }
+    EXPECT_FALSE(std::filesystem::exists(out_bad));
+
+    std::size_t temp_leftovers = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir.path())) {
+        if (entry.path().filename().string().find(".decrypt.") != std::string::npos) {
+            ++temp_leftovers;
+        }
+    }
+    EXPECT_EQ(temp_leftovers, 0u);
+}
+
 #ifdef _WIN32
 TEST(VaultCrypto, WriteSecretFile0600EnforcesWindowsOwnerOnlyDacl) {
     TempDir dir;

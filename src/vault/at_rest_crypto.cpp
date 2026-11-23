@@ -1003,6 +1003,56 @@ void decrypt_stream_auto(std::istream& in, std::size_t total_len,
     throw std::runtime_error("vault_crypto: unrecognized envelope magic (expected BVL3 or BVL2)");
 }
 
+void decrypt_stream_to_file_atomic(std::istream& in, std::size_t total_len,
+                                   const SecretKey& dek, std::string_view blob_name,
+                                   const std::filesystem::path& output_path) {
+    std::array<uint8_t, 8> rnd{};
+    if (RAND_bytes(rnd.data(), static_cast<int>(rnd.size())) != 1) {
+        throw std::runtime_error("vault_crypto: RAND_bytes failed for staging temp filename");
+    }
+    const std::filesystem::path parent =
+        output_path.parent_path().empty() ? std::filesystem::path(".") : output_path.parent_path();
+    const std::filesystem::path tmp_path =
+        parent / ("." + output_path.filename().string() + ".decrypt." + bytes_to_hex(rnd.data(), rnd.size()));
+
+    std::error_code ec;
+    try {
+        {
+            std::ofstream tmp_out(tmp_path, std::ios::binary | std::ios::trunc);
+            if (!tmp_out) {
+                throw std::runtime_error("vault_crypto: cannot open temp staging file " + tmp_path.string());
+            }
+#ifndef _WIN32
+            std::filesystem::permissions(
+                tmp_path,
+                std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                std::filesystem::perm_options::replace, ec);
+#endif
+            decrypt_stream_auto(
+                in, total_len, dek, blob_name,
+                [&](std::string_view chunk) {
+                    if (!chunk.empty()) {
+                        tmp_out.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+                        if (!tmp_out) {
+                            throw std::runtime_error(
+                                "vault_crypto: write failed on temp staging file " + tmp_path.string());
+                        }
+                    }
+                });
+            tmp_out.flush();
+            if (!tmp_out) {
+                throw std::runtime_error(
+                    "vault_crypto: flush failed on temp staging file " + tmp_path.string());
+            }
+        }
+        std::filesystem::rename(tmp_path, output_path);
+    } catch (...) {
+        std::filesystem::remove(tmp_path, ec);
+        throw;
+    }
+}
+
+
 std::array<std::vector<uint8_t>, 3> erasure_split_2of3(const std::vector<uint8_t>& blob) {
     const std::size_t half = (blob.size() + 1) / 2;
     std::array<std::vector<uint8_t>, 3> shards;
