@@ -16,9 +16,9 @@ namespace {
 
 constexpr std::uint64_t kMaxCollisionAttempts = 4096;
 
-[[noreturn]] void log_and_throw_csv_error(const std::string& msg) {
+[[noreturn]] void log_and_throw_csv_error(ParseError code, const std::string& msg) {
     std::cerr << "[BlindVault CSV Error] " << msg << '\n';
-    throw std::runtime_error(msg);
+    throw CsvParseException(code, msg);
 }
 
 void validate_column_count(const std::vector<std::string>& cols,
@@ -30,7 +30,7 @@ void validate_column_count(const std::vector<std::string>& cols,
         oss << context << ": malformed CSV at record " << record_index
             << " (line " << start_line << "): expected exactly "
             << EXPECTED_CSV_COLUMNS << " columns, got " << cols.size();
-        log_and_throw_csv_error(oss.str());
+        log_and_throw_csv_error(ParseError::ColumnCountMismatch, oss.str());
     }
 }
 
@@ -68,6 +68,8 @@ void unescape_tsv_value_into(vault_crypto::SecureString& out, std::string_view e
     }
 }
 
+} // namespace
+
 bool is_valid_token_format(std::string_view sv) noexcept {
     if (sv.size() != TOKEN_TOTAL_LEN || sv.rfind("TOK_", 0) != 0) {
         return false;
@@ -81,7 +83,8 @@ bool is_valid_token_format(std::string_view sv) noexcept {
     return true;
 }
 
-} // namespace
+CsvStreamParser::CsvStreamParser(CsvParserLimits limits)
+    : limits_(limits) {}
 
 CsvStreamParser::~CsvStreamParser() {
     cleanse_buffers();
@@ -98,6 +101,7 @@ void CsvStreamParser::cleanse_buffers() noexcept {
         }
     }
     current_record_.clear();
+    current_record_bytes_ = 0;
 }
 
 void CsvStreamParser::reset() noexcept {
@@ -107,6 +111,40 @@ void CsvStreamParser::reset() noexcept {
     line_number_ = 1;
     record_index_ = 0;
     record_start_line_ = 1;
+}
+
+void CsvStreamParser::append_field_char(char c) {
+    if (current_field_.size() >= limits_.max_field_bytes) {
+        std::ostringstream oss;
+        oss << "CsvStreamParser: field size limit exceeded (max "
+            << limits_.max_field_bytes << " bytes) at record "
+            << (record_index_ + 1) << " (line " << record_start_line_ << ")";
+        cleanse_buffers();
+        log_and_throw_csv_error(ParseError::FieldSizeLimitExceeded, oss.str());
+    }
+    if (current_record_bytes_ >= limits_.max_record_bytes) {
+        std::ostringstream oss;
+        oss << "CsvStreamParser: record size limit exceeded (max "
+            << limits_.max_record_bytes << " bytes) at record "
+            << (record_index_ + 1) << " (line " << record_start_line_ << ")";
+        cleanse_buffers();
+        log_and_throw_csv_error(ParseError::RecordSizeLimitExceeded, oss.str());
+    }
+    current_field_.push_back(c);
+    ++current_record_bytes_;
+}
+
+void CsvStreamParser::commit_current_field() {
+    if (current_record_.size() >= limits_.max_columns) {
+        std::ostringstream oss;
+        oss << "CsvStreamParser: column count limit exceeded (max "
+            << limits_.max_columns << " columns) at record "
+            << (record_index_ + 1) << " (line " << record_start_line_ << ")";
+        cleanse_buffers();
+        log_and_throw_csv_error(ParseError::ColumnCountLimitExceeded, oss.str());
+    }
+    current_record_.push_back(std::move(current_field_));
+    current_field_.clear();
 }
 
 void CsvStreamParser::emit_current_record(const RecordCallback& on_record) {
@@ -124,6 +162,7 @@ void CsvStreamParser::emit_current_record(const RecordCallback& on_record) {
         }
     }
     current_record_.clear();
+    current_record_bytes_ = 0;
     in_record_ = false;
 }
 
@@ -155,14 +194,12 @@ void CsvStreamParser::feed(std::string_view chunk, const RecordCallback& on_reco
                         record_start_line_ = line_number_;
                         in_record_ = true;
                     }
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                 } else if (c == '\r') {
                     if (!in_record_) {
                         record_start_line_ = line_number_;
                     }
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                     emit_current_record(on_record);
                     state_ = State::AfterCr;
                 } else if (c == '\n') {
@@ -170,8 +207,7 @@ void CsvStreamParser::feed(std::string_view chunk, const RecordCallback& on_reco
                         record_start_line_ = line_number_;
                     }
                     ++line_number_;
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                     emit_current_record(on_record);
                     state_ = State::FieldStart;
                 } else {
@@ -179,25 +215,22 @@ void CsvStreamParser::feed(std::string_view chunk, const RecordCallback& on_reco
                         record_start_line_ = line_number_;
                         in_record_ = true;
                     }
-                    current_field_.push_back(c);
+                    append_field_char(c);
                     state_ = State::UnquotedField;
                 }
                 break;
 
             case State::UnquotedField:
                 if (c == ',') {
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                     state_ = State::FieldStart;
                 } else if (c == '\r') {
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                     emit_current_record(on_record);
                     state_ = State::AfterCr;
                 } else if (c == '\n') {
                     ++line_number_;
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                     emit_current_record(on_record);
                     state_ = State::FieldStart;
                 } else if (c == '"') {
@@ -205,9 +238,9 @@ void CsvStreamParser::feed(std::string_view chunk, const RecordCallback& on_reco
                     oss << "CsvStreamParser: unescaped quote inside unquoted field at record "
                         << (record_index_ + 1) << " (line " << line_number_ << ")";
                     cleanse_buffers();
-                    log_and_throw_csv_error(oss.str());
+                    log_and_throw_csv_error(ParseError::UnexpectedQuoteInUnquotedField, oss.str());
                 } else {
-                    current_field_.push_back(c);
+                    append_field_char(c);
                 }
                 break;
 
@@ -218,28 +251,25 @@ void CsvStreamParser::feed(std::string_view chunk, const RecordCallback& on_reco
                     if (c == '\n') {
                         ++line_number_;
                     }
-                    current_field_.push_back(c);
+                    append_field_char(c);
                 }
                 break;
 
             case State::QuoteInQuotedField:
                 if (c == '"') {
                     // RFC 4180 escaped quote ("")
-                    current_field_.push_back('"');
+                    append_field_char('"');
                     state_ = State::QuotedField;
                 } else if (c == ',') {
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                     state_ = State::FieldStart;
                 } else if (c == '\r') {
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                     emit_current_record(on_record);
                     state_ = State::AfterCr;
                 } else if (c == '\n') {
                     ++line_number_;
-                    current_record_.push_back(std::move(current_field_));
-                    current_field_.clear();
+                    commit_current_field();
                     emit_current_record(on_record);
                     state_ = State::FieldStart;
                 } else {
@@ -248,7 +278,7 @@ void CsvStreamParser::feed(std::string_view chunk, const RecordCallback& on_reco
                         << "' after closing quote at record " << (record_index_ + 1)
                         << " (line " << line_number_ << ")";
                     cleanse_buffers();
-                    log_and_throw_csv_error(oss.str());
+                    log_and_throw_csv_error(ParseError::UnexpectedCharAfterClosingQuote, oss.str());
                 }
                 break;
 
@@ -265,14 +295,13 @@ void CsvStreamParser::finish(const RecordCallback& on_record) {
         oss << "CsvStreamParser: unclosed quoted field at EOF for record "
             << (record_index_ + 1) << " (started on line " << record_start_line_ << ")";
         cleanse_buffers();
-        log_and_throw_csv_error(oss.str());
+        log_and_throw_csv_error(ParseError::UnclosedQuoteAtEof, oss.str());
     }
 
     if (state_ == State::QuoteInQuotedField ||
         state_ == State::UnquotedField ||
         (state_ == State::FieldStart && in_record_)) {
-        current_record_.push_back(std::move(current_field_));
-        current_field_.clear();
+        commit_current_field();
         emit_current_record(on_record);
     }
 
@@ -305,7 +334,8 @@ void CsvStreamParser::parse_stream(std::istream& in,
     }
     if (in.bad()) {
         cleanse_buffers();
-        log_and_throw_csv_error("CsvStreamParser: I/O read failure on input stream");
+        log_and_throw_csv_error(ParseError::StreamReadError,
+                                "CsvStreamParser: I/O read failure on input stream");
     }
     finish(on_record);
 }
@@ -317,7 +347,8 @@ std::vector<std::string> parse_csv_row(std::string_view record_text) {
     auto cb = [&](const std::vector<std::string>& fields, std::size_t, std::size_t) {
         ++record_count;
         if (record_count > 1) {
-            log_and_throw_csv_error("parse_csv_row: input contained multiple CSV records");
+            log_and_throw_csv_error(ParseError::MultipleRecordsInSingleRow,
+                                    "parse_csv_row: input contained multiple CSV records");
         }
         result = fields;
     };

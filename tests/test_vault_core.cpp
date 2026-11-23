@@ -1849,6 +1849,77 @@ TEST(VaultCrypto, WriteSecretFile0600SimulatedSyscallFailures) {
 }
 #endif
 
+// ---------------- CsvStreamParser Bounds, TOK_ Prefix Hardening, SecureString Wipe, BVL3 Atomic Staging, Windows ACL ----------------
+
+TEST(Tokenizer, CsvStreamParserEnforcesMemoryBounds) {
+    // 1. Field size limit: exact limit succeeds, limit + 1 throws FieldSizeLimitExceeded
+    {
+        vault_token::CsvParserLimits limits;
+        limits.max_field_bytes = 16;
+        limits.max_record_bytes = 256;
+        limits.max_columns = 16;
+
+        vault_token::CsvStreamParser ok_parser(limits);
+        std::vector<std::vector<std::string>> rows;
+        auto cb = [&](const std::vector<std::string>& fields, std::size_t, std::size_t) {
+            rows.push_back(fields);
+        };
+        const std::string exact_field(16, 'A');
+        ok_parser.feed("\"" + exact_field + "\",ok\n", cb);
+        ok_parser.finish(cb);
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows[0][0], exact_field);
+
+        vault_token::CsvStreamParser bad_parser(limits);
+        const std::string oversized_field(17, 'B');
+        try {
+            bad_parser.feed("\"" + oversized_field + "\",ok\n", cb);
+            FAIL() << "Expected FieldSizeLimitExceeded";
+        } catch (const vault_token::CsvParseException& e) {
+            EXPECT_EQ(e.code(), vault_token::ParseError::FieldSizeLimitExceeded);
+        }
+    }
+
+    // 2. Record size limit: sum of fields within limit passes; exceeding total limit throws RecordSizeLimitExceeded
+    {
+        vault_token::CsvParserLimits limits;
+        limits.max_field_bytes = 32;
+        limits.max_record_bytes = 40;
+        limits.max_columns = 16;
+
+        vault_token::CsvStreamParser bad_parser(limits);
+        std::vector<std::vector<std::string>> rows;
+        auto cb = [&](const std::vector<std::string>& fields, std::size_t, std::size_t) {
+            rows.push_back(fields);
+        };
+        const std::string f1(25, 'X');
+        const std::string f2(25, 'Y'); // 25 + 25 = 50 > max_record_bytes (40)
+        try {
+            bad_parser.feed(f1 + "," + f2 + "\n", cb);
+            FAIL() << "Expected RecordSizeLimitExceeded";
+        } catch (const vault_token::CsvParseException& e) {
+            EXPECT_EQ(e.code(), vault_token::ParseError::RecordSizeLimitExceeded);
+        }
+    }
+
+    // 3. Column count limit
+    {
+        vault_token::CsvParserLimits limits;
+        limits.max_field_bytes = 64;
+        limits.max_record_bytes = 512;
+        limits.max_columns = 3;
+
+        vault_token::CsvStreamParser bad_parser(limits);
+        auto cb = [&](const std::vector<std::string>&, std::size_t, std::size_t) {};
+        try {
+            bad_parser.feed("c1,c2,c3,c4\n", cb);
+            FAIL() << "Expected ColumnCountLimitExceeded";
+        } catch (const vault_token::CsvParseException& e) {
+            EXPECT_EQ(e.code(), vault_token::ParseError::ColumnCountLimitExceeded);
+        }
+    }
+}
+
 TEST(Tokenizer, RejectsSpoofedAndUnknownTokPrefixBypass) {
     TempDir dir;
     auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("tok_guard.kek"));

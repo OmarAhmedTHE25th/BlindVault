@@ -1,7 +1,8 @@
 #pragma once
 // High-speed PII & IP scrubber / deterministic 128-bit tokenizer with strict RFC 4180
-// streaming CSV state-machine parsing, O(1)-RAM streaming CSV sanitization, and
-// AES-256-GCM + RFC 3394 KMS-wrapped envelope encryption at rest ("BVTK").
+// streaming CSV state-machine parsing, O(1)-RAM (with respect to total file size, bounded
+// by CsvParserLimits::max_record_bytes) CSV sanitization, and AES-256-GCM + RFC 3394
+// KMS-wrapped envelope encryption at rest ("BVTK").
 
 #include <array>
 #include <cstddef>
@@ -69,17 +70,49 @@ struct TransparentStringEqual {
     }
 };
 
+enum class ParseError {
+    None,
+    FieldSizeLimitExceeded,
+    RecordSizeLimitExceeded,
+    ColumnCountLimitExceeded,
+    ColumnCountMismatch,
+    UnclosedQuoteAtEof,
+    UnexpectedQuoteInUnquotedField,
+    UnexpectedCharAfterClosingQuote,
+    StreamReadError,
+    MultipleRecordsInSingleRow
+};
+
+class CsvParseException : public std::runtime_error {
+public:
+    CsvParseException(ParseError code, const std::string& message)
+        : std::runtime_error(message), code_(code) {}
+
+    [[nodiscard]] ParseError code() const noexcept { return code_; }
+
+private:
+    ParseError code_;
+};
+
+struct CsvParserLimits {
+    std::size_t max_field_bytes = 64 * 1024;    // 64 KiB max per field
+    std::size_t max_record_bytes = 1024 * 1024; // 1 MiB max total field bytes per record
+    std::size_t max_columns = 64;               // max columns per record
+};
+
 // Strict RFC 4180 streaming CSV state machine.
+// Uses O(1) memory with respect to total file size, strictly bounded by CsvParserLimits
+// (max_record_bytes / max_field_bytes / max_columns).
 // Properly handles quoted fields spanning multiple physical lines (\n and \r\n),
-// escaped double quotes (""), arbitrary chunk boundaries, and rejects unclosed quotes
-// or malformed quote placement with descriptive errors.
+// escaped double quotes (""), arbitrary chunk boundaries, and rejects unclosed quotes,
+// malformed quote placement, or oversized fields/records with explicit errors.
 class CsvStreamParser {
 public:
     using RecordCallback = std::function<void(const std::vector<std::string>& fields,
                                               std::size_t record_index,
                                               std::size_t start_line)>;
 
-    CsvStreamParser() = default;
+    explicit CsvStreamParser(CsvParserLimits limits = {});
     ~CsvStreamParser();
 
     CsvStreamParser(const CsvStreamParser&) = delete;
@@ -92,6 +125,8 @@ public:
                       std::size_t chunk_size = 16384);
     void reset() noexcept;
 
+    [[nodiscard]] const CsvParserLimits& limits() const noexcept { return limits_; }
+
 private:
     enum class State {
         FieldStart,
@@ -101,14 +136,18 @@ private:
         AfterCr
     };
 
+    void append_field_char(char c);
+    void commit_current_field();
     void emit_current_record(const RecordCallback& on_record);
     void cleanse_buffers() noexcept;
 
+    CsvParserLimits limits_{};
     State state_ = State::FieldStart;
     bool in_record_ = false;
     std::size_t line_number_ = 1;
     std::size_t record_index_ = 0;
     std::size_t record_start_line_ = 1;
+    std::size_t current_record_bytes_ = 0;
     std::string current_field_;
     std::vector<std::string> current_record_;
 };
@@ -142,7 +181,8 @@ public:
     std::string sanitize_csv_batch(std::string_view csv_text, SanitizeStats* out_stats = nullptr);
     std::string rehydrate_csv_batch(std::string_view sanitized_csv) const;
 
-    // O(1)-RAM streaming RFC 4180 sanitization and rehydration (exact 8 columns)
+    // Streaming RFC 4180 sanitization and rehydration in O(1) RAM relative to total
+    // file size, bounded by CsvParserLimits::max_record_bytes (exact 8 columns).
     void sanitize_csv_stream(std::istream& in,
                              std::ostream& out,
                              SanitizeStats* out_stats = nullptr,
