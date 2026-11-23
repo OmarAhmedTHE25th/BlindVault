@@ -357,7 +357,10 @@ std::vector<std::string> parse_csv_row(std::string_view record_text) {
     return result;
 }
 
-void append_escaped_csv_field(std::string& out, std::string_view field) {
+namespace {
+
+template <typename Buffer>
+void append_escaped_csv_field_impl(Buffer& out, std::string_view field) {
     if (field.find_first_of(",\"\r\n") == std::string_view::npos) {
         out.append(field);
         return;
@@ -368,6 +371,16 @@ void append_escaped_csv_field(std::string& out, std::string_view field) {
         out.push_back(c);
     }
     out.push_back('"');
+}
+
+} // namespace
+
+void append_escaped_csv_field(std::string& out, std::string_view field) {
+    append_escaped_csv_field_impl(out, field);
+}
+
+void append_escaped_csv_field(vault_crypto::SecureString& out, std::string_view field) {
+    append_escaped_csv_field_impl(out, field);
 }
 
 std::string escape_csv_field(std::string_view field) {
@@ -486,11 +499,12 @@ TransactionRecord TokenVault::rehydrate_record(const TransactionRecord& clean) c
     return restored;
 }
 
+template <typename RowBuffer>
 void TokenVault::sanitize_record_fields_unlocked(const std::vector<std::string>& cols,
                                                  std::size_t record_index,
                                                  std::size_t start_line,
                                                  bool& first_record,
-                                                 std::string& row_out,
+                                                 RowBuffer& row_out,
                                                  SanitizeStats* out_stats,
                                                  std::unordered_set<std::string>* out_tokens) {
     validate_column_count(cols, record_index, start_line, "TokenVault::sanitize_csv");
@@ -527,11 +541,12 @@ void TokenVault::sanitize_record_fields_unlocked(const std::vector<std::string>&
     }
 }
 
+template <typename RowBuffer>
 void TokenVault::rehydrate_record_fields_unlocked(const std::vector<std::string>& cols,
                                                   std::size_t record_index,
                                                   std::size_t start_line,
                                                   bool& first_record,
-                                                  std::string& row_out) const {
+                                                  RowBuffer& row_out) const {
     validate_column_count(cols, record_index, start_line, "TokenVault::rehydrate_csv");
 
     if (first_record) {
@@ -595,16 +610,7 @@ void TokenVault::sanitize_csv_stream(std::istream& in,
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::string row_buf;
-        row_buf.reserve(512);
-        struct RowBufGuard {
-            std::string& s;
-            ~RowBufGuard() {
-                if (s.capacity() > 0) {
-                    OPENSSL_cleanse(s.data(), s.size());
-                }
-            }
-        } row_guard{row_buf};
+        vault_crypto::SecureString row_buf(512);
 
         bool first_record = true;
         CsvStreamParser parser;
@@ -616,10 +622,11 @@ void TokenVault::sanitize_csv_stream(std::istream& in,
                 cols, record_index, start_line, first_record, row_buf, out_stats, out_tokens);
             if (!row_buf.empty()) {
                 out.write(row_buf.data(), static_cast<std::streamsize>(row_buf.size()));
-                OPENSSL_cleanse(row_buf.data(), row_buf.size());
+                row_buf.clear();
             }
         };
         parser.parse_stream(in, on_record);
+        row_buf.cleanse();
     }
 
     out.flush();
@@ -649,31 +656,25 @@ void TokenVault::rehydrate_csv_stream(std::istream& in, std::ostream& out) const
         "tx_id,timestamp,customer_name,national_id,iban,ip_status,amount_egp,merchant\n";
     out.write(kHeader, sizeof(kHeader) - 1);
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::string row_buf;
-    row_buf.reserve(512);
-    struct RowBufGuard {
-        std::string& s;
-        ~RowBufGuard() {
-            if (!s.empty()) {
-                OPENSSL_cleanse(s.data(), s.size());
-            }
-        }
-    } row_guard{row_buf};
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        vault_crypto::SecureString row_buf(512);
 
-    bool first_record = true;
-    CsvStreamParser parser;
-    auto on_record = [&](const std::vector<std::string>& cols,
-                         std::size_t record_index,
-                         std::size_t start_line) {
-        row_buf.clear();
-        rehydrate_record_fields_unlocked(cols, record_index, start_line, first_record, row_buf);
-        if (!row_buf.empty()) {
-            out.write(row_buf.data(), static_cast<std::streamsize>(row_buf.size()));
-            OPENSSL_cleanse(row_buf.data(), row_buf.size());
-        }
-    };
-    parser.parse_stream(in, on_record);
+        bool first_record = true;
+        CsvStreamParser parser;
+        auto on_record = [&](const std::vector<std::string>& cols,
+                             std::size_t record_index,
+                             std::size_t start_line) {
+            row_buf.clear();
+            rehydrate_record_fields_unlocked(cols, record_index, start_line, first_record, row_buf);
+            if (!row_buf.empty()) {
+                out.write(row_buf.data(), static_cast<std::streamsize>(row_buf.size()));
+                row_buf.clear();
+            }
+        };
+        parser.parse_stream(in, on_record);
+        row_buf.cleanse();
+    }
     out.flush();
 }
 

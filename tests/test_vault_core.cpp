@@ -2004,11 +2004,15 @@ private:
 };
 
 std::atomic<std::size_t> g_wipe_events{0};
+std::atomic<std::size_t> g_max_wiped_len{0};
 std::atomic<bool> g_all_bytes_zeroed{true};
 
 void secure_string_wipe_hook(const char* data, std::size_t len) {
     if (!data || len == 0) return;
     g_wipe_events.fetch_add(1, std::memory_order_relaxed);
+    std::size_t prev_max = g_max_wiped_len.load(std::memory_order_relaxed);
+    while (len > prev_max && !g_max_wiped_len.compare_exchange_weak(
+               prev_max, len, std::memory_order_relaxed)) {}
     for (std::size_t i = 0; i < len; ++i) {
         if (data[i] != '\0') {
             g_all_bytes_zeroed.store(false, std::memory_order_relaxed);
@@ -2016,6 +2020,70 @@ void secure_string_wipe_hook(const char* data, std::size_t len) {
         }
     }
 }
+
+#ifdef _WIN32
+void verify_windows_owner_only_dacl(const std::filesystem::path& target) {
+    HANDLE raw_token = nullptr;
+    ASSERT_TRUE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token));
+    DWORD len = 0;
+    GetTokenInformation(raw_token, TokenUser, nullptr, 0, &len);
+    std::vector<uint8_t> tu_buf(len);
+    ASSERT_TRUE(GetTokenInformation(raw_token, TokenUser, tu_buf.data(), len, &len));
+    CloseHandle(raw_token);
+    const PSID user_sid = reinterpret_cast<const TOKEN_USER*>(tu_buf.data())->User.Sid;
+
+    std::array<uint8_t, SECURITY_MAX_SID_SIZE> sys_sid_buf{};
+    DWORD sys_len = static_cast<DWORD>(sys_sid_buf.size());
+    const PSID sys_sid = reinterpret_cast<PSID>(sys_sid_buf.data());
+    ASSERT_TRUE(CreateWellKnownSid(WinLocalSystemSid, nullptr, sys_sid, &sys_len));
+
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    const DWORD rc = GetNamedSecurityInfoW(
+        target.c_str(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        &dacl,
+        nullptr,
+        &sd);
+    ASSERT_EQ(rc, ERROR_SUCCESS);
+    ASSERT_NE(sd, nullptr);
+    ASSERT_NE(dacl, nullptr);
+
+    SECURITY_DESCRIPTOR_CONTROL ctrl = 0;
+    DWORD rev = 0;
+    ASSERT_TRUE(GetSecurityDescriptorControl(sd, &ctrl, &rev));
+    EXPECT_NE(ctrl & SE_DACL_PROTECTED, 0u);
+
+    ACL_SIZE_INFORMATION acl_info{};
+    ASSERT_TRUE(GetAclInformation(dacl, &acl_info, sizeof(acl_info), AclSizeInformation));
+    EXPECT_EQ(acl_info.AceCount, 2u);
+
+    bool saw_user = false;
+    bool saw_system = false;
+    for (DWORD i = 0; i < acl_info.AceCount; ++i) {
+        LPVOID raw_ace = nullptr;
+        ASSERT_TRUE(GetAce(dacl, i, &raw_ace));
+        auto* hdr = reinterpret_cast<ACE_HEADER*>(raw_ace);
+        EXPECT_EQ(hdr->AceType, ACCESS_ALLOWED_ACE_TYPE);
+        auto* allow_ace = reinterpret_cast<ACCESS_ALLOWED_ACE*>(raw_ace);
+        PSID ace_sid = reinterpret_cast<PSID>(&allow_ace->SidStart);
+        if (EqualSid(ace_sid, user_sid)) {
+            saw_user = true;
+        } else if (EqualSid(ace_sid, sys_sid)) {
+            saw_system = true;
+        } else {
+            ADD_FAILURE() << "Unexpected SID present in protected secret file DACL";
+        }
+    }
+    EXPECT_TRUE(saw_user);
+    EXPECT_TRUE(saw_system);
+
+    LocalFree(sd);
+}
+#endif
 
 } // namespace
 
@@ -2080,79 +2148,203 @@ TEST(VaultCrypto, Bvl3AtomicFileDecryptionDeletesTempOnMidStreamFailure) {
 
     std::size_t temp_leftovers = 0;
     for (const auto& entry : std::filesystem::directory_iterator(dir.path())) {
-        if (entry.path().filename().string().find(".decrypt.") != std::string::npos) {
+        const std::string fname = entry.path().filename().string();
+        if (fname.find(".tmp.") != std::string::npos || fname.find(".decrypt.") != std::string::npos) {
             ++temp_leftovers;
         }
     }
     EXPECT_EQ(temp_leftovers, 0u);
 }
 
+TEST(Tokenizer, StreamingCsvRowBufCleansesFullCapacityAfterLargeThenSmallRow) {
+    TempDir dir;
+    auto kms = std::make_shared<vault_kms::LocalSoftwareKmsProvider>(dir.file("rowbuf.kek"));
+    vault_token::TokenVault vault(dir.file("rowbuf_tokens.enc"), kms);
+
+    // Row 1 forces row_buf capacity well above 2 KiB; Row 2 is short (~110 bytes).
+    const std::string huge_merchant(2048, 'M');
+    const std::string csv_in =
+        "tx_id,timestamp,customer_name,national_id,iban,source_ip,amount_egp,merchant\n"
+        "TX_LARGE,2026-11-23T03:00:00Z,Ahmed Hassan,30108110101000,EG380019000500000000263181000,41.10.20.30,500.00," +
+        huge_merchant + "\n"
+        "TX_SMALL,2026-11-23T03:01:00Z,Mona El-Sayed,29901010102222,EG380019000500000000263181001,10.0.0.5,99.00,Cafe\n";
+
+    std::string sanitized;
+    {
+        g_wipe_events.store(0, std::memory_order_relaxed);
+        g_max_wiped_len.store(0, std::memory_order_relaxed);
+        g_all_bytes_zeroed.store(true, std::memory_order_relaxed);
+        vault_crypto::detail::set_secure_string_wipe_observer_for_test(&secure_string_wipe_hook);
+        struct ObserverReset {
+            ~ObserverReset() { vault_crypto::detail::set_secure_string_wipe_observer_for_test(nullptr); }
+        } reset_guard;
+
+        std::istringstream in(csv_in);
+        std::ostringstream out;
+        vault.sanitize_csv_stream(in, out);
+        sanitized = out.str();
+
+        // row_buf.cleanse() & ~SecureString() must have wiped >= 2048 bytes (full allocated capacity,
+        // NOT merely the ~110-byte length of the second small row) and zeroed every byte.
+        EXPECT_GT(g_wipe_events.load(std::memory_order_relaxed), 0u);
+        EXPECT_GE(g_max_wiped_len.load(std::memory_order_relaxed), 2048u);
+        EXPECT_TRUE(g_all_bytes_zeroed.load(std::memory_order_relaxed));
+    }
+
+    // Same verification for rehydrate_csv_stream() after a large row followed by a small row.
+    {
+        g_wipe_events.store(0, std::memory_order_relaxed);
+        g_max_wiped_len.store(0, std::memory_order_relaxed);
+        g_all_bytes_zeroed.store(true, std::memory_order_relaxed);
+        vault_crypto::detail::set_secure_string_wipe_observer_for_test(&secure_string_wipe_hook);
+        struct ObserverReset {
+            ~ObserverReset() { vault_crypto::detail::set_secure_string_wipe_observer_for_test(nullptr); }
+        } reset_guard;
+
+        std::istringstream in(sanitized);
+        std::ostringstream out;
+        vault.rehydrate_csv_stream(in, out);
+
+        EXPECT_GT(g_wipe_events.load(std::memory_order_relaxed), 0u);
+        EXPECT_GE(g_max_wiped_len.load(std::memory_order_relaxed), 2048u);
+        EXPECT_TRUE(g_all_bytes_zeroed.load(std::memory_order_relaxed));
+        EXPECT_NE(out.str().find(huge_merchant), std::string::npos);
+        EXPECT_NE(out.str().find("Mona El-Sayed"), std::string::npos);
+    }
+}
+
+#ifndef _WIN32
+TEST(VaultCrypto, Bvl3AtomicFileDecryptionPermissionsAndSyscallFailures) {
+    TempDir dir;
+    const auto dek = vault_crypto::generate_key();
+    std::string plain_payload;
+    plain_payload.reserve(100 * 1024);
+    for (int i = 0; i < 2000; ++i) {
+        plain_payload += "ROW_" + std::to_string(i) + ",TOK_00112233445566778899aabbccddeeff,123.45\n";
+    }
+
+    std::stringstream enc_ss(std::ios::in | std::ios::out | std::ios::binary);
+    std::istringstream src_ss(plain_payload, std::ios::binary);
+    const std::size_t total_len =
+        vault_crypto::encrypt_stream_bvl3(src_ss, enc_ss, dek, "perm_test.enc");
+    const std::string valid_ct = enc_ss.str();
+
+    // 1. Permissive umask(0000) must NOT loosen 0600 creation mode on staging/final file
+    const mode_t old_umask = ::umask(0000);
+    struct UmaskRestore {
+        mode_t prev;
+        ~UmaskRestore() { ::umask(prev); }
+    } umask_guard{old_umask};
+
+    const auto target = dir.file("staged_secret.csv");
+    {
+        SyscallFaultState st;
+        st.max_write_chunk = 512; // Force partial write retries across frames
+        g_fault_state = &st;
+
+        std::istringstream in_ok(valid_ct, std::ios::binary);
+        vault_crypto::detail::decrypt_stream_to_file_atomic_posix(
+            in_ok, total_len, dek, "perm_test.enc", target, make_fault_ops());
+        g_fault_state = nullptr;
+
+        EXPECT_EQ(st.first_open_flags & (O_CREAT | O_EXCL | O_WRONLY), (O_CREAT | O_EXCL | O_WRONLY));
+        EXPECT_EQ(st.first_open_mode, 0600u);
+        EXPECT_EQ(st.fsync_calls, 2);
+        EXPECT_EQ(st.rename_calls, 1);
+        EXPECT_EQ(st.unlink_calls, 0);
+
+        struct stat sb{};
+        ASSERT_EQ(::stat(target.c_str(), &sb), 0);
+        EXPECT_EQ(sb.st_mode & 0777, 0600);
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 2. open(tmp) failure -> throws with EACCES, leaves existing target intact
+    {
+        SyscallFaultState st;
+        st.fail_open_after = 0;
+        st.open_errno = EACCES;
+        g_fault_state = &st;
+
+        std::istringstream in(valid_ct, std::ios::binary);
+        try {
+            vault_crypto::detail::decrypt_stream_to_file_atomic_posix(
+                in, total_len, dek, "perm_test.enc", target, make_fault_ops());
+            FAIL() << "Expected open(tmp) failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(EACCES)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+    }
+
+    // 3. write() failure mid-stream -> throws with ENOSPC (not clobbered), unlinks staging file, target untouched
+    {
+        SyscallFaultState st;
+        st.max_write_chunk = 1024;
+        st.fail_write_after = 1;
+        st.write_errno = ENOSPC;
+        g_fault_state = &st;
+
+        std::istringstream in(valid_ct, std::ios::binary);
+        try {
+            vault_crypto::detail::decrypt_stream_to_file_atomic_posix(
+                in, total_len, dek, "perm_test.enc", target, make_fault_ops());
+            FAIL() << "Expected write() failure";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("errno=" + std::to_string(ENOSPC)), std::string::npos);
+        }
+        g_fault_state = nullptr;
+        EXPECT_EQ(st.unlink_calls, 1);
+        EXPECT_EQ(st.rename_calls, 0);
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+        const auto disk = vault_crypto::read_bytes_from_file(target.string());
+        EXPECT_EQ(std::string(disk.begin(), disk.end()), plain_payload);
+    }
+
+    // 4. Mid-stream authentication failure -> unlinks staging file, target untouched
+    {
+        std::string tampered = valid_ct;
+        tampered[tampered.size() - 25] ^= 0x3C;
+        SyscallFaultState st;
+        g_fault_state = &st;
+
+        std::istringstream in(tampered, std::ios::binary);
+        EXPECT_THROW(
+            vault_crypto::detail::decrypt_stream_to_file_atomic_posix(
+                in, tampered.size(), dek, "perm_test.enc", target, make_fault_ops()),
+            std::runtime_error);
+        g_fault_state = nullptr;
+        EXPECT_EQ(st.unlink_calls, 1);
+        EXPECT_EQ(st.rename_calls, 0);
+        EXPECT_EQ(count_tmp_files(dir.path()), 0u);
+        const auto disk = vault_crypto::read_bytes_from_file(target.string());
+        EXPECT_EQ(std::string(disk.begin(), disk.end()), plain_payload);
+    }
+}
+#endif
+
 #ifdef _WIN32
 TEST(VaultCrypto, WriteSecretFile0600EnforcesWindowsOwnerOnlyDacl) {
     TempDir dir;
     const auto target = dir.file("win_owner_only.secret");
-    const std::string payload = "WINDOWS_DACL_PROTECTED_SECRET";
-    vault_crypto::write_secret_file_0600(target, payload);
+    vault_crypto::write_secret_file_0600(target, "WINDOWS_DACL_PROTECTED_SECRET");
+    verify_windows_owner_only_dacl(target);
+}
 
-    HANDLE raw_token = nullptr;
-    ASSERT_TRUE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token));
-    DWORD len = 0;
-    GetTokenInformation(raw_token, TokenUser, nullptr, 0, &len);
-    std::vector<uint8_t> tu_buf(len);
-    ASSERT_TRUE(GetTokenInformation(raw_token, TokenUser, tu_buf.data(), len, &len));
-    CloseHandle(raw_token);
-    const PSID user_sid = reinterpret_cast<const TOKEN_USER*>(tu_buf.data())->User.Sid;
+TEST(VaultCrypto, Bvl3AtomicFileDecryptionEnforcesWindowsOwnerOnlyDacl) {
+    TempDir dir;
+    const auto dek = vault_crypto::generate_key();
+    const std::string plain = "TX1,TOK_00112233445566778899aabbccddeeff,100.00\n";
+    std::stringstream enc_ss(std::ios::in | std::ios::out | std::ios::binary);
+    std::istringstream src_ss(plain, std::ios::binary);
+    const std::size_t total_len =
+        vault_crypto::encrypt_stream_bvl3(src_ss, enc_ss, dek, "win_dacl.enc");
 
-    std::array<uint8_t, SECURITY_MAX_SID_SIZE> sys_sid_buf{};
-    DWORD sys_len = static_cast<DWORD>(sys_sid_buf.size());
-    const PSID sys_sid = reinterpret_cast<PSID>(sys_sid_buf.data());
-    ASSERT_TRUE(CreateWellKnownSid(WinLocalSystemSid, nullptr, sys_sid, &sys_len));
-
-    PACL dacl = nullptr;
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    const DWORD rc = GetNamedSecurityInfoW(
-        target.c_str(),
-        SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        nullptr,
-        nullptr,
-        &dacl,
-        nullptr,
-        &sd);
-    ASSERT_EQ(rc, ERROR_SUCCESS);
-    ASSERT_NE(sd, nullptr);
-    ASSERT_NE(dacl, nullptr);
-
-    SECURITY_DESCRIPTOR_CONTROL ctrl = 0;
-    DWORD rev = 0;
-    ASSERT_TRUE(GetSecurityDescriptorControl(sd, &ctrl, &rev));
-    EXPECT_NE(ctrl & SE_DACL_PROTECTED, 0u);
-
-    ACL_SIZE_INFORMATION acl_info{};
-    ASSERT_TRUE(GetAclInformation(dacl, &acl_info, sizeof(acl_info), AclSizeInformation));
-    EXPECT_EQ(acl_info.AceCount, 2u);
-
-    bool saw_user = false;
-    bool saw_system = false;
-    for (DWORD i = 0; i < acl_info.AceCount; ++i) {
-        LPVOID raw_ace = nullptr;
-        ASSERT_TRUE(GetAce(dacl, i, &raw_ace));
-        auto* hdr = reinterpret_cast<ACE_HEADER*>(raw_ace);
-        EXPECT_EQ(hdr->AceType, ACCESS_ALLOWED_ACE_TYPE);
-        auto* allow_ace = reinterpret_cast<ACCESS_ALLOWED_ACE*>(raw_ace);
-        PSID ace_sid = reinterpret_cast<PSID>(&allow_ace->SidStart);
-        if (EqualSid(ace_sid, user_sid)) {
-            saw_user = true;
-        } else if (EqualSid(ace_sid, sys_sid)) {
-            saw_system = true;
-        } else {
-            ADD_FAILURE() << "Unexpected SID present in protected secret file DACL";
-        }
-    }
-    EXPECT_TRUE(saw_user);
-    EXPECT_TRUE(saw_system);
-
-    LocalFree(sd);
+    const auto target = dir.file("win_decrypted_secret.csv");
+    std::istringstream in_ss(enc_ss.str(), std::ios::binary);
+    vault_crypto::decrypt_stream_to_file_atomic(in_ss, total_len, dek, "win_dacl.enc", target);
+    verify_windows_owner_only_dacl(target);
 }
 #endif
 

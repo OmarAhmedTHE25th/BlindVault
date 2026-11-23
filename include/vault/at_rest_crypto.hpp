@@ -173,6 +173,10 @@ PosixFileOps default_posix_file_ops() noexcept;
 void write_secret_file_0600_posix(const std::filesystem::path& path,
                                   std::string_view content,
                                   const PosixFileOps& ops);
+void decrypt_stream_to_file_atomic_posix(std::istream& in, std::size_t total_len,
+                                         const SecretKey& dek, std::string_view blob_name,
+                                         const std::filesystem::path& output_path,
+                                         const PosixFileOps& ops);
 #endif
 
 } // namespace detail

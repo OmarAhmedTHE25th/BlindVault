@@ -154,6 +154,7 @@ private:
 
 std::vector<std::string> parse_csv_row(std::string_view record_text);
 void append_escaped_csv_field(std::string& out, std::string_view field);
+void append_escaped_csv_field(vault_crypto::SecureString& out, std::string_view field);
 std::string escape_csv_field(std::string_view field);
 std::string format_csv_row(const std::vector<std::string>& cols);
 
@@ -200,18 +201,20 @@ private:
     void init_hmac_ctx();
     std::string_view tokenize_view_unlocked(std::string_view raw_value);
     std::string compute_token_unlocked(std::string_view input, std::uint64_t collision_attempt = 0) const;
+    template <typename RowBuffer>
     void sanitize_record_fields_unlocked(const std::vector<std::string>& cols,
                                          std::size_t record_index,
                                          std::size_t start_line,
                                          bool& first_record,
-                                         std::string& row_out,
+                                         RowBuffer& row_out,
                                          SanitizeStats* out_stats,
                                          std::unordered_set<std::string>* out_tokens);
+    template <typename RowBuffer>
     void rehydrate_record_fields_unlocked(const std::vector<std::string>& cols,
                                           std::size_t record_index,
                                           std::size_t start_line,
                                           bool& first_record,
-                                          std::string& row_out) const;
+                                          RowBuffer& row_out) const;
     void load_unlocked();
 
     std::filesystem::path storage_path_;
