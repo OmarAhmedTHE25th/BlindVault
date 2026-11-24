@@ -22,14 +22,24 @@
           <span class="brand-name">BlindVault</span>
         </a>
 
-        <div class="product-switcher" role="tablist" aria-label="Ecosystem component switcher">
-          <button type="button" class="switch-pill is-active" data-product="vault" role="tab" aria-selected="true">
-            BlindVault
-          </button>
-          <button type="button" class="switch-pill" data-product="control" role="tab" aria-selected="false">
-            BlindVault-Control
-          </button>
-        </div>
+        <nav class="product-switcher" data-active="vault" aria-label="Switch between BlindVault websites">
+          <span class="switch-thumb" aria-hidden="true"></span>
+          <a
+            href="https://blindvault.vercel.app"
+            class="switch-pill is-active"
+            data-product="vault"
+            aria-current="page"
+          >
+            BlindVault Core
+          </a>
+          <a
+            href="https://blindvault-control.vercel.app"
+            class="switch-pill"
+            data-product="control"
+          >
+            blindvault-control
+          </a>
+        </nav>
       </div>
 
       <nav class="main-nav" aria-label="Primary navigation">
@@ -76,7 +86,7 @@
       <a href="#benchmarks">Benchmarks</a>
       <a href="#cli-tests">CLI &amp; Tests</a>
       <a href="#quickstart">Quickstart</a>
-      <a href="#control-plane">BlindVault-Control</a>
+      <a href="https://blindvault-control.vercel.app">Switch to blindvault-control &rarr;</a>
     </div>
   </header>
 
@@ -910,7 +920,7 @@ cmake --build build-gui --target BlindVault_GUI
       </div>
       <div class="footer-links">
         <a href="https://github.com/OmarAhmedTHE25th/BlindVault" target="_blank" rel="noopener noreferrer">BlindVault Repository</a>
-        <a href="#control-plane">BlindVault-Control</a>
+        <a href="https://blindvault-control.vercel.app">Switch to blindvault-control &rarr;</a>
         <a href="../README.md">Technical README</a>
         <a href="../PROJECT_GUIDE.md">Plain-English Guide</a>
       </div>
