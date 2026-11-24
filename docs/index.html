@@ -37,6 +37,7 @@
         <a href="#xray">Live X-Ray</a>
         <a href="#security">Security</a>
         <a href="#benchmarks">Benchmarks</a>
+        <a href="#cli-tests">CLI &amp; Tests</a>
         <a href="#quickstart">Quickstart</a>
       </nav>
 
@@ -73,6 +74,7 @@
       <a href="#xray">Live X-Ray</a>
       <a href="#security">Security</a>
       <a href="#benchmarks">Benchmarks</a>
+      <a href="#cli-tests">CLI &amp; Tests</a>
       <a href="#quickstart">Quickstart</a>
       <a href="#control-plane">BlindVault-Control</a>
     </div>
@@ -769,7 +771,50 @@
       </div>
     </section>
 
-    <!-- 5. Clean Tabbed Quickstart -->
+    <!-- 5. Verified CLI & Terminal Test Runs -->
+    <section class="terminal-gallery-section reveal-on-scroll" id="cli-tests">
+      <div class="container">
+        <div class="section-intro">
+          <span class="eyebrow">Real CLI &amp; Terminal Test Captures</span>
+          <h2>Verified End-to-End &amp; Core Cryptographic Test Runs</h2>
+          <p>
+            Unedited captures from live <code class="mono-inline">scripts/e2e_test.sh</code> mutual TLS 1.3 CLI checks and GoogleTest cryptographic, RFC 4180 parser, quorum, and recovery suites (not microbenchmarks).
+          </p>
+        </div>
+
+        <div class="terminal-shot-grid">
+          <figure class="terminal-shot-card">
+            <div class="terminal-shot-media">
+              <img
+                src="./images/cli-e2e-test.png"
+                alt="BlindVault CLI end-to-end test run passing mTLS 1.3 transfers, trust revocation, TLS 1.2 refusal, and connection limits"
+                loading="lazy"
+              />
+            </div>
+            <figcaption class="terminal-shot-caption">
+              <strong>CLI End-to-End Test Suite</strong>
+              <span class="mono">bash scripts/e2e_test.sh ./build-wsl/BlindVault</span>
+            </figcaption>
+          </figure>
+
+          <figure class="terminal-shot-card">
+            <div class="terminal-shot-media">
+              <img
+                src="./images/terminal-unit-tests.png"
+                alt="BlindVault terminal GoogleTest output passing VaultCrypto, Tokenizer, VaultHardening, QuorumGate, S3ShardBackend, and ControlClient suites"
+                loading="lazy"
+              />
+            </div>
+            <figcaption class="terminal-shot-caption">
+              <strong>Terminal GoogleTest Cryptographic &amp; Hardening Suites</strong>
+              <span class="mono">unit_tests (VaultCrypto, Tokenizer, VaultHardening, QuorumGate, S3, Control)</span>
+            </figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <!-- 6. Clean Tabbed Quickstart -->
     <section class="quickstart-section reveal-on-scroll" id="quickstart">
       <div class="container">
         <div class="section-intro">

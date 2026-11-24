@@ -336,6 +336,14 @@ mkdir -p corpus-work
 ./build-fuzz/fuzz_validation corpus-work fuzz/seeds -max_total_time=60
 ```
 
+### Verified CLI & Terminal Test Runs
+
+End-to-end mutual TLS 1.3 CLI verification (`scripts/e2e_test.sh`) and core cryptographic/tokenizer/hardening unit tests (`unit_tests`):
+
+| End-to-End CLI Test Run (`scripts/e2e_test.sh`) | Core Security & Hardening Unit Tests (`unit_tests`) |
+| :---: | :---: |
+| ![BlindVault CLI End-to-End Test Run](docs/images/cli-e2e-test.png) | ![BlindVault Terminal Unit Tests](docs/images/terminal-unit-tests.png) |
+
 ## Project Structure
 
 ```text
